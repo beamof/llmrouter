@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Router 控制台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚦</text></svg>">
+<style>
+:root{--bd:#e3e8ef;--bg:#f6f8fb;--card:#fff;--tx:#1c2333;--mut:#68738a;--acc:#2f6fed;--ok:#0a8a5f;--bad:#d4380d;--warn:#b45309}
+*{box-sizing:border-box}
+body{margin:0;color:var(--tx);font:14px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg)}
+header{position:sticky;top:0;z-index:9;display:flex;align-items:center;gap:16px;padding:10px 22px;background:#fff;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+header h1{font-size:16px;margin:0}
+nav{display:flex;gap:6px}
+nav button{border:none;background:none;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:14px;color:var(--mut)}
+nav button.on{background:var(--acc);color:#fff}
+#tokenbar{margin-left:auto;display:none;align-items:center;gap:6px;font-size:13px;color:var(--mut)}
+.wrap{max-width:1100px;margin:20px auto 60px;padding:0 18px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px 16px;margin-bottom:14px}
+.toolbar{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.toolbar .sp{flex:1}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow:hidden}
+th,td{padding:8px 12px;border-bottom:1px solid var(--bd);text-align:left;vertical-align:middle}
+th{background:#eef2f8;font-size:13px;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.btn{border:1px solid var(--bd);background:#fff;border-radius:8px;padding:4px 10px;cursor:pointer;font-size:13px;color:var(--tx)}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn.danger:hover{border-color:var(--bad);color:var(--bad)}
+.btn.mini{padding:1px 7px;font-size:12px}
+input,select{border:1px solid var(--bd);border-radius:8px;padding:6px 8px;font:inherit;background:#fff}
+input:focus,select:focus{outline:2px solid #bcd2ff;border-color:var(--acc)}
+dialog{border:1px solid var(--bd);border-radius:14px;padding:18px 20px;width:min(560px,94vw);box-shadow:0 20px 60px #0003}
+dialog::backdrop{background:#0006}
+.frow{display:flex;gap:10px;margin:10px 0;align-items:center}
+.frow>label{width:96px;flex:none;color:var(--mut);font-size:13px}
+.frow input,.frow select{flex:1;min-width:0}
+.mute-row{display:flex;gap:6px;align-items:center;margin:4px 0}
+.hint{color:var(--mut);font-size:12px}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+.empty{padding:26px;text-align:center;color:var(--mut)}
+.sumcards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px}
+.sumcard{flex:1;min-width:180px;background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px 14px}
+.sumcard b{display:block;font-size:20px}
+.sumcard span{color:var(--mut);font-size:12px}
+.ok{color:var(--ok);font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>🚦 LLM Router</h1>
+  <nav>
+    <button class="on" data-tab="models">模型路由</button>
+    <button data-tab="providers">Providers</button>
+    <button data-tab="keys">Keys</button>
+    <button data-tab="usage">用量</button>
+  </nav>
+  <div id="tokenbar">管理令牌 <input id="tokenin" type="password"> <button class="btn" onclick="saveToken()">保存</button></div>
+</header>
+
+<div class="wrap">
+  <!-- 模型路由 -->
+  <section id="tab-models">
+    <div class="card">
+      <b>接入方式</b>　<span class="mono" id="endpoints"></span>
+      <div class="hint">请求体原样透传（messages / tools / stream 等全部字段不做任何改动），响应字节级回传。同一模型名可挂多个 Provider，按优先级自动故障转移。客户端带 <span class="mono">X-Session-ID</span> 头可开启会话粘性：同一会话固定走同一上游，仅在上游失败时才切换。</div>
+      <div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        自动模型名 <input id="auto-name" class="mono" style="width:110px">
+        <button class="btn mini" onclick="saveAutoName()">保存</button>
+        <span class="hint">请求体 model 填这个名字（默认 auto）时，在所有可用模型里按优先级自动挑选，仅替换 model 字段、其余内容照旧透传</span>
+      </div>
+    </div>
+    <div class="toolbar">
+      <button class="btn pri" onclick="editModel()">＋ 添加模型</button>
+      <div class="sp"></div>
+      <div class="hint">优先级数值越大越优先，用每行 ▲▼ 调整顺序</div>
+    </div>
+    <table id="models-table">
+      <thead><tr><th>#</th><th>模型</th><th>Provider</th><th>优先级</th><th>今日用量 / 上限 (tokens)</th><th>静音时段</th><th>测试</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- Providers -->
+  <section id="tab-providers" hidden>
+    <div class="toolbar">
+      <button class="btn pri" onclick="editProvider()">＋ 添加 Provider</button>
+      <div class="sp"></div>
+      <div class="hint">Base URL 填到 /v1，例如 https://api.openai.com/v1</div>
+    </div>
+    <table id="providers-table">
+      <thead><tr><th>名称</th><th>基址</th><th>密钥</th><th>上游余额</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- API Keys -->
+  <section id="tab-keys" hidden>
+    <div class="toolbar">
+      <input id="k-name" placeholder="备注，如：Cursor / 我的脚本" style="width:240px">
+      <button class="btn pri" onclick="createKey()">＋ 生成 Key</button>
+      <div class="sp"></div>
+      <div class="hint">客户端携带 <span class="mono">Authorization: Bearer sk-r-…</span> 访问 /v1/*；一个 Key 都没有时代理入口不鉴权</div>
+    </div>
+    <table id="keys-table">
+      <thead><tr><th>备注</th><th>Key</th><th>创建时间</th><th class="num">今日用量(tokens)</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- 用量 -->
+  <section id="tab-usage" hidden>
+    <div class="toolbar">
+      <button class="btn on range-btn" onclick="setUsageRange('today', this)">今日</button>
+      <button class="btn range-btn" onclick="setUsageRange('7d', this)">近 7 天</button>
+      <button class="btn range-btn" onclick="setUsageRange('month', this)">本月</button>
+    </div>
+    <div class="sumcards" id="usage-sum"></div>
+    <div class="sumcards" id="usage-keysum"></div>
+    <table id="usage-table">
+      <thead><tr><th>日期</th><th>Key</th><th>Provider</th><th>模型</th><th class="num">tokens 合计</th><th class="num">请求数</th><th class="num">输入</th><th class="num">输出</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</div>
+
+<!-- Provider 弹窗 -->
+<dialog id="dlg-provider">
+  <h3 id="dlg-provider-title" style="margin-top:0">添加 Provider</h3>
+  <div class="frow"><label>名称</label><input id="p-name" placeholder="deepseek"></div>
+  <div class="frow"><label>Chat 基址 *</label><input id="p-base" class="mono" placeholder="https://api.openai.com/v1"></div>
+  <div class="frow"><label>API Key</label><input id="p-key" class="mono" placeholder="sk-..." autocomplete="off"></div>
+  <div class="frow"><label>Responses 基址</label><input id="p-resp" class="mono" placeholder="留空 = 同 Chat 基址；如 https://open.bigmodel.cn/api/v1"></div>
+  <div class="frow"><label>余额查询 URL</label><input id="p-bal" class="mono" placeholder="https://api.deepseek.com/user/balance"></div>
+  <div class="hint" style="margin:4px 0 12px">两种协议的基址可以不同（如智谱 Coding Plan 没有 /responses，可单独填 https://open.bigmodel.cn/api/v1）。余额查询地址可留空：智谱、DeepSeek 会自动使用官方余额接口。</div>
+  <div style="display:flex;justify-content:flex-end;gap:8px">
+    <button class="btn" onclick="dlgProvider.close()">取消</button>
+    <button class="btn pri" onclick="saveProvider()">保存</button>
+  </div>
+</dialog>
+
+<!-- 模型弹窗 -->
+<dialog id="dlg-model">
+  <h3 id="dlg-model-title" style="margin-top:0">添加模型</h3>
+  <div class="frow"><label>Provider *</label><select id="m-provider"></select></div>
+  <div class="frow" style="align-items:flex-start"><label>模型名 *</label>
+    <div style="flex:1">
+      <input id="m-name" class="mono" list="upstream-models" placeholder="gpt-4o（可下拉选择，或手动输入）" style="width:100%">
+      <datalist id="upstream-models"></datalist>
+      <div class="hint" id="m-fetch-status"></div>
+    </div>
+  </div>
+  <div class="frow"><label>优先级</label><input id="m-priority" type="number" value="10"> <span class="hint">越大越优先</span></div>
+  <div class="frow"><label>每日上限</label><input id="m-limit" type="number" min="0" step="0.1" value="0" style="width:100px"> <span class="hint">万 tokens / 天（填 50 = 50 万），0 = 不限；流式响应无法计入</span></div>
+  <div class="frow" style="align-items:flex-start"><label>静音时段</label>
+    <div style="flex:1">
+      <div id="mutes"></div>
+      <button class="btn mini" onclick="addMuteRow()">＋ 时间段</button>
+      <span class="hint">每天在这些时段内不路由到该模型（服务器本地时间），支持跨零点，如 22:00~06:00</span>
+    </div>
+  </div>
+  <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+    <button class="btn" onclick="dlgModel.close()">取消</button>
+    <button class="btn pri" onclick="saveModel()">保存</button>
+  </div>
+</dialog>
+
+<script>
+let S = {providers: [], models: [], usage: [], balances: {}, api_keys: []};
+const $ = id => document.getElementById(id);
+const dlgProvider = $('dlg-provider'), dlgModel = $('dlg-model');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtN = n => (n || 0).toLocaleString();
+const fmtWan = n => (n = n || 0) >= 10000 ? (n / 10000).toFixed(1) + '万' : fmtN(n);
+const pname = id => (S.providers.find(p => p.id === id) || {}).name || id;
+
+async function api(method, path, body) {
+  const headers = {'Content-Type': 'application/json'};
+  const t = localStorage.getItem('lr_admin_token');
+  if (t) headers['X-Admin-Token'] = t;
+  const res = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : undefined});
+  if (res.status === 401) { $('tokenbar').style.display = 'flex'; $('tokenin').focus(); throw new Error('请填写管理令牌'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error?.message || ('HTTP ' + res.status));
+  return data;
+}
+
+function saveToken() { localStorage.setItem('lr_admin_token', $('tokenin').value.trim()); load(); }
+
+async function load() {
+  try {
+    S = await api('GET', '/api/state');
+    // 兼容空状态时后端可能返回的 null
+    S.providers ||= [];
+    S.models ||= [];
+    S.usage ||= [];
+    S.balances ||= {};
+    S.api_keys ||= [];
+    renderModels(); renderProviders(); renderKeys(); renderUsage();
+  } catch (e) { console.error(e); }
+}
+
+/* ---------- 标签页 ---------- */
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  ['models', 'providers', 'keys', 'usage'].forEach(t => $('tab-' + t).hidden = t !== b.dataset.tab);
+});
+
+/* ---------- 模型 ---------- */
+const sortedModels = () => [...S.models].sort((a, b) => (b.priority - a.priority) || a.id.localeCompare(b.id));
+
+function renderModels() {
+  $('endpoints').textContent = location.origin + '/v1/chat/completions　·　' + location.origin + '/v1/responses';
+  if (document.activeElement !== $('auto-name')) $('auto-name').value = S.auto_model || 'auto';
+  const tb = $('models-table').querySelector('tbody');
+  if (!S.models.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">还没有模型，点「＋ 添加模型」</td></tr>'; return; }
+  tb.innerHTML = sortedModels().map((m, i) => `
+    <tr>
+      <td class="hint">${i + 1}</td>
+      <td class="mono"><b>${esc(m.name)}</b></td>
+      <td>${esc(pname(m.provider_id))}</td>
+      <td style="white-space:nowrap">${m.priority}
+        <button class="btn mini" title="提高优先级" onclick="move('${m.id}',-1)">▲</button>
+        <button class="btn mini" title="降低优先级" onclick="move('${m.id}',1)">▼</button></td>
+      <td class="num">${fmtWan(m.used_today)} / ${m.daily_limit > 0 ? +(m.daily_limit / 10000).toFixed(2) + '万' : '∞'}</td>
+      <td>${(m.mutes || []).map(w => esc(w.from + '~' + w.to)).join('<br>') || '<span class="hint">—</span>'}</td>
+      <td style="max-width:220px">
+        <button class="btn mini" onclick="testModel('${m.id}')">测试</button>
+        <div class="hint mono" id="test-${m.id}"></div></td>
+      <td style="white-space:nowrap">
+        <button class="btn mini" onclick="editModel('${m.id}')">编辑</button>
+        <button class="btn mini danger" onclick="del('/api/models/${m.id}', '模型 ${esc(m.name)}')">删除</button></td>
+    </tr>`).join('');
+}
+
+// 探测某条模型路由的上游连通性（不发对话、不耗 token），结果就地显示在该行
+async function testModel(id) {
+  const el = $('test-' + id);
+  el.textContent = '测试中…';
+  el.style.color = '';
+  try {
+    const r = await api('POST', '/api/models/' + id + '/test');
+    const icon = { ok: '✅', warn: '⚠️', fail: '❌' }[r.level] || '❌';
+    const color = { ok: 'var(--ok)', warn: 'var(--warn)', fail: 'var(--bad)' }[r.level] || 'var(--bad)';
+    el.textContent = `${icon} ${r.latency_ms}ms · ${r.message}`;
+    el.style.color = color;
+  } catch (e) {
+    el.textContent = '❌ ' + e.message;
+    el.style.color = 'var(--bad)';
+  }
+}
+
+async function saveAutoName() {
+  try {
+    S = await api('PUT', '/api/settings', {auto_model: $('auto-name').value.trim() || 'auto'});
+    renderModels();
+  } catch (e) { alert(e.message); }
+}
+
+async function move(id, dir) {  const ids = sortedModels().map(m => m.id);
+  const i = ids.indexOf(id), j = i + dir;
+  if (j < 0 || j >= ids.length) return;
+  [ids[i], ids[j]] = [ids[j], ids[i]];
+  try { S = await api('POST', '/api/models/reorder', {ids}); renderModels(); } catch (e) { alert(e.message); }
+}
+
+let editingModel = null;
+function editModel(id) {
+  if (!S.providers.length) { alert('请先在 Providers 页签添加一个 Provider'); return; }
+  editingModel = id ? S.models.find(m => m.id === id) : null;
+  $('dlg-model-title').textContent = id ? '编辑模型' : '添加模型';
+  $('m-provider').innerHTML = S.providers.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+  $('m-provider').value = editingModel?.provider_id || S.providers[0].id;
+  $('m-name').value = editingModel?.name || '';
+  $('m-priority').value = editingModel?.priority ?? ((sortedModels()[0]?.priority || 0) + 1);
+  $('m-limit').value = editingModel?.daily_limit ? editingModel.daily_limit / 10000 : 0;
+  $('mutes').innerHTML = '';
+  (editingModel?.mutes || []).forEach(w => addMuteRow(w.from, w.to));
+  dlgModel.showModal();
+  fetchUpstreamModels();
+}
+
+// 根据所选 provider 拉取上游 /models，填充模型名下拉建议
+async function fetchUpstreamModels() {
+  const pid = $('m-provider').value;
+  const dl = $('upstream-models'), st = $('m-fetch-status');
+  dl.innerHTML = '';
+  st.textContent = '正在从上游获取模型列表…';
+  try {
+    const r = await api('GET', '/api/providers/' + pid + '/models');
+    const ids = r.models || [];
+    dl.innerHTML = ids.map(id => `<option value="${esc(id)}"></option>`).join('');
+    st.textContent = ids.length
+      ? `已从上游获取 ${ids.length} 个模型，点击模型名输入框下拉选择（也可手动输入）`
+      : '上游返回了空模型列表，请手动填写';
+  } catch (e) {
+    st.textContent = '获取上游模型列表失败（' + e.message + '），可手动填写';
+  }
+}
+$('m-provider').onchange = fetchUpstreamModels;
+
+function addMuteRow(from = '09:00', to = '18:00') {
+  const div = document.createElement('div');
+  div.className = 'mute-row';
+  div.innerHTML = `<input type="time" value="${esc(from)}"> ~ <input type="time" value="${esc(to)}"> <button class="btn mini danger">删除</button>`;
+  div.querySelector('button').onclick = () => div.remove();
+  $('mutes').appendChild(div);
+}
+
+async function saveModel() {
+  const mutes = [...$('mutes').children].map(r => {
+    const [f, t] = r.querySelectorAll('input');
+    return f.value && t.value ? {from: f.value, to: t.value} : null;
+  }).filter(Boolean);
+  const body = {
+    provider_id: $('m-provider').value,
+    name: $('m-name').value.trim(),
+    priority: parseInt($('m-priority').value) || 0,
+    daily_limit: Math.round((parseFloat($('m-limit').value) || 0) * 10000), // 界面单位：万 tokens
+    mutes,
+  };
+  if (!body.name) { alert('模型名必填'); return; }
+  try {
+    S = await api(editingModel ? 'PUT' : 'POST', editingModel ? '/api/models/' + editingModel.id : '/api/models', body);
+    dlgModel.close(); renderModels();
+  } catch (e) { alert(e.message); }
+}
+
+/* ---------- Providers ---------- */
+function maskKey(k) { return !k ? '—' : (k.length <= 8 ? '***' : k.slice(0, 5) + '…' + k.slice(-4)); }
+
+function renderProviders() {
+  const tb = $('providers-table').querySelector('tbody');
+  if (!S.providers.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">还没有 Provider</td></tr>'; return; }
+  tb.innerHTML = S.providers.map(p => {
+    const b = S.balances[p.id];
+    let bal = '<span class="hint">未查询</span>';
+    if (b) {
+      const items = (b.found || []).slice(0, 3).map(s => {
+        const i = s.indexOf(' = ');
+        if (i < 0) return `<div class="ok"><b>${esc(s)}</b></div>`; // 已是友好文案（如智谱套餐）
+        const field = s.slice(0, i).split('.').pop(), val = s.slice(i + 3);
+        return `<div><span class="ok"><b>${esc(val)}</b></span> <span class="hint">${esc(field)}</span></div>`;
+      }).join('');
+      bal = `<div title="${esc((b.raw || '').slice(0, 500))}">${items || `<span class="hint">未识别出余额字段</span>`}</div><span class="hint">${new Date(b.at).toLocaleString()}</span>`;
+    }
+    const resp = p.responses_url && p.responses_url !== p.base_url
+      ? `<br><span class="hint mono">responses: ${esc(p.responses_url)}</span>` : '';
+    return `<tr>
+      <td><b>${esc(p.name)}</b></td>
+      <td class="mono">${esc(p.base_url)}${resp}</td>
+      <td class="mono">${esc(maskKey(p.api_key))}</td>
+      <td style="max-width:280px">${bal}<br><button class="btn mini" onclick="queryBalance('${p.id}')">查询余额</button></td>
+      <td style="white-space:nowrap">
+        <button class="btn mini" onclick="editProvider('${p.id}')">编辑</button>
+        <button class="btn mini danger" onclick="del('/api/providers/${p.id}', 'Provider ${esc(p.name)} 及其所有模型')">删除</button></td>
+    </tr>`;
+  }).join('');
+}
+
+let editingProvider = null;
+function editProvider(id) {
+  editingProvider = id ? S.providers.find(p => p.id === id) : null;
+  $('dlg-provider-title').textContent = id ? '编辑 Provider' : '添加 Provider';
+  $('p-name').value = editingProvider?.name || '';
+  $('p-base').value = editingProvider?.base_url || '';
+  $('p-resp').value = editingProvider?.responses_url || '';
+  $('p-key').value = editingProvider?.api_key || '';
+  $('p-bal').value = editingProvider?.balance_url || '';
+  dlgProvider.showModal();
+}
+
+async function saveProvider() {
+  const body = {
+    name: $('p-name').value.trim() || 'provider',
+    base_url: $('p-base').value.trim(),
+    responses_url: $('p-resp').value.trim(),
+    api_key: $('p-key').value.trim(),
+    balance_url: $('p-bal').value.trim(),
+  };
+  if (!body.base_url) { alert('Chat 基址必填'); return; }
+  try {
+    S = await api(editingProvider ? 'PUT' : 'POST', editingProvider ? '/api/providers/' + editingProvider.id : '/api/providers', body);
+    dlgProvider.close(); renderProviders(); renderModels();
+  } catch (e) { alert(e.message); }
+}
+
+async function queryBalance(id) {
+  try { await api('POST', `/api/providers/${id}/balance`); await load(); } catch (e) { alert(e.message); }
+}
+
+async function del(url, what) {
+  if (!confirm(`确定删除「${what}」？`)) return;
+  try { S = await api('DELETE', url); renderModels(); renderProviders(); } catch (e) { alert(e.message); }
+}
+
+/* ---------- API Keys ---------- */
+const keyName = id => !id ? '免鉴权' : id === 'env' ? '环境变量' : ((S.api_keys || []).find(k => k.id === id) || {}).name || '已删除';
+const todayStr = () => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+
+function renderKeys() {
+  const tb = $('keys-table').querySelector('tbody');
+  if (!S.api_keys.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">还没有 Key；未添加任何 Key 时代理入口不鉴权</td></tr>'; return; }
+  const todayTok = {};
+  for (const u of S.usage) {
+    if (u.date === todayStr() && u.key_id) todayTok[u.key_id] = (todayTok[u.key_id] || 0) + u.prompt_tokens + u.completion_tokens;
+  }
+  tb.innerHTML = S.api_keys.map(k => `
+    <tr>
+      <td>${esc(k.name)}</td>
+      <td class="mono">${esc(k.key)} <button class="btn mini" onclick="copyKey('${esc(k.key)}')">复制</button></td>
+      <td class="hint">${new Date(k.created_at).toLocaleString()}</td>
+      <td class="num">${fmtWan(todayTok[k.id] || 0)}</td>
+      <td><button class="btn mini danger" onclick="delKey('${k.id}', '${esc(k.name)}')">删除</button></td>
+    </tr>`).join('');
+}
+
+async function createKey() {
+  try {
+    await api('POST', '/api/keys', {name: $('k-name').value.trim()});
+    $('k-name').value = '';
+    await load();
+  } catch (e) { alert(e.message); }
+}
+
+async function delKey(id, name) {
+  if (!confirm(`确定删除 Key「${name}」？使用它的客户端将立即无法访问`)) return;
+  try { S = await api('DELETE', '/api/keys/' + id); renderKeys(); renderUsage(); } catch (e) { alert(e.message); }
+}
+
+async function copyKey(key) {
+  try { await navigator.clipboard.writeText(key); } catch {}
+}
+
+/* ---------- 用量 ---------- */
+let usageRange = 'today'; // today | 7d | month
+
+function setUsageRange(range, btn) {
+  usageRange = range;
+  document.querySelectorAll('#tab-usage .range-btn').forEach(b => b.classList.toggle('on', b === btn));
+  renderUsage();
+}
+
+// 按当前范围过滤用量行（本地日期字符串比较）
+function usageFiltered() {
+  const today = todayStr();
+  if (usageRange === 'today') return S.usage.filter(u => u.date === today);
+  if (usageRange === 'month') return S.usage.filter(u => u.date.startsWith(today.slice(0, 7)));
+  const t = new Date(Date.now() - 6 * 86400000); // 含今天共 7 天
+  const from = new Date(t.getTime() - t.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  return S.usage.filter(u => u.date >= from && u.date <= today);
+}
+
+function renderUsage() {
+  const rows = usageFiltered();
+  const agg = {}, byKey = {}, tot = {r: 0, pt: 0, ct: 0};
+  for (const u of rows) {
+    (agg[u.provider_id] ??= {r: 0, pt: 0, ct: 0});
+    agg[u.provider_id].r += u.requests; agg[u.provider_id].pt += u.prompt_tokens; agg[u.provider_id].ct += u.completion_tokens;
+    (byKey[u.key_id || ''] ??= {r: 0, pt: 0, ct: 0});
+    byKey[u.key_id || ''].r += u.requests; byKey[u.key_id || ''].pt += u.prompt_tokens; byKey[u.key_id || ''].ct += u.completion_tokens;
+    tot.r += u.requests; tot.pt += u.prompt_tokens; tot.ct += u.completion_tokens;
+  }
+  const rangeLabel = {today: '今日', '7d': '近 7 天', month: '本月'}[usageRange];
+  const card = (label, v) => `<div class="sumcard"><span>${label}</span><b>${fmtWan(v.pt + v.ct)}</b><span>tokens · ${fmtN(v.r)} 次请求 · in ${fmtN(v.pt)} · out ${fmtN(v.ct)}</span></div>`;
+  $('usage-sum').innerHTML =
+    Object.entries(agg).map(([k, v]) => card(esc(pname(k)), v)).join('') + card(rangeLabel + '总计', tot);
+  $('usage-keysum').innerHTML = Object.entries(byKey).map(([k, v]) => card('Key · ' + esc(keyName(k)), v)).join('');
+  const tb = $('usage-table').querySelector('tbody');
+  if (!rows.length) { tb.innerHTML = `<tr><td colspan="8" class="empty">${rangeLabel}暂无用量数据</td></tr>`; return; }
+  tb.innerHTML = rows.slice(0, 300).map(u => `
+    <tr>
+      <td>${u.date}</td><td>${esc(keyName(u.key_id))}</td><td>${esc(pname(u.provider_id))}</td><td class="mono">${esc(u.model)}</td>
+      <td class="num"><b>${fmtWan(u.prompt_tokens + u.completion_tokens)}</b></td>
+      <td class="num">${fmtN(u.requests)}</td><td class="num">${fmtN(u.prompt_tokens)}</td><td class="num">${fmtN(u.completion_tokens)}</td>
+    </tr>`).join('');
+}
+
+load();
+</script>
+</body>
+</html>
