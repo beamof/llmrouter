@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布标签（如 v1.0.0）'
+        required: true
+        default: 'v0.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, suffix: linux-x86_64 }
+          - { goos: linux,   goarch: arm64, suffix: linux-arm64 }
+          - { goos: darwin,  goarch: amd64, suffix: darwin-x86_64 }
+          - { goos: darwin,  goarch: arm64, suffix: darwin-arm64 }
+          - { goos: windows, goarch: amd64, suffix: windows-x86_64.exe }
+          - { goos: windows, goarch: arm64, suffix: windows-arm64.exe }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          out="llmrouter-${{ matrix.suffix }}"
+          go build -trimpath -ldflags "-s -w" -o "$out" .
+          ls -lh "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmrouter-${{ matrix.suffix }}
+          path: llmrouter-${{ matrix.suffix }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
