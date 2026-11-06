@@ -54,6 +54,7 @@ type UsageStat struct {
 	Model            string `json:"model"`
 	Requests         int64  `json:"requests"`
 	PromptTokens     int64  `json:"prompt_tokens"`
+	CachedTokens     int64  `json:"cached_tokens,omitempty"` // 输入中命中缓存的 token（含在 prompt_tokens 内）
 	CompletionTokens int64  `json:"completion_tokens"`
 }
 
@@ -305,23 +306,31 @@ func genAPIKey() string {
 	return "sk-r-" + hex.EncodeToString(b)
 }
 
+// Usage 一次调用的 token 用量
+type Usage struct {
+	Prompt     int64 // 输入总 tokens（含缓存命中部分）
+	Cached     int64 // 其中命中缓存的 tokens
+	Completion int64 // 输出 tokens
+}
+
 // AddUsage 记一次调用并落盘
-func (s *Store) AddUsage(m *Model, keyID string, prompt, completion int64) {
+func (s *Store) AddUsage(m *Model, keyID string, u Usage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	today := time.Now().Format("2006-01-02")
-	for _, u := range s.Usage {
-		if u.Date == today && u.KeyID == keyID && u.ProviderID == m.ProviderID && u.Model == m.Name {
-			u.Requests++
-			u.PromptTokens += prompt
-			u.CompletionTokens += completion
+	for _, st := range s.Usage {
+		if st.Date == today && st.KeyID == keyID && st.ProviderID == m.ProviderID && st.Model == m.Name {
+			st.Requests++
+			st.PromptTokens += u.Prompt
+			st.CachedTokens += u.Cached
+			st.CompletionTokens += u.Completion
 			s.save()
 			return
 		}
 	}
 	s.Usage = append(s.Usage, &UsageStat{
 		Date: today, KeyID: keyID, ProviderID: m.ProviderID, Model: m.Name,
-		Requests: 1, PromptTokens: prompt, CompletionTokens: completion,
+		Requests: 1, PromptTokens: u.Prompt, CachedTokens: u.Cached, CompletionTokens: u.Completion,
 	})
 	s.save()
 }

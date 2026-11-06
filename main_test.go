@@ -829,6 +829,91 @@ func TestSessionExpiry(t *testing.T) {
 	}
 }
 
+func TestStreamUsageCounting(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n" +
+		"data: [DONE]\n\n"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, sse)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "m", nil)
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m","stream":true}`)
+	if resp.StatusCode != 200 || body != sse {
+		t.Fatalf("SSE 应原样透传: %d %q", resp.StatusCode, body)
+	}
+	// 记账发生在响应体写完之后，轮询等待 handler 收尾
+	var st struct {
+		Usage []*UsageStat `json:"usage"`
+	}
+	for i := 0; i < 50; i++ {
+		if err := json.Unmarshal(s.store.SnapshotJSON(), &st); err != nil {
+			t.Fatal(err)
+		}
+		if len(st.Usage) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(st.Usage) != 1 || st.Usage[0].PromptTokens != 11 || st.Usage[0].CompletionTokens != 22 {
+		t.Errorf("流式 usage 未记账: %+v", st.Usage)
+	}
+}
+
+func TestExtractStreamUsage(t *testing.T) {
+	// responses 风格：usage 嵌套在 response 对象里，且含二级嵌套
+	respStyle := []byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":107,"input_tokens_details":{"text_tokens":107},"output_tokens":36}}}`)
+	if u := extractStreamUsage(respStyle); u.Prompt != 107 || u.Completion != 36 {
+		t.Errorf("responses 风格提取错误: %d/%d", u.Prompt, u.Completion)
+	}
+	// chat 风格
+	chatStyle := []byte(`...data: {"usage":{"prompt_tokens":5,"completion_tokens":6}}`)
+	if u := extractStreamUsage(chatStyle); u.Prompt != 5 || u.Completion != 6 {
+		t.Errorf("chat 风格提取错误: %d/%d", u.Prompt, u.Completion)
+	}
+	// 无 usage / usage:null
+	if u := extractStreamUsage([]byte("data: [DONE]")); u.Prompt != 0 || u.Completion != 0 {
+		t.Errorf("无 usage 应为 0: %d/%d", u.Prompt, u.Completion)
+	}
+	if u := extractStreamUsage([]byte(`{"usage":null}`)); u.Prompt != 0 || u.Completion != 0 {
+		t.Errorf("usage:null 应为 0: %d/%d", u.Prompt, u.Completion)
+	}
+}
+
+func TestCachedTokens(t *testing.T) {
+	// 流式尾部嗅探应提取缓存命中量
+	tail := []byte(`data: {"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":80}}}`)
+	if got := extractStreamUsage(tail); got.Prompt != 100 || got.Cached != 80 || got.Completion != 10 {
+		t.Errorf("流式缓存提取错误: %+v", got)
+	}
+	// 无缓存字段时 Cached 为 0
+	tail2 := []byte(`data: {"usage":{"prompt_tokens":50,"completion_tokens":5}}`)
+	if got := extractStreamUsage(tail2); got.Prompt != 50 || got.Cached != 0 {
+		t.Errorf("无缓存字段应记 0: %+v", got)
+	}
+
+	// 非流式响应经代理后应记下 cached_tokens
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":900}}}`)
+	}))
+	defer up.Close()
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "m", nil)
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+		t.Fatal("请求失败")
+	}
+	var st struct {
+		Usage []*UsageStat `json:"usage"`
+	}
+	json.Unmarshal(s.store.SnapshotJSON(), &st)
+	if len(st.Usage) != 1 || st.Usage[0].CachedTokens != 900 || st.Usage[0].PromptTokens != 1000 {
+		t.Errorf("非流式缓存未记账: %+v", st.Usage)
+	}
+}
+
 func TestNoModelField(t *testing.T) {
 	_, app := newTestServer(t)
 	resp, body := postJSON(t, app, "/v1/chat/completions", `{"messages":[]}`)

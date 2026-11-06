@@ -57,7 +57,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
     -d '{"model":"gpt-4o","messages":[...]}'
   ```
 - 静音时段按服务器本地时间，每天重复，支持跨零点（如 22:00~06:00）
-- 非流式响应会顺带读取 `usage` 字段记账 token（兼容 `prompt_tokens/completion_tokens` 与 `input_tokens/output_tokens`）；流式响应不解析流（保证透传），因此只计请求数、不计入每日 token 上限
+- 非流式响应会顺带读取 `usage` 字段记账 token（兼容 `prompt_tokens/completion_tokens` 与 `input_tokens/output_tokens`）；流式响应透传时保留 8KB 滚动尾部副本（不改任何字节），从末尾 `usage` 事件提取 token，同样计入统计与每日上限
+- 缓存命中单独统计：读取 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`（含在输入 token 内），用量页展示缓存量与命中率
 - Provider 的 API Key 为空时，客户端的 Authorization 头会原样转发（自带 Key 模式）
 
 ## 模型测试按钮

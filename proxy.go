@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -231,6 +233,56 @@ func skipReqHeader(k string) bool {
 	return false
 }
 
+// sseSniffer 透传 SSE 的同时保留一份滚动尾部（不改任何字节），流结束后从中提取 usage
+type sseSniffer struct {
+	w    flushWriter
+	tail []byte
+}
+
+func (s *sseSniffer) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	s.tail = append(s.tail, p[:n]...)
+	if len(s.tail) > 8192 {
+		s.tail = s.tail[len(s.tail)-8192:]
+	}
+	return n, err
+}
+
+var (
+	rePromptTok     = regexp.MustCompile(`"prompt_tokens"\s*:\s*(\d+)`)
+	reCompletionTok = regexp.MustCompile(`"completion_tokens"\s*:\s*(\d+)`)
+	reInputTok      = regexp.MustCompile(`"input_tokens"\s*:\s*(\d+)`)
+	reOutputTok     = regexp.MustCompile(`"output_tokens"\s*:\s*(\d+)`)
+	reCachedTok     = regexp.MustCompile(`"cached_tokens"\s*:\s*(\d+)`)
+)
+
+// extractStreamUsage 从 SSE 尾部提取最后一个 usage 对象里的 token 数，
+// 兼容 chat completions（prompt/completion_tokens）与 responses（input/output_tokens）两种字段名，
+// 并提取缓存命中量（prompt_tokens_details.cached_tokens / input_tokens_details.cached_tokens）
+func extractStreamUsage(tail []byte) Usage {
+	i := bytes.LastIndex(tail, []byte(`"usage"`))
+	if i < 0 {
+		return Usage{}
+	}
+	seg := tail[i:]
+	if len(seg) > 2048 {
+		seg = seg[:2048]
+	}
+	grab := func(re *regexp.Regexp) int64 {
+		if m := re.FindSubmatch(seg); m != nil {
+			if v, err := strconv.ParseInt(string(m[1]), 10, 64); err == nil {
+				return v
+			}
+		}
+		return 0
+	}
+	u := Usage{Prompt: grab(rePromptTok), Completion: grab(reCompletionTok), Cached: grab(reCachedTok)}
+	if u.Prompt == 0 && u.Completion == 0 {
+		u.Prompt, u.Completion = grab(reInputTok), grab(reOutputTok)
+	}
+	return u
+}
+
 // relay 把上游响应原样写回客户端；非流式响应顺带读取 usage 记账
 func (s *Server) relay(w http.ResponseWriter, resp *http.Response, m Model, keyID string) {
 	defer resp.Body.Close()
@@ -244,32 +296,45 @@ func (s *Server) relay(w http.ResponseWriter, resp *http.Response, m Model, keyI
 	}
 	w.WriteHeader(resp.StatusCode)
 	if resp.StatusCode == 204 || resp.StatusCode == 304 {
-		s.store.AddUsage(&m, keyID, 0, 0)
+		s.store.AddUsage(&m, keyID, Usage{})
 		return
 	}
 	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
-		io.Copy(flushWriter{w}, resp.Body) // 流式：边收边发，不解析
-		s.store.AddUsage(&m, keyID, 0, 0)
+		sn := &sseSniffer{w: flushWriter{w}}
+		io.Copy(sn, resp.Body) // 流式：边收边发，字节不变，尾部嗅探 usage
+		s.store.AddUsage(&m, keyID, extractStreamUsage(sn.tail))
 		return
 	}
 	buf, _ := io.ReadAll(resp.Body)
 	var u struct {
 		Usage *struct {
-			PromptTokens     int64 `json:"prompt_tokens"` // chat completions
-			CompletionTokens int64 `json:"completion_tokens"`
-			InputTokens      int64 `json:"input_tokens"` // responses 协议
-			OutputTokens     int64 `json:"output_tokens"`
+			PromptTokens        int64 `json:"prompt_tokens"` // chat completions
+			CompletionTokens    int64 `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int64 `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			InputTokens        int64 `json:"input_tokens"` // responses 协议
+			OutputTokens       int64 `json:"output_tokens"`
+			InputTokensDetails *struct {
+				CachedTokens int64 `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
 	json.Unmarshal(buf, &u)
-	pt, ct := int64(0), int64(0)
+	var uu Usage
 	if u.Usage != nil {
-		if pt, ct = u.Usage.PromptTokens, u.Usage.CompletionTokens; pt == 0 && ct == 0 {
-			pt, ct = u.Usage.InputTokens, u.Usage.OutputTokens
+		uu = Usage{Prompt: u.Usage.PromptTokens, Completion: u.Usage.CompletionTokens}
+		if uu.Prompt == 0 && uu.Completion == 0 {
+			uu.Prompt, uu.Completion = u.Usage.InputTokens, u.Usage.OutputTokens
+		}
+		if u.Usage.PromptTokensDetails != nil {
+			uu.Cached = u.Usage.PromptTokensDetails.CachedTokens
+		} else if u.Usage.InputTokensDetails != nil {
+			uu.Cached = u.Usage.InputTokensDetails.CachedTokens
 		}
 	}
 	w.Write(buf)
-	s.store.AddUsage(&m, keyID, pt, ct)
+	s.store.AddUsage(&m, keyID, uu)
 }
 
 func skipRespHeader(k string) bool {

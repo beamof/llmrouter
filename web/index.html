@@ -105,7 +105,7 @@ dialog::backdrop{background:#0006}
       <div class="hint">客户端携带 <span class="mono">Authorization: Bearer sk-r-…</span> 访问 /v1/*；一个 Key 都没有时代理入口不鉴权</div>
     </div>
     <table id="keys-table">
-      <thead><tr><th>备注</th><th>Key</th><th>创建时间</th><th class="num">今日用量(tokens)</th><th>操作</th></tr></thead>
+      <thead><tr><th>备注</th><th>Key</th><th>创建时间</th><th class="num">今日用量 (万 tokens)</th><th>操作</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -120,7 +120,7 @@ dialog::backdrop{background:#0006}
     <div class="sumcards" id="usage-sum"></div>
     <div class="sumcards" id="usage-keysum"></div>
     <table id="usage-table">
-      <thead><tr><th>日期</th><th>Key</th><th>Provider</th><th>模型</th><th class="num">tokens 合计</th><th class="num">请求数</th><th class="num">输入</th><th class="num">输出</th></tr></thead>
+      <thead><tr><th>日期</th><th>Key</th><th>Provider</th><th>模型</th><th class="num">tokens 合计 (万)</th><th class="num">请求数</th><th class="num">输入 (万)</th><th class="num">缓存命中 (万)</th><th class="num">输出 (万)</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -173,7 +173,14 @@ const $ = id => document.getElementById(id);
 const dlgProvider = $('dlg-provider'), dlgModel = $('dlg-model');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtN = n => (n || 0).toLocaleString();
-const fmtWan = n => (n = n || 0) >= 10000 ? (n / 10000).toFixed(1) + '万' : fmtN(n);
+const fmtWan = n => (n = n || 0) >= 10000 ? (n / 10000).toFixed(1) + '万' : fmtN(n); // 智能显示：≥1万用万
+// 用量统一以「万」为单位展示，小数位自适应（大值 1 位 / 常规 2 位 / 微小值 4 位），精确值放 title
+const wan2 = n => {
+  const w = (n || 0) / 10000;
+  const s = w >= 100 ? w.toFixed(1) : w >= 0.01 ? w.toFixed(2) : w.toFixed(4);
+  return s.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '') + '万';
+};
+const wanTitle = n => fmtN(n) + ' tokens';
 const pname = id => (S.providers.find(p => p.id === id) || {}).name || id;
 
 async function api(method, path, body) {
@@ -224,7 +231,7 @@ function renderModels() {
       <td style="white-space:nowrap">${m.priority}
         <button class="btn mini" title="提高优先级" onclick="move('${m.id}',-1)">▲</button>
         <button class="btn mini" title="降低优先级" onclick="move('${m.id}',1)">▼</button></td>
-      <td class="num">${fmtWan(m.used_today)} / ${m.daily_limit > 0 ? +(m.daily_limit / 10000).toFixed(2) + '万' : '∞'}</td>
+      <td class="num" title="${wanTitle(m.used_today)}">${wan2(m.used_today)} / ${m.daily_limit > 0 ? +(m.daily_limit / 10000).toFixed(2) + '万' : '∞'}</td>
       <td>${(m.mutes || []).map(w => esc(w.from + '~' + w.to)).join('<br>') || '<span class="hint">—</span>'}</td>
       <td style="max-width:220px">
         <button class="btn mini" onclick="testModel('${m.id}')">测试</button>
@@ -412,7 +419,7 @@ function renderKeys() {
       <td>${esc(k.name)}</td>
       <td class="mono">${esc(k.key)} <button class="btn mini" onclick="copyKey('${esc(k.key)}')">复制</button></td>
       <td class="hint">${new Date(k.created_at).toLocaleString()}</td>
-      <td class="num">${fmtWan(todayTok[k.id] || 0)}</td>
+      <td class="num" title="${wanTitle(todayTok[k.id] || 0)}">${wan2(todayTok[k.id] || 0)}</td>
       <td><button class="btn mini danger" onclick="delKey('${k.id}', '${esc(k.name)}')">删除</button></td>
     </tr>`).join('');
 }
@@ -455,26 +462,32 @@ function usageFiltered() {
 
 function renderUsage() {
   const rows = usageFiltered();
-  const agg = {}, byKey = {}, tot = {r: 0, pt: 0, ct: 0};
+  const agg = {}, byKey = {}, tot = {r: 0, pt: 0, ct: 0, ca: 0};
   for (const u of rows) {
-    (agg[u.provider_id] ??= {r: 0, pt: 0, ct: 0});
-    agg[u.provider_id].r += u.requests; agg[u.provider_id].pt += u.prompt_tokens; agg[u.provider_id].ct += u.completion_tokens;
-    (byKey[u.key_id || ''] ??= {r: 0, pt: 0, ct: 0});
-    byKey[u.key_id || ''].r += u.requests; byKey[u.key_id || ''].pt += u.prompt_tokens; byKey[u.key_id || ''].ct += u.completion_tokens;
-    tot.r += u.requests; tot.pt += u.prompt_tokens; tot.ct += u.completion_tokens;
+    (agg[u.provider_id] ??= {r: 0, pt: 0, ct: 0, ca: 0});
+    agg[u.provider_id].r += u.requests; agg[u.provider_id].pt += u.prompt_tokens; agg[u.provider_id].ct += u.completion_tokens; agg[u.provider_id].ca += u.cached_tokens || 0;
+    (byKey[u.key_id || ''] ??= {r: 0, pt: 0, ct: 0, ca: 0});
+    byKey[u.key_id || ''].r += u.requests; byKey[u.key_id || ''].pt += u.prompt_tokens; byKey[u.key_id || ''].ct += u.completion_tokens; byKey[u.key_id || ''].ca += u.cached_tokens || 0;
+    tot.r += u.requests; tot.pt += u.prompt_tokens; tot.ct += u.completion_tokens; tot.ca += u.cached_tokens || 0;
   }
   const rangeLabel = {today: '今日', '7d': '近 7 天', month: '本月'}[usageRange];
-  const card = (label, v) => `<div class="sumcard"><span>${label}</span><b>${fmtWan(v.pt + v.ct)}</b><span>tokens · ${fmtN(v.r)} 次请求 · in ${fmtN(v.pt)} · out ${fmtN(v.ct)}</span></div>`;
+  const card = (label, v) => {
+    const hit = v.pt > 0 ? Math.round(v.ca / v.pt * 100) : 0;
+    return `<div class="sumcard"><span>${label}</span><b title="${wanTitle(v.pt + v.ct)}">${wan2(v.pt + v.ct)}</b><span>tokens · ${fmtN(v.r)} 次请求<br>输入 ${wan2(v.pt)}（缓存 ${wan2(v.ca)}，命中 ${hit}%）· 输出 ${wan2(v.ct)}</span></div>`;
+  };
   $('usage-sum').innerHTML =
     Object.entries(agg).map(([k, v]) => card(esc(pname(k)), v)).join('') + card(rangeLabel + '总计', tot);
   $('usage-keysum').innerHTML = Object.entries(byKey).map(([k, v]) => card('Key · ' + esc(keyName(k)), v)).join('');
   const tb = $('usage-table').querySelector('tbody');
-  if (!rows.length) { tb.innerHTML = `<tr><td colspan="8" class="empty">${rangeLabel}暂无用量数据</td></tr>`; return; }
+  if (!rows.length) { tb.innerHTML = `<tr><td colspan="9" class="empty">${rangeLabel}暂无用量数据</td></tr>`; return; }
   tb.innerHTML = rows.slice(0, 300).map(u => `
     <tr>
       <td>${u.date}</td><td>${esc(keyName(u.key_id))}</td><td>${esc(pname(u.provider_id))}</td><td class="mono">${esc(u.model)}</td>
-      <td class="num"><b>${fmtWan(u.prompt_tokens + u.completion_tokens)}</b></td>
-      <td class="num">${fmtN(u.requests)}</td><td class="num">${fmtN(u.prompt_tokens)}</td><td class="num">${fmtN(u.completion_tokens)}</td>
+      <td class="num" title="${wanTitle(u.prompt_tokens + u.completion_tokens)}"><b>${wan2(u.prompt_tokens + u.completion_tokens)}</b></td>
+      <td class="num">${fmtN(u.requests)}</td>
+      <td class="num" title="${wanTitle(u.prompt_tokens)}">${wan2(u.prompt_tokens)}</td>
+      <td class="num" title="${wanTitle(u.cached_tokens || 0)}">${wan2(u.cached_tokens || 0)}</td>
+      <td class="num" title="${wanTitle(u.completion_tokens)}">${wan2(u.completion_tokens)}</td>
     </tr>`).join('');
 }
 
