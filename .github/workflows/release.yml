@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false # 项目无外部依赖、没有 go.sum，开启缓存只会报恢复失败
 
       - name: Test
         run: go test ./...
