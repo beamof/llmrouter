@@ -23,8 +23,6 @@ jobs:
         include:
           - { goos: linux,   goarch: amd64, suffix: linux-x86_64 }
           - { goos: linux,   goarch: arm64, suffix: linux-arm64 }
-          - { goos: darwin,  goarch: amd64, suffix: darwin-x86_64 }
-          - { goos: darwin,  goarch: arm64, suffix: darwin-arm64 }
           - { goos: windows, goarch: amd64, suffix: windows-x86_64.exe }
           - { goos: windows, goarch: arm64, suffix: windows-arm64.exe }
     steps:
