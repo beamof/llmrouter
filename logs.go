@@ -7,22 +7,29 @@ import (
 // maxLogs 异常日志最多保留的条数，超出时丢弃最旧的
 const maxLogs = 500
 
-// LogEntry 一次异常或失败记录。
-// 只记失败与异常，成功请求走用量统计（Usage），不在这里重复记录。
+// LogEntry 一次异常、失败或会话建立记录。
 type LogEntry struct {
 	ID         string    `json:"id"`
 	Time       time.Time `json:"time"`
-	Level      string    `json:"level"`  // error | warn
-	Kind       string    `json:"kind"`   // 失败类型，见下面 kind* 常量
+	Level      string    `json:"level"`  // info | warn | error
+	Kind       string    `json:"kind"`   // 记录类型，见下面 kind* 常量
 	Status     int       `json:"status"` // 相关 HTTP 状态码：上游失败时为上游返回码，其余为返回给客户端的码
 	KeyID      string    `json:"key_id,omitempty"`
 	ProviderID string    `json:"provider_id,omitempty"`
 	Model      string    `json:"model,omitempty"`
 	Message    string    `json:"message"`          // 简要说明
 	Detail     string    `json:"detail,omitempty"` // 上游错误详情（已截断）
+
+	// 会话建立相关（kind = session）
+	SessionID  string       `json:"session_id,omitempty"` // 客户端 X-Session-ID 原文
+	Requested  string       `json:"requested,omitempty"`  // 请求体里的 model 字段
+	Bound      bool         `json:"bound,omitempty"`      // true = 复用已有绑定，false = 新建绑定
+	Reason     string       `json:"reason,omitempty"`     // 选择该模型的理由（一句话）
+	Candidates []string     `json:"candidates,omitempty"` // 候选顺序：Provider/模型（优先级）
+	Skipped    []SkipReason `json:"skipped,omitempty"`    // 被剔除的条目及原因
 }
 
-// 失败类型
+// 记录类型
 const (
 	kindAuth        = "auth"         // 客户端 API Key 无效
 	kindBadRequest  = "bad_request"  // 请求体不合法
@@ -31,11 +38,20 @@ const (
 	kindAllFailed   = "all_failed"   // 所有上游都失败，返回 502
 	kindAdminAuth   = "admin_auth"   // 后台令牌错误
 	kindAdminLocked = "admin_locked" // 后台令牌因连续错误被锁定
+	kindSession     = "session"      // 会话建立/切换绑定
 )
 
 // logFail 记一条异常日志。detail 会截断，避免把大段上游响应塞进状态文件。
 func (s *Server) logFail(e LogEntry) {
 	e.Detail = truncateRunes(e.Detail, 500)
+	s.store.AddLog(&e)
+}
+
+// logSession 记一条会话建立日志（模型选择结果 + 理由）。
+// 只记成功选定的那次，且失败重试导致的切换会另起一条，便于回溯"为什么走了这个上游"。
+func (s *Server) logSession(e LogEntry) {
+	e.Kind = kindSession
+	e.Level = "info"
 	s.store.AddLog(&e)
 }
 

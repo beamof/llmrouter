@@ -443,49 +443,75 @@ func (s *Store) CandidateByID(modelID string) (Candidate, bool) {
 	return Candidate{}, false
 }
 
-// AllCandidates 所有模型的可用候选（auto 虚拟模型路由用），剔除静音中、超每日上限的，按优先级降序
-func (s *Store) AllCandidates(now time.Time) []Candidate {
+// SkipReason 某条模型路由被排除在候选之外的原因（用于会话日志说明选择理由）
+type SkipReason struct {
+	ModelID    string `json:"model_id"`
+	Model      string `json:"model"`
+	ProviderID string `json:"provider_id"`
+	Reason     string `json:"reason"`
+}
+
+// skipReason 该条目为何不可用，返回空串表示可用（调用方需持锁）
+func (s *Store) skipReason(m *Model, now time.Time, today string) string {
+	switch {
+	case mutedNow(m.Mutes, now):
+		return "处于静音时段"
+	case s.overLimit(m, today):
+		return "已达每日 token 上限"
+	case s.atCapacity(m):
+		return fmt.Sprintf("并行已满 %d/%d", s.inflight[m.ID], m.MaxConcurrent)
+	}
+	return ""
+}
+
+// providerLocked 按 ID 取 provider 指针（调用方需持锁）
+func (s *Store) providerLocked(id string) (*Provider, bool) {
+	for _, p := range s.Providers {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return nil, false
+}
+
+// CandidatesDetailed 与 Candidates / AllCandidates 同义，但同时返回被剔除条目的原因。
+// name 为空或 all 为 true 时不按名字过滤（auto 虚拟模型用）。
+func (s *Store) CandidatesDetailed(name string, now time.Time, all bool) ([]Candidate, []SkipReason) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	today := now.Format("2006-01-02")
 	var out []Candidate
+	var skips []SkipReason
 	for _, m := range s.Models {
-		if mutedNow(m.Mutes, now) || s.overLimit(m, today) || s.atCapacity(m) {
+		if !all && m.Name != name {
 			continue
 		}
-		for _, p := range s.Providers {
-			if p.ID == m.ProviderID {
-				c := Candidate{Provider: *p, Model: *m}
-				c.Model.Mutes = append([]MuteWindow(nil), m.Mutes...)
-				out = append(out, c)
-				break
-			}
+		if r := s.skipReason(m, now, today); r != "" {
+			skips = append(skips, SkipReason{ModelID: m.ID, Model: m.Name, ProviderID: m.ProviderID, Reason: r})
+			continue
 		}
+		p, ok := s.providerLocked(m.ProviderID)
+		if !ok {
+			skips = append(skips, SkipReason{ModelID: m.ID, Model: m.Name, ProviderID: m.ProviderID, Reason: "Provider 不存在"})
+			continue
+		}
+		c := Candidate{Provider: *p, Model: *m}
+		c.Model.Mutes = append([]MuteWindow(nil), m.Mutes...)
+		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Model.Priority > out[j].Model.Priority })
+	return out, skips
+}
+
+// AllCandidates 所有模型的可用候选（auto 虚拟模型路由用），剔除静音中、超每日上限的，按优先级降序
+func (s *Store) AllCandidates(now time.Time) []Candidate {
+	out, _ := s.CandidatesDetailed("", now, true)
 	return out
 }
 
 // Candidates 找出该名字的可用候选：剔除静音中、今日 token 已达上限的，按优先级降序
 func (s *Store) Candidates(name string, now time.Time) []Candidate {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	today := now.Format("2006-01-02")
-	var out []Candidate
-	for _, m := range s.Models {
-		if m.Name != name || mutedNow(m.Mutes, now) || s.overLimit(m, today) || s.atCapacity(m) {
-			continue
-		}
-		for _, p := range s.Providers {
-			if p.ID == m.ProviderID {
-				c := Candidate{Provider: *p, Model: *m}
-				c.Model.Mutes = append([]MuteWindow(nil), m.Mutes...)
-				out = append(out, c)
-				break
-			}
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Model.Priority > out[j].Model.Priority })
+	out, _ := s.CandidatesDetailed(name, now, false)
 	return out
 }
 

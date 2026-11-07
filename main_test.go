@@ -1327,3 +1327,202 @@ func TestStateIncludesInflight(t *testing.T) {
 		t.Fatalf("状态应带 inflight/max_concurrent: %+v", v.Models)
 	}
 }
+
+// 会话建立要记日志，含选中理由、候选顺序与被剔除原因
+func TestSessionLogNewBinding(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	// 高优先级模型设静音，应该被剔除
+	now := time.Now()
+	from := now.Add(-time.Hour).Format("15:04")
+	to := now.Add(time.Hour).Format("15:04")
+	addProviderModel(t, s, up.URL, "m", func(m *Model) {
+		m.Priority = 99
+		m.Mutes = []MuteWindow{{From: from, To: to}}
+	})
+	addProviderModel(t, s, up.URL, "m", func(m *Model) { m.Priority = 10 })
+
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "sess-1"); resp.StatusCode != 200 {
+		t.Fatalf("应 200, got %d %s", resp.StatusCode, body)
+	}
+
+	s.store.mu.Lock()
+	var sess *LogEntry
+	for _, l := range s.store.Logs {
+		if l.Kind == kindSession {
+			sess = l
+		}
+	}
+	s.store.mu.Unlock()
+	if sess == nil {
+		t.Fatal("应记录一条会话日志")
+	}
+	if sess.Model != "m" || sess.SessionID != "sess-1" || sess.Requested != "m" {
+		t.Errorf("会话日志字段不对: %+v", sess)
+	}
+	if sess.Bound {
+		t.Error("首次建立应为新建绑定（bound=false）")
+	}
+	if !strings.Contains(sess.Reason, "按优先级") {
+		t.Errorf("理由应说明按优先级选中: %q", sess.Reason)
+	}
+	if len(sess.Candidates) != 1 {
+		t.Errorf("候选应只剩 1 个（静音的被剔除）: %v", sess.Candidates)
+	}
+	if len(sess.Skipped) != 1 || !strings.Contains(sess.Skipped[0].Reason, "静音") {
+		t.Errorf("应记录被静音剔除的条目: %+v", sess.Skipped)
+	}
+}
+
+// 第二次同会话请求应标记为复用绑定
+func TestSessionLogReuseBinding(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "m", nil)
+
+	for i := 0; i < 2; i++ {
+		postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "X-Session-ID", "sess-2")
+	}
+	s.store.mu.Lock()
+	var sess []*LogEntry
+	for _, l := range s.store.Logs {
+		if l.Kind == kindSession {
+			sess = append(sess, l)
+		}
+	}
+	s.store.mu.Unlock()
+	if len(sess) != 2 {
+		t.Fatalf("应记录 2 条会话日志, got %d", len(sess))
+	}
+	if sess[0].Bound {
+		t.Error("第一条应为新建绑定")
+	}
+	if !sess[1].Bound || !strings.Contains(sess[1].Reason, "复用") {
+		t.Errorf("第二条应复用绑定: bound=%v reason=%q", sess[1].Bound, sess[1].Reason)
+	}
+}
+
+// auto 虚拟模型的理由应说明是全局最高优先级
+func TestSessionLogAutoModel(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "real-model", func(m *Model) { m.Priority = 7 })
+
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"auto"}`); resp.StatusCode != 200 {
+		t.Fatalf("应 200, got %d %s", resp.StatusCode, body)
+	}
+	s.store.mu.Lock()
+	var sess *LogEntry
+	for _, l := range s.store.Logs {
+		if l.Kind == kindSession {
+			sess = l
+		}
+	}
+	s.store.mu.Unlock()
+	if sess == nil {
+		t.Fatal("应记录会话日志")
+	}
+	if sess.Model != "real-model" || sess.Requested != "auto" {
+		t.Errorf("应记录实际模型与原始请求名: %+v", sess)
+	}
+	if !strings.Contains(sess.Reason, "auto") {
+		t.Errorf("理由应提到 auto: %q", sess.Reason)
+	}
+}
+
+// 并行已满让位的模型，要在理由里点出来
+func TestSessionLogMentionsFullModel(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	full := addProviderModel(t, s, up.URL, "m", func(m *Model) {
+		m.Priority = 50
+		m.MaxConcurrent = 1
+	})
+	addProviderModel(t, s, up.URL, "m", func(m *Model) { m.Priority = 10 })
+	s.store.TryAcquire(full.ID) // 占满高优先级模型
+
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+		t.Fatalf("应 200, got %d %s", resp.StatusCode, body)
+	}
+	s.store.mu.Lock()
+	var sess *LogEntry
+	for _, l := range s.store.Logs {
+		if l.Kind == kindSession {
+			sess = l
+		}
+	}
+	s.store.mu.Unlock()
+	if sess == nil {
+		t.Fatal("应记录会话日志")
+	}
+	if !strings.Contains(sess.Reason, "并行已满") {
+		t.Errorf("理由应说明有模型因并行已满让位: %q", sess.Reason)
+	}
+	if len(sess.Skipped) != 1 || !strings.Contains(sess.Skipped[0].Reason, "并行已满") {
+		t.Errorf("应记录并行已满的剔除项: %+v", sess.Skipped)
+	}
+}
+
+// CandidatesDetailed 的剔除原因要覆盖静音、超限、并行满、Provider 缺失
+func TestCandidatesDetailedSkipReasons(t *testing.T) {
+	s, _ := newTestServer(t)
+	now := time.Now()
+	from := now.Add(-time.Hour).Format("15:04")
+	to := now.Add(time.Hour).Format("15:04")
+
+	muted := addProviderModel(t, s, "http://a.invalid", "m", func(m *Model) {
+		m.Priority = 40
+		m.Mutes = []MuteWindow{{From: from, To: to}}
+	})
+	limited := addProviderModel(t, s, "http://b.invalid", "m", func(m *Model) {
+		m.Priority = 30
+		m.DailyLimit = 1
+	})
+	capacity := addProviderModel(t, s, "http://c.invalid", "m", func(m *Model) {
+		m.Priority = 20
+		m.MaxConcurrent = 1
+	})
+	ok := addProviderModel(t, s, "http://d.invalid", "m", func(m *Model) { m.Priority = 10 })
+
+	// 造出「已达每日上限」
+	s.store.AddUsage(&Model{ProviderID: limited.ProviderID, Name: limited.Name}, "", Usage{Prompt: 5})
+	s.store.TryAcquire(capacity.ID)
+
+	cands, skips := s.store.CandidatesDetailed("m", time.Now(), false)
+	if len(cands) != 1 || cands[0].Model.ID != ok.ID {
+		t.Fatalf("应只剩 1 个可用候选: %+v", cands)
+	}
+	if len(skips) != 3 {
+		t.Fatalf("应有 3 个剔除项, got %d: %+v", len(skips), skips)
+	}
+	byID := map[string]string{}
+	for _, sk := range skips {
+		byID[sk.ModelID] = sk.Reason
+	}
+	if !strings.Contains(byID[muted.ID], "静音") {
+		t.Errorf("静音原因不对: %q", byID[muted.ID])
+	}
+	if !strings.Contains(byID[limited.ID], "每日") {
+		t.Errorf("超限原因不对: %q", byID[limited.ID])
+	}
+	if !strings.Contains(byID[capacity.ID], "并行已满") {
+		t.Errorf("并行原因不对: %q", byID[capacity.ID])
+	}
+}

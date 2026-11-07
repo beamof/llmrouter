@@ -115,21 +115,22 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 
 		// 会话绑定的候选排最前（不套用静音/上限规则），规则候选作为 fallback 池
 		sessKey := ""
-		if sid := r.Header.Get("X-Session-ID"); sid != "" {
+		sid := r.Header.Get("X-Session-ID")
+		if sid != "" {
 			sessKey = sid + "\x00" + req.Model
 		}
+		now := time.Now()
 		var cands []Candidate
+		boundID := "" // 已绑定的模型条目 ID，用于区分「复用绑定」与「新建绑定」
 		if sessKey != "" {
 			if modelID, ok := s.getSession(sessKey); ok {
 				if c, ok := s.store.CandidateByID(modelID); ok {
 					cands = append(cands, c)
+					boundID = modelID
 				}
 			}
 		}
-		rule := s.store.Candidates(req.Model, time.Now())
-		if isAuto {
-			rule = s.store.AllCandidates(time.Now())
-		}
+		rule, skips := s.store.CandidatesDetailed(req.Model, now, isAuto)
 		for _, c := range rule {
 			if len(cands) == 0 || cands[0].Model.ID != c.Model.ID {
 				cands = append(cands, c)
@@ -203,6 +204,24 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			}
 			if sessKey != "" {
 				s.setSession(sessKey, c.Model.ID) // 成功即绑定/续期
+				s.logSession(s.buildSessionLog(LogEntry{
+					KeyID:      keyID,
+					ProviderID: c.Provider.ID,
+					Model:      c.Model.Name,
+					SessionID:  sid,
+					Requested:  req.Model,
+					Bound:      boundID == c.Model.ID,
+					Status:     resp.StatusCode,
+				}, c, boundID, cands, skips, isAuto))
+			} else {
+				// 无会话头时也记一条，便于看清「一次性请求」选中了谁
+				s.logSession(s.buildSessionLog(LogEntry{
+					KeyID:      keyID,
+					ProviderID: c.Provider.ID,
+					Model:      c.Model.Name,
+					Requested:  req.Model,
+					Status:     resp.StatusCode,
+				}, c, "", cands, skips, isAuto))
 			}
 			s.relay(w, resp, c.Model, keyID) // relay 返回前会释放名额
 			return
@@ -218,6 +237,38 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 		})
 		writeErr(w, http.StatusBadGateway, "所有上游均失败，最后一个错误: "+lastErr)
 	}
+}
+
+// buildSessionLog 生成会话日志：在基础字段上补选路理由、候选顺序与被剔除的原因。
+// 理由分四种：复用绑定 / 会话切换 / 优先级最高 / auto 全局最高。
+func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, cands []Candidate, skips []SkipReason, isAuto bool) LogEntry {
+	// 候选顺序，带上优先级，便于看清"为什么是它"
+	for _, c := range cands {
+		e.Candidates = append(e.Candidates, fmt.Sprintf("%s/%s (优先级 %d)", c.Provider.Name, c.Model.Name, c.Model.Priority))
+	}
+	e.Skipped = skips
+
+	switch {
+	case boundID == chosen.Model.ID:
+		e.Bound = true
+		e.Reason = "会话已有绑定，直接复用"
+	case boundID != "":
+		e.Reason = "原绑定上游本次不可用，按优先级切换到下一个可用候选"
+	case isAuto:
+		e.Reason = fmt.Sprintf("auto 虚拟模型：全部可用模型中优先级最高（%d）", chosen.Model.Priority)
+	default:
+		e.Reason = fmt.Sprintf("未绑定会话，按优先级选中最高可用候选（%d）", chosen.Model.Priority)
+	}
+
+	// 把「与选中项同优先级、但因并行已满而让位」的情况说清楚
+	for _, sk := range skips {
+		if strings.HasPrefix(sk.Reason, "并行已满") {
+			e.Reason += fmt.Sprintf("；%s 同时因 %s 未参与", sk.Model, sk.Reason)
+			break
+		}
+	}
+	e.Message = fmt.Sprintf("建立会话 → %s / %s", chosen.Provider.Name, chosen.Model.Name)
+	return e
 }
 
 // withModel 只替换请求体顶层 model 字段的值，其余字段以 RawMessage 原样保留（auto 虚拟模型用）

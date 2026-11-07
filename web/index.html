@@ -299,7 +299,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
       </button>
       <button class="nav-item" data-page="logs">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2.4 17.4A2 2 0 0 0 4.1 20.4h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
-        异常日志
+        日志
         <span class="nav-badge" id="log-badge" hidden></span>
       </button>
     </nav>
@@ -385,13 +385,14 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
         </div>
       </section>
 
-      <!-- ================= 异常日志 ================= -->
+      <!-- ================= 日志 ================= -->
       <section id="page-logs" hidden>
         <div class="panel" style="margin-bottom:14px">
           <div class="panel-head" style="margin-bottom:0">
             <div class="row-inline">
               <div class="seg sm" id="log-filter">
                 <button data-kind="all" class="on">全部</button>
+                <button data-kind="session">会话</button>
                 <button data-kind="upstream">上游失败</button>
                 <button data-kind="routing">路由异常</button>
                 <button data-kind="auth">鉴权</button>
@@ -783,7 +784,7 @@ function go(p) {
   $('range-seg').hidden = p !== 'home';
   const meta = {
     home: ['用量总览', '实时 token 用量与请求趋势'],
-    logs: ['异常日志', '上游失败、路由异常与鉴权拒绝记录'],
+    logs: ['日志', '会话建立与选路理由、上游失败、路由异常、鉴权拒绝'],
     settings: ['设置', '模型路由、上游 Provider 与访问密钥'],
   }[p] || ['用量总览', ''];
   $('page-title').textContent = meta[0];
@@ -839,14 +840,16 @@ function renderAll() {
 }
 
 /* ---------- 异常日志 ---------- */
-// 服务端的 kind 分组到界面的三个筛选档
+// 服务端的 kind 分组到界面的筛选档
 const LOG_KINDS = {
   all: null,
+  session: ['session'],
   upstream: ['upstream', 'all_failed'],
   routing: ['no_candidate', 'bad_request'],
   auth: ['auth', 'admin_auth', 'admin_locked'],
 };
 const LOG_KIND_LABEL = {
+  session: ['ok', '会话'],
   auth: ['bad', 'API Key'],
   bad_request: ['warn', '请求体'],
   no_candidate: ['warn', '无可用上游'],
@@ -880,7 +883,7 @@ function renderLogs() {
   const tb = $('logs-body');
   if (!rows.length) {
     tb.innerHTML = `<tr><td colspan="6" class="empty">${
-      total ? '当前筛选下没有记录' : '暂无异常记录。请求失败、上游报错、鉴权被拒时会记在这里'
+      total ? '当前筛选下没有记录' : '暂无记录。会话建立、请求失败、上游报错、鉴权被拒时会记在这里'
     }</td></tr>`;
     return;
   }
@@ -889,14 +892,23 @@ function renderLogs() {
     const [cls, label] = LOG_KIND_LABEL[l.kind] || ['bad', l.kind];
     const t = new Date(l.time);
     const open = expandedLogs.has(l.id);
-    const hasDetail = !!l.detail;
+    const isSession = l.kind === 'session';
+    // 会话日志的「详情」由理由/候选/剔除项拼成；其他类型是上游错误原文
+    const expandable = isSession ? true : !!l.detail;
     const modelProv = [l.model, l.provider_id ? pname(l.provider_id) : ''].filter(Boolean);
+    const bindTag = isSession
+      ? (l.bound ? '<span class="pill ok" style="margin-left:4px">复用绑定</span>'
+                 : '<span class="pill warn" style="margin-left:4px">新建绑定</span>')
+      : '';
     return `<tr>
       <td class="log-time">${t.toLocaleDateString()} <small>${t.toLocaleTimeString()}</small></td>
       <td><span class="pill ${cls}">${esc(label)}</span></td>
       <td>
-        <div class="log-msg">${esc(l.message)}</div>
-        ${hasDetail && open ? `<div class="log-detail">${esc(l.detail)}</div>` : ''}
+        <div class="log-msg">${esc(l.message)}${bindTag}</div>
+        ${isSession && l.reason ? `<div class="cell-sub" style="margin-top:3px">理由：${esc(l.reason)}</div>` : ''}
+        ${isSession && l.session_id ? `<div class="cell-sub mono" style="margin-top:2px">会话 ${esc(l.session_id)} · 请求 ${esc(l.requested || '')}</div>` : ''}
+        ${!isSession && l.detail && open ? `<div class="log-detail">${esc(l.detail)}</div>` : ''}
+        ${isSession && open ? renderSessionDetail(l) : ''}
       </td>
       <td class="cell-sub">${
         modelProv.length
@@ -904,9 +916,20 @@ function renderLogs() {
           : '<span class="hint">—</span>'
       }${l.key_id !== undefined && l.key_id !== '' ? `<div class="hint">Key: ${esc(keyName(l.key_id))}</div>` : ''}</td>
       <td class="num">${l.status ? l.status : '<span class="hint">—</span>'}</td>
-      <td>${hasDetail ? `<button class="log-expand" title="${open ? '收起' : '展开详情'}" onclick="toggleLog('${l.id}')">${open ? '▾' : '▸'}</button>` : ''}</td>
+      <td>${expandable ? `<button class="log-expand" title="${open ? '收起' : '展开详情'}" onclick="toggleLog('${l.id}')">${open ? '▾' : '▸'}</button>` : ''}</td>
     </tr>`;
   }).join('');
+}
+
+// 会话日志展开：候选顺序 + 被剔除的条目及原因
+function renderSessionDetail(l) {
+  const cands = (l.candidates || []).map((c, i) =>
+    `<div>${i + 1}. ${esc(c)}${i === 0 ? ' ← 已选中' : ''}</div>`).join('');
+  const skips = (l.skipped || []).map(s =>
+    `<div>${esc(pname(s.provider_id))}/${esc(s.model)}：${esc(s.reason)}</div>`).join('');
+  return `<div class="log-detail">${
+    cands ? `候选顺序\n${cands}` : '无候选记录'
+  }${skips ? `\n\n已剔除\n${skips}` : ''}</div>`;
 }
 
 function toggleLog(id) {
