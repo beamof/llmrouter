@@ -30,6 +30,9 @@ type LogEntry struct {
 	Skipped    []SkipReason `json:"skipped,omitempty"`    // 被剔除的条目及原因
 }
 
+// rateLimitMute 上游返回 429 后自动静音的时长
+const rateLimitMute = 5 * time.Hour
+
 // 记录类型
 const (
 	kindAuth        = "auth"         // 客户端 API Key 无效
@@ -40,6 +43,7 @@ const (
 	kindAdminAuth   = "admin_auth"   // 后台令牌错误
 	kindAdminLocked = "admin_locked" // 后台令牌因连续错误被锁定
 	kindSession     = "session"      // 会话建立/切换绑定
+	kindMuted       = "muted"        // 上游 429，模型被自动静音
 )
 
 // logFail 记一条异常日志。detail 会截断，避免把大段上游响应塞进状态文件。

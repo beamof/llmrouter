@@ -160,6 +160,20 @@ func (s *Server) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 	s.replyState(w, r)
 }
 
+// handleModelUnmute 手动解除上游 429 触发的自动静音
+func (s *Server) handleModelUnmute(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if m, ok := s.store.Model(id); ok && m.MutedUntil.IsZero() {
+		writeErr(w, http.StatusBadRequest, "该模型当前没有自动静音")
+		return
+	}
+	if !s.store.ClearMute(id) {
+		writeErr(w, http.StatusNotFound, "模型不存在")
+		return
+	}
+	s.replyState(w, r)
+}
+
 // handleSettings 更新设置（目前只有 auto 虚拟模型名）
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {

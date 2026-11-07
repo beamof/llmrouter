@@ -1023,11 +1023,12 @@ func TestNoModelField(t *testing.T) {
 	}
 }
 
-// 上游失败应写入异常日志，含状态码、Provider 与上游错误详情
+// 上游失败应写入异常日志，含状态码、Provider 与上游错误详情。
+// 429 单独归为 muted 类型（会触发自动静音），这里用 500 验证普通失败路径。
 func TestLogUpstreamFailure(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(429)
-		fmt.Fprint(w, `{"error":{"message":"rate limit exceeded"}}`)
+		w.WriteHeader(500)
+		fmt.Fprint(w, `{"error":{"message":"upstream boom"}}`)
 	}))
 	defer up.Close()
 
@@ -1055,10 +1056,10 @@ func TestLogUpstreamFailure(t *testing.T) {
 	if up1 == nil || all == nil {
 		t.Fatalf("缺少预期日志: %+v", logs)
 	}
-	if up1.Status != 429 || up1.ProviderID != m.ProviderID || up1.Model != "m" {
+	if up1.Status != 500 || up1.ProviderID != m.ProviderID || up1.Model != "m" {
 		t.Errorf("上游失败日志字段不对: %+v", up1)
 	}
-	if !strings.Contains(up1.Detail, "rate limit exceeded") {
+	if !strings.Contains(up1.Detail, "upstream boom") {
 		t.Errorf("应含上游错误详情: %q", up1.Detail)
 	}
 	if all.Status != 502 || !strings.Contains(all.Message, "全部失败") {
@@ -1590,4 +1591,199 @@ func TestCandidatesDetailedSkipReasons(t *testing.T) {
 	if !strings.Contains(byID[capacity.ID], "并行已满") {
 		t.Errorf("并行原因不对: %q", byID[capacity.ID])
 	}
+}
+
+// 上游返回 429 后，该模型条目应被自动静音，后续请求直接跳过它
+func TestMuteOn429(t *testing.T) {
+	var hits int32
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"rate limit exceeded"}}`)
+	}))
+	defer upA.Close()
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upB.Close()
+
+	s, app := newTestServer(t)
+	a := addProviderModel(t, s, upA.URL, "m", func(m *Model) { m.Priority = 20 })
+	addProviderModel(t, s, upB.URL, "m", func(m *Model) { m.Priority = 10 })
+
+	// 第一次：A 返回 429 → 自动静音，请求改走 B 并成功
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+		t.Fatalf("应透过 B 成功, got %d %s", resp.StatusCode, body)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("A 应被调用 1 次, got %d", got)
+	}
+
+	// A 应处于静音期
+	s.store.mu.Lock()
+	var muted *Model
+	for _, m := range s.store.Models {
+		if m.ID == a.ID {
+			muted = m
+		}
+	}
+	s.store.mu.Unlock()
+	if muted == nil || muted.MutedUntil.IsZero() {
+		t.Fatal("A 应被设置 MutedUntil")
+	}
+	if d := time.Until(muted.MutedUntil); d < 4*time.Hour || d > 5*time.Hour {
+		t.Fatalf("静音时长应约为 5 小时, got %v", d)
+	}
+
+	// 后续多次请求都不应再打到 A
+	for i := 0; i < 3; i++ {
+		if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+			t.Fatalf("第 %d 次应成功", i+2)
+		}
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("静音后 A 不应再被调用, got %d 次", got)
+	}
+}
+
+// 429 静音期间，会话绑定也不能绕过（否则会话会持续打一个限流的上游）
+func TestMutedModelSkippedBySessionBinding(t *testing.T) {
+	var hitsA int32
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hitsA, 1)
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upA.Close()
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upB.Close()
+
+	s, app := newTestServer(t)
+	a := addProviderModel(t, s, upA.URL, "m", func(m *Model) { m.Priority = 20 })
+	addProviderModel(t, s, upB.URL, "m", func(m *Model) { m.Priority = 10 })
+
+	// 会话绑定到 A
+	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "s1"); resp.StatusCode != 200 {
+		t.Fatal("首次应成功")
+	}
+	if atomic.LoadInt32(&hitsA) != 1 {
+		t.Fatal("首次应打到 A")
+	}
+
+	// 手动把 A 静音（模拟它刚返回过 429）
+	s.store.MuteOn429(a.ID, 5*time.Hour, "test")
+
+	// 同会话再请求：绑定已失效，应改走 B
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "s1"); resp.StatusCode != 200 {
+		t.Fatalf("应透过 B 成功, got %d %s", resp.StatusCode, body)
+	}
+	if got := atomic.LoadInt32(&hitsA); got != 1 {
+		t.Fatalf("静音后 A 不应再被调用, got %d", got)
+	}
+}
+
+// 静音到期自动恢复；已在静音期内再次 429 只会延长，不会缩短
+func TestMutedUntilExpiryAndExtend(t *testing.T) {
+	s, _ := newTestServer(t)
+	m := addProviderModel(t, s, "http://x.invalid", "m", nil)
+
+	// 到期即恢复：直接设一个已过去的时间
+	s.store.mu.Lock()
+	s.store.Models[0].MutedUntil = time.Now().Add(-time.Minute)
+	s.store.mu.Unlock()
+	if r := s.store.skipReason(s.store.Models[0], time.Now(), time.Now().Format("2006-01-02")); r != "" {
+		t.Fatalf("静音到期后应可用, got %q", r)
+	}
+	if _, ok := s.store.CandidateByID(m.ID); !ok {
+		t.Fatal("静音到期后应能按 ID 取到候选")
+	}
+
+	// 再次 429 延长到 5 小时
+	until1, ok := s.store.MuteOn429(m.ID, 5*time.Hour, "r1")
+	if !ok {
+		t.Fatal("应静音成功")
+	}
+	// 已有更长静音时，用更短的时长不应缩短
+	s.store.mu.Lock()
+	s.store.Models[0].MutedUntil = time.Now().Add(10 * time.Hour)
+	s.store.mu.Unlock()
+	until2, _ := s.store.MuteOn429(m.ID, 1*time.Hour, "r2")
+	if !until2.After(until1) || time.Until(until2) < 9*time.Hour {
+		t.Fatalf("不应缩短已有静音: until1=%v until2=%v", until1, until2)
+	}
+}
+
+// 手动解除静音接口
+func TestClearMuteAPI(t *testing.T) {
+	s, app := newTestServer(t)
+	m := addProviderModel(t, s, "http://x.invalid", "m", nil)
+	s.store.MuteOn429(m.ID, 5*time.Hour, "test")
+
+	req, _ := http.NewRequest("DELETE", app.URL+"/api/models/"+m.ID+"/mute", nil)
+	resp, err := app.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("解除静音应 200, got %d", resp.StatusCode)
+	}
+	s.store.mu.Lock()
+	mu := s.store.Models[0].MutedUntil
+	s.store.mu.Unlock()
+	if !mu.IsZero() {
+		t.Fatalf("解除后 MutedUntil 应归零, got %v", mu)
+	}
+
+	// 再次解除应 400（本来就没静音）
+	req2, _ := http.NewRequest("DELETE", app.URL+"/api/models/"+m.ID+"/mute", nil)
+	resp2, _ := app.Client().Do(req2)
+	resp2.Body.Close()
+	if resp2.StatusCode != 400 {
+		t.Fatalf("未静音时解除应 400, got %d", resp2.StatusCode)
+	}
+}
+
+// 429 要记一条 muted 日志，且 429 模型不参与候选
+func TestMuteOn429LogsAndSkips(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"quota exceeded"}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	m := addProviderModel(t, s, up.URL, "m", nil)
+
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 502 {
+		t.Fatalf("无备用时应 502, got %d", resp.StatusCode)
+	}
+
+	s.store.mu.Lock()
+	var mutedLog *LogEntry
+	for _, l := range s.store.Logs {
+		if l.Kind == kindMuted {
+			mutedLog = l
+		}
+	}
+	s.store.mu.Unlock()
+	if mutedLog == nil {
+		t.Fatal("应记录一条 muted 日志")
+	}
+	if mutedLog.Status != 429 || !strings.Contains(mutedLog.Message, "自动静音") {
+		t.Errorf("muted 日志不对: %+v", mutedLog)
+	}
+
+	// 已静音 → 该模型不进入候选
+	cands, skips := s.store.CandidatesDetailed("m", time.Now(), false)
+	if len(cands) != 0 {
+		t.Fatalf("静音模型不应进入候选, got %d", len(cands))
+	}
+	if len(skips) != 1 || !strings.Contains(skips[0].Reason, "429") {
+		t.Fatalf("剔除原因应说明 429: %+v", skips)
+	}
+	_ = m
 }

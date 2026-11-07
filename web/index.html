@@ -1169,12 +1169,17 @@ function renderModels() {
   }
   tb.innerHTML = sortedModels().map((m, i) => {
     const muted = isMuted(m.mutes);
+    const autoUntil = m.muted_until && new Date(m.muted_until) > new Date() ? new Date(m.muted_until) : null;
     const over = m.daily_limit > 0 && m.used_today >= m.daily_limit;
     const full = m.max_concurrent > 0 && (m.inflight || 0) >= m.max_concurrent;
-    const status = muted ? '<span class="pill warn">静音中</span>'
+    const status = autoUntil ? `<span class="pill bad" title="${esc(m.mute_reason || '')}">限流静音</span>`
+      : muted ? '<span class="pill warn">静音中</span>'
       : over ? '<span class="pill bad">已超限</span>'
       : full ? '<span class="pill warn">并行已满</span>'
       : '<span class="pill ok">可用</span>';
+    // 自动静音的到期提示（附手动解除入口）
+    const muteNote = autoUntil ? `<div class="cell-sub">至 ${autoUntil.toLocaleString()}
+      <button class="btn mini" onclick="unmuteModel('${m.id}')" style="margin-left:4px">解除</button></div>` : '';
     const pct = m.daily_limit > 0 ? Math.min(100, Math.round(m.used_today / m.daily_limit * 100)) : 0;
     const limitTxt = m.daily_limit > 0 ? fmtTok(m.daily_limit) : '∞';
     const bar = m.daily_limit > 0
@@ -1193,7 +1198,7 @@ function renderModels() {
       </td>
       <td class="mono"><b>${esc(m.name)}</b></td>
       <td>${esc(pname(m.provider_id))}</td>
-      <td>${status}</td>
+      <td>${status}${muteNote}</td>
       <td class="num">
         <div class="usage-cell" style="align-items:flex-end">
           ${bar}
@@ -1220,6 +1225,17 @@ function renderModels() {
 }
 
 // 探测某条模型路由的上游连通性（不发对话、不耗 token），结果就地显示在该行
+// 手动解除上游 429 触发的自动静音
+async function unmuteModel(id) {
+  const m = S.models.find(x => x.id === id);
+  if (!confirm(`解除「${m?.name || id}」的限流静音？解除后会立即重新参与路由。`)) return;
+  try {
+    S = await api('DELETE', '/api/models/' + id + '/mute');
+    renderAll();
+    toast('已解除静音');
+  } catch (e) { alert(e.message); }
+}
+
 async function testModel(id) {
   const el = $('test-' + id);
   if (!el) return;

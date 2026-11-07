@@ -68,6 +68,7 @@ func (s *Server) routes() *http.ServeMux {
 	api.HandleFunc("DELETE /api/models/{id}", s.handleModelDelete)
 	api.HandleFunc("POST /api/models/reorder", s.handleReorder)
 	api.HandleFunc("POST /api/models/{id}/test", s.handleModelTest)
+	api.HandleFunc("DELETE /api/models/{id}/mute", s.handleModelUnmute)
 	api.HandleFunc("POST /api/keys", s.handleKeyCreate)
 	api.HandleFunc("DELETE /api/keys/{id}", s.handleKeyDelete)
 	api.HandleFunc("PUT /api/settings", s.handleSettings)

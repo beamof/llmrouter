@@ -194,6 +194,18 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				s.store.Release(c.Model.ID)
 				lastErr = fmt.Sprintf("%s: HTTP %d: %s", c.Provider.Name, resp.StatusCode, errSnippet(eb))
 				failures = append(failures, lastErr)
+				// 429 视为明确限流：把该模型条目自动静音一段时间，后续请求直接跳过它
+				if resp.StatusCode == http.StatusTooManyRequests {
+					if until, ok := s.store.MuteOn429(c.Model.ID, rateLimitMute, "上游返回 429 限流"); ok {
+						s.logFail(LogEntry{
+							Level: "warn", Kind: kindMuted, Status: resp.StatusCode, KeyID: keyID,
+							ProviderID: c.Provider.ID, Model: c.Model.Name,
+							Message: fmt.Sprintf("上游返回 429，已自动静音至 %s", until.Local().Format("01-02 15:04")),
+							Detail:  string(eb),
+						})
+						continue
+					}
+				}
 				s.logFail(LogEntry{
 					Level: "error", Kind: kindUpstream, Status: resp.StatusCode, KeyID: keyID,
 					ProviderID: c.Provider.ID, Model: c.Model.Name,

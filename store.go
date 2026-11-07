@@ -37,6 +37,12 @@ type Model struct {
 	DailyLimit    int64        `json:"daily_limit"`    // 每日请求上限，0 = 不限
 	MaxConcurrent int          `json:"max_concurrent"` // 最大并行请求数，0 = 不限；超出后新请求改走后续候选
 	Mutes         []MuteWindow `json:"mutes,omitempty"`
+
+	// MutedUntil 上游返回 429 后自动静音到的时刻（绝对时间），零值 = 未静音。
+	// 与 Mutes（每天重复的时段）不同，这是临时的、一次性的，到点自动恢复。
+	MutedUntil time.Time `json:"muted_until,omitempty"`
+	// MuteReason 最近一次自动静音的原因说明（给后台展示）
+	MuteReason string `json:"mute_reason,omitempty"`
 }
 
 // APIKey 客户端访问本网关 /v1/* 的密钥
@@ -423,13 +429,17 @@ func (s *Store) SetAutoModel(name string) {
 	s.save()
 }
 
-// CandidateByID 按模型条目 ID 取候选，不做静音/上限过滤（会话绑定直连用）
+// CandidateByID 按模型条目 ID 取候选。会话绑定直连时不套用静音时段/每日上限/并行上限
+// （绑定即优先），但上游 429 触发的自动静音仍然生效——那代表上游明确限流了，继续打过去没有意义。
 func (s *Store) CandidateByID(modelID string) (Candidate, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, m := range s.Models {
 		if m.ID != modelID {
 			continue
+		}
+		if mutedUntil(m, time.Now()) {
+			return Candidate{}, false
 		}
 		for _, p := range s.Providers {
 			if p.ID == m.ProviderID {
@@ -454,6 +464,8 @@ type SkipReason struct {
 // skipReason 该条目为何不可用，返回空串表示可用（调用方需持锁）
 func (s *Store) skipReason(m *Model, now time.Time, today string) string {
 	switch {
+	case mutedUntil(m, now):
+		return "上游 429 自动静音至 " + m.MutedUntil.Local().Format("01-02 15:04")
 	case mutedNow(m.Mutes, now):
 		return "处于静音时段"
 	case s.overLimit(m, today):
@@ -462,6 +474,49 @@ func (s *Store) skipReason(m *Model, now time.Time, today string) string {
 		return fmt.Sprintf("并行已满 %d/%d", s.inflight[m.ID], m.MaxConcurrent)
 	}
 	return ""
+}
+
+// mutedUntil 该条目是否因上游 429 处于自动静音期
+func mutedUntil(m *Model, now time.Time) bool {
+	return !m.MutedUntil.IsZero() && now.Before(m.MutedUntil)
+}
+
+// MuteOn429 上游返回 429 时把该模型条目自动静音一段时间。
+// 已在静音期内则延长到更晚的时刻，不缩短。返回静音截止时间。
+func (s *Store) MuteOn429(modelID string, d time.Duration, reason string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.Models {
+		if m.ID != modelID {
+			continue
+		}
+		until := time.Now().Add(d)
+		if until.After(m.MutedUntil) {
+			m.MutedUntil = until
+		} else {
+			until = m.MutedUntil // 已有更晚的静音，保持不动
+		}
+		m.MuteReason = reason
+		s.save()
+		return until, true
+	}
+	return time.Time{}, false
+}
+
+// ClearMute 手动解除某个模型条目的自动静音
+func (s *Store) ClearMute(modelID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.Models {
+		if m.ID != modelID {
+			continue
+		}
+		m.MutedUntil = time.Time{}
+		m.MuteReason = ""
+		s.save()
+		return true
+	}
+	return false
 }
 
 // providerLocked 按 ID 取 provider 指针（调用方需持锁）
