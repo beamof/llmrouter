@@ -899,20 +899,6 @@ func TestWBJSONEnvelopeOn200(t *testing.T) {
 	}
 }
 
-func TestWBResponsesSkipped(t *testing.T) {
-	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Error("上游不应收到 /responses 请求")
-	})
-	s, app := newTestServer(t)
-	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
-	resp, body := postJSON(t, app, "/v1/responses",
-		`{"model":"glm-5.0","input":"hi"}`)
-	// wb 候选在循环内被跳过并发失败，全部为 wb 候选时给出明确原因的 502
-	if resp.StatusCode != 502 || !strings.Contains(body, "不支持 /responses") {
-		t.Fatalf("仅 WorkBuddy 候选时 /responses 应带原因失败: %d %s", resp.StatusCode, body)
-	}
-}
-
 func TestWBUpstreamModelsAndCatalogFallback(t *testing.T) {
 	up, refreshes := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {})
 	s, app := newTestServer(t)

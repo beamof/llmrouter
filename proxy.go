@@ -179,19 +179,14 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				continue
 			}
 			// WorkBuddy 候选走适配分支：归一化出站、专用请求头、token 续期、
-			// 流式节拍过滤与非流式聚合都在 wbAttempt 里完成
+			// 流式节拍过滤与非流式聚合都在 wbAttempt 里完成；/responses 请求由
+			// wbAttempt 翻译成 chat 协议发上游，回程再渲染回 responses 形态
 			if e, _ := wbOf(c.Provider); e != nil {
-				if suffix == "/responses" {
-					s.store.Release(c.Model.ID) // 上游没有 /responses 协议
-					lastErr = fmt.Sprintf("%s: WorkBuddy 上游不支持 /responses 协议", c.Provider.Name)
-					failures = append(failures, lastErr)
-					continue
-				}
 				sendBody := body
 				if isAuto {
 					sendBody = withModel(body, c.Model.Name)
 				}
-				if err := s.wbAttempt(w, r, c, sendBody, keyID); err != nil {
+				if err := s.wbAttempt(w, r, c, sendBody, keyID, suffix == "/responses"); err != nil {
 					lastErr = err.Error()
 					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
 					continue // 名额释放与失败日志由 wbAttempt 处理

@@ -20,7 +20,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1415,11 +1414,7 @@ func (a *wbAgg) result(model string) ([]byte, Usage) {
 		msg["reasoning_content"] = a.reasoning.String()
 	}
 	if len(a.tools) > 0 {
-		idx := make([]int, 0, len(a.tools))
-		for i := range a.tools {
-			idx = append(idx, i)
-		}
-		sort.Ints(idx)
+		idx := a.sortedToolIdx()
 		calls := make([]any, 0, len(idx))
 		for _, i := range idx {
 			t := a.tools[i]
@@ -1513,7 +1508,9 @@ func (s *Server) wbPrepareBody(e *wbEdition, c Candidate, sendBody []byte) ([]by
 // → 发送（凭证失效时强制续期后原候选重试一次）→ 错误分类（限流按上游恢复时刻静音）
 // → 流式节拍过滤透传 / 非流式聚合。成功时已向客户端写出响应并返回 nil；
 // 失败时返回错误描述（并行名额已释放、失败日志已记，调用方换下一个候选）。
-func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, sendBody []byte, keyID string) error {
+// responsesMode 时入站是 /v1/responses 协议：先翻成 chat 出站，回程渲染回
+// responses 事件流或聚合为 response 对象（见 workbuddy_responses.go）。
+func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, sendBody []byte, keyID string, responsesMode bool) error {
 	defer s.store.Release(c.Model.ID)
 	e, cred := wbOf(c.Provider)
 	if e == nil || cred == nil || cred.AccessToken == "" {
@@ -1523,7 +1520,23 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 		return err
 	}
 	wantStream := wbBodyStream(sendBody)
-	body, err := s.wbPrepareBody(e, c, sendBody)
+	src := sendBody
+	if responsesMode {
+		chat, err := wbResponsesToChat(sendBody)
+		if err != nil {
+			s.logFail(LogEntry{Level: "error", Kind: kindBadRequest, KeyID: keyID,
+				ProviderID: c.Provider.ID, Model: c.Model.Name,
+				Message: "/responses 请求体翻译失败", Detail: err.Error()})
+			return err
+		}
+		if src, err = json.Marshal(chat); err != nil {
+			s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
+				ProviderID: c.Provider.ID, Model: c.Model.Name,
+				Message: "构造 WorkBuddy 出站请求失败", Detail: err.Error()})
+			return err
+		}
+	}
+	body, err := s.wbPrepareBody(e, c, src)
 	if err != nil {
 		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
@@ -1598,6 +1611,20 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 	if wantStream {
 		wbCopyRespHeaders(w, resp.Header, true)
 		w.WriteHeader(resp.StatusCode)
+		if responsesMode {
+			// chat 分片 → responses 事件流，边收边渲染
+			rs := newWBRespStream(w, c.Model.Name)
+			rs.begin()
+			_, cerr := io.Copy(rs, filter)
+			usage := rs.finish(cerr)
+			s.store.AddUsage(&c.Model, keyID, usage)
+			if cerr != nil {
+				s.logFail(LogEntry{Level: "warn", Kind: kindUpstream, KeyID: keyID,
+					ProviderID: c.Provider.ID, Model: c.Model.Name,
+					Message: "WorkBuddy 流式响应中断（已渲染部分 responses 事件）", Detail: cerr.Error()})
+			}
+			return nil
+		}
 		sn := &sseSniffer{w: flushWriter{w}}
 		_, cerr := io.Copy(sn, filter)
 		s.store.AddUsage(&c.Model, keyID, extractStreamUsage(sn.tail))
@@ -1619,7 +1646,13 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 			Message: "WorkBuddy 响应中断，聚合失败", Detail: cerr.Error()})
 		return fmt.Errorf("上游流式响应中断: %v", cerr)
 	}
-	out, usage := agg.result(c.Model.Name)
+	var out []byte
+	var usage Usage
+	if responsesMode {
+		out, usage = agg.responsesResult(c.Model.Name)
+	} else {
+		out, usage = agg.result(c.Model.Name)
+	}
 	wbCopyRespHeaders(w, resp.Header, false)
 	w.WriteHeader(resp.StatusCode)
 	w.Write(out)
