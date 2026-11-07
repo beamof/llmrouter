@@ -51,17 +51,18 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",mo
   box-shadow:inset 0 0 0 1px rgba(129,140,248,.26);
 }
 .side-foot{margin-top:auto;display:flex;flex-direction:column;gap:10px;padding:0 4px}
+.foot-row{display:flex;align-items:center;gap:8px}
 .token-btn{
-  display:flex;align-items:center;gap:8px;width:100%;padding:8px 10px;border-radius:10px;cursor:pointer;
+  display:flex;align-items:center;gap:8px;flex:1;min-width:0;padding:8px 10px;border-radius:10px;cursor:pointer;
   border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:#c3cee0;font-size:12.5px;
 }
 .token-btn:hover{background:rgba(255,255,255,.09);color:#fff}
+.token-btn #token-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.16);flex:none}
 .dot.off{background:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.16)}
 .side-note{color:#5f6c85;font-size:11px;line-height:1.5}
-.side-sep{height:1px;background:rgba(255,255,255,.09);margin:2px 2px 0}
 .icon-nav{
-  display:grid;place-items:center;width:34px;height:34px;padding:0;border-radius:10px;cursor:pointer;
+  display:grid;place-items:center;flex:none;width:34px;height:34px;padding:0;border-radius:10px;cursor:pointer;
   border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:#9aa8c0;
   transition:background .15s,color .15s;
 }
@@ -242,10 +243,10 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
   .brand b{font-size:13px;white-space:nowrap}
   .side-nav{flex-direction:row;gap:4px;margin-left:auto}
   .nav-item{white-space:nowrap;padding:7px 11px;font-size:13px}
-  .side-foot{margin:0;flex-direction:row;padding:0;flex:none}
-  .token-btn{width:34px;height:34px;padding:0;justify-content:center;border-radius:9px}
+  .side-foot{margin:0;padding:0;flex:none;flex-direction:row;align-items:center}
+  .foot-row{gap:6px}
+  .token-btn{width:34px;height:34px;flex:none;padding:0;justify-content:center;border-radius:9px}
   .token-btn #token-label{display:none}
-  .side-sep{display:none}
   .main{padding:0 12px 44px}
   .topbar{align-items:flex-start;flex-direction:column;gap:10px;padding:14px 0 12px}
   .topbar h1{font-size:17px}
@@ -278,12 +279,13 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
       </button>
     </nav>
     <div class="side-foot">
-      <button class="token-btn" onclick="openToken()"><span class="dot" id="token-dot"></span><span id="token-label">管理令牌</span></button>
+      <div class="foot-row">
+        <button class="token-btn" onclick="openToken()"><span class="dot" id="token-dot"></span><span id="token-label">管理令牌</span></button>
+        <button class="icon-nav" data-page="settings" title="设置" aria-label="设置">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.11a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.11A1.7 1.7 0 0 0 4.67 8.6a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.11a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.11a1.7 1.7 0 0 0-1.49 1z"/></svg>
+        </button>
+      </div>
       <div class="side-note">请求原样透传 · 状态存本地 JSON</div>
-      <div class="side-sep"></div>
-      <button class="icon-nav" data-page="settings" title="设置" aria-label="设置">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.11a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.11A1.7 1.7 0 0 0 4.67 8.6a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.11a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.11a1.7 1.7 0 0 0-1.49 1z"/></svg>
-      </button>
     </div>
   </aside>
 
