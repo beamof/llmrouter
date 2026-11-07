@@ -76,6 +76,7 @@ type Store struct {
 	APIKeys   []*APIKey           `json:"api_keys"`
 	Usage     []*UsageStat        `json:"usage"`
 	Balances  map[string]*Balance `json:"balances"`
+	Logs      []*LogEntry         `json:"logs,omitempty"`       // 异常/失败日志，最多 maxLogs 条
 	AutoModel string              `json:"auto_model,omitempty"` // 对外声明的自动模型名，空 = "auto"
 }
 

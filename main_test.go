@@ -1021,3 +1021,134 @@ func TestNoModelField(t *testing.T) {
 		t.Fatalf("未知模型应 404: %d %s", resp.StatusCode, body)
 	}
 }
+
+// 上游失败应写入异常日志，含状态码、Provider 与上游错误详情
+func TestLogUpstreamFailure(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"rate limit exceeded"}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	m := addProviderModel(t, s, up.URL, "m", nil)
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 502 {
+		t.Fatalf("应 502, got %d", resp.StatusCode)
+	}
+
+	s.store.mu.Lock()
+	logs := append([]*LogEntry(nil), s.store.Logs...)
+	s.store.mu.Unlock()
+	if len(logs) != 2 {
+		t.Fatalf("应记录 2 条（单上游失败 + 全部失败），got %d", len(logs))
+	}
+	var up1, all *LogEntry
+	for _, l := range logs {
+		switch l.Kind {
+		case kindUpstream:
+			up1 = l
+		case kindAllFailed:
+			all = l
+		}
+	}
+	if up1 == nil || all == nil {
+		t.Fatalf("缺少预期日志: %+v", logs)
+	}
+	if up1.Status != 429 || up1.ProviderID != m.ProviderID || up1.Model != "m" {
+		t.Errorf("上游失败日志字段不对: %+v", up1)
+	}
+	if !strings.Contains(up1.Detail, "rate limit exceeded") {
+		t.Errorf("应含上游错误详情: %q", up1.Detail)
+	}
+	if all.Status != 502 || !strings.Contains(all.Message, "全部失败") {
+		t.Errorf("汇总日志不对: %+v", all)
+	}
+}
+
+// 没有可用上游、请求体不合法、API Key 无效都要记日志
+func TestLogRoutingAndAuthFailures(t *testing.T) {
+	s, app := newTestServer(t)
+
+	// 未知模型 → 404 no_candidate
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"ghost"}`); resp.StatusCode != 404 {
+		t.Fatalf("应 404, got %d", resp.StatusCode)
+	}
+	// 缺 model 字段 → 400 bad_request
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"messages":[]}`); resp.StatusCode != 400 {
+		t.Fatalf("应 400, got %d", resp.StatusCode)
+	}
+	// 配置 Key 后用错误 Key → 401 auth
+	s.store.AddAPIKey("k")
+	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "Authorization", "Bearer bad"); resp.StatusCode != 401 {
+		t.Fatalf("应 401, got %d", resp.StatusCode)
+	}
+
+	s.store.mu.Lock()
+	kinds := map[string]int{}
+	for _, l := range s.store.Logs {
+		kinds[l.Kind]++
+	}
+	s.store.mu.Unlock()
+	for _, want := range []string{kindNoCandidate, kindBadRequest, kindAuth} {
+		if kinds[want] == 0 {
+			t.Errorf("缺少 %s 日志，实际: %v", want, kinds)
+		}
+	}
+}
+
+// 日志条数有上限，超出时丢弃最旧的；清空接口能清干净
+func TestLogCapAndClear(t *testing.T) {
+	s, app := newTestServer(t)
+	s.adminToken = "tok"
+
+	for i := 0; i < maxLogs+20; i++ {
+		s.logFail(LogEntry{Kind: kindUpstream, Message: fmt.Sprintf("err-%d", i)})
+	}
+	s.store.mu.Lock()
+	n, first := len(s.store.Logs), s.store.Logs[0].Message
+	s.store.mu.Unlock()
+	if n != maxLogs {
+		t.Fatalf("应截断到 %d 条, got %d", maxLogs, n)
+	}
+	if first != "err-20" {
+		t.Fatalf("应丢弃最旧的 20 条, 首条为 %q", first)
+	}
+
+	req, _ := http.NewRequest("DELETE", app.URL+"/api/logs", nil)
+	req.Header.Set("X-Admin-Token", "tok")
+	resp, err := app.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("清空应 200, got %d", resp.StatusCode)
+	}
+	s.store.mu.Lock()
+	n = len(s.store.Logs)
+	s.store.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("清空后应为 0, got %d", n)
+	}
+}
+
+// /api/state 必须返回 logs 数组（空时是 [] 而不是 null），前端才不会拿到 null
+func TestStateIncludesLogs(t *testing.T) {
+	_, app := newTestServer(t)
+	resp, body := postJSONWithHeader(t, app, "GET", "/api/state", "", "X-Admin-Token", "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("应 200, got %d", resp.StatusCode)
+	}
+	var v struct {
+		Logs *[]LogEntry `json:"logs"`
+	}
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Logs == nil {
+		t.Fatal("logs 不应为 null")
+	}
+	if len(*v.Logs) != 0 {
+		t.Fatalf("空状态应为空数组, got %d", len(*v.Logs))
+	}
+}

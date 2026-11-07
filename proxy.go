@@ -80,11 +80,19 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		keyID, ok := s.checkAPIToken(r)
 		if !ok {
+			s.logFail(LogEntry{
+				Level: "warn", Kind: kindAuth, Status: http.StatusUnauthorized,
+				Message: "客户端 API Key 无效，请求被拒绝",
+			})
 			writeErr(w, http.StatusUnauthorized, "invalid api key")
 			return
 		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			s.logFail(LogEntry{
+				Level: "error", Kind: kindBadRequest, Status: http.StatusBadRequest, KeyID: keyID,
+				Message: "读取请求体失败: " + err.Error(),
+			})
 			writeErr(w, http.StatusBadRequest, "读取请求体失败: "+err.Error())
 			return
 		}
@@ -92,6 +100,11 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			Model string `json:"model"`
 		}
 		if err := json.Unmarshal(body, &req); err != nil || req.Model == "" {
+			s.logFail(LogEntry{
+				Level: "warn", Kind: kindBadRequest, Status: http.StatusBadRequest, KeyID: keyID,
+				Message: `请求体不是合法 JSON 或缺少 "model" 字段`,
+				Detail:  truncateRunes(string(body), 200),
+			})
 			writeErr(w, http.StatusBadRequest, `请求体必须是 JSON 且包含 "model" 字段`)
 			return
 		}
@@ -123,16 +136,20 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			}
 		}
 		if len(cands) == 0 {
+			msg := fmt.Sprintf("模型 %q 当前没有可用上游（未配置、处于静音时段或已达每日上限）", req.Model)
 			if isAuto {
-				writeErr(w, http.StatusNotFound, "当前没有可用模型（全部未配置、处于静音时段或已达每日上限）")
-			} else {
-				writeErr(w, http.StatusNotFound,
-					fmt.Sprintf("模型 %q 当前没有可用上游（未配置、处于静音时段或已达每日上限）", req.Model))
+				msg = "当前没有可用模型（全部未配置、处于静音时段或已达每日上限）"
 			}
+			s.logFail(LogEntry{
+				Level: "error", Kind: kindNoCandidate, Status: http.StatusNotFound,
+				KeyID: keyID, Model: req.Model, Message: msg,
+			})
+			writeErr(w, http.StatusNotFound, msg)
 			return
 		}
 
 		lastErr := fmt.Sprintf("模型 %q 无候选", req.Model)
+		var failures []string // 逐个上游的失败原因，全部失败时一并写进日志
 		for _, c := range cands {
 			sendBody := body
 			if isAuto {
@@ -141,11 +158,23 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			up, err := s.upstreamRequest(r, c.Provider, suffix, sendBody)
 			if err != nil {
 				lastErr = err.Error()
+				failures = append(failures, fmt.Sprintf("%s: 构造请求失败: %v", c.Provider.Name, err))
+				s.logFail(LogEntry{
+					Level: "error", Kind: kindUpstream, KeyID: keyID,
+					ProviderID: c.Provider.ID, Model: c.Model.Name,
+					Message: "构造上游请求失败", Detail: err.Error(),
+				})
 				continue
 			}
 			resp, err := s.client.Do(up)
 			if err != nil {
 				lastErr = fmt.Sprintf("%s: %v", c.Provider.Name, err)
+				failures = append(failures, lastErr)
+				s.logFail(LogEntry{
+					Level: "error", Kind: kindUpstream, KeyID: keyID,
+					ProviderID: c.Provider.ID, Model: c.Model.Name,
+					Message: "连接上游失败（网络错误或超时）", Detail: err.Error(),
+				})
 				continue
 			}
 			// 任何 4xx/5xx 都换下一个候选（换一家可能就好了），失败原因带上上游错误信息
@@ -153,6 +182,13 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				eb, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 				resp.Body.Close()
 				lastErr = fmt.Sprintf("%s: HTTP %d: %s", c.Provider.Name, resp.StatusCode, errSnippet(eb))
+				failures = append(failures, lastErr)
+				s.logFail(LogEntry{
+					Level: "error", Kind: kindUpstream, Status: resp.StatusCode, KeyID: keyID,
+					ProviderID: c.Provider.ID, Model: c.Model.Name,
+					Message: fmt.Sprintf("上游返回 HTTP %d", resp.StatusCode),
+					Detail:  string(eb),
+				})
 				continue
 			}
 			if sessKey != "" {
@@ -164,6 +200,12 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 		if sessKey != "" {
 			s.clearSession(sessKey) // 全部失败，解除绑定，下次会话从头按规则选
 		}
+		s.logFail(LogEntry{
+			Level: "error", Kind: kindAllFailed, Status: http.StatusBadGateway,
+			KeyID: keyID, Model: req.Model,
+			Message: fmt.Sprintf("%d 个上游全部失败", len(cands)),
+			Detail:  strings.Join(failures, "\n"),
+		})
 		writeErr(w, http.StatusBadGateway, "所有上游均失败，最后一个错误: "+lastErr)
 	}
 }

@@ -26,6 +26,7 @@ type StateView struct {
 	APIKeys   []*APIKey           `json:"api_keys"`
 	Usage     []*UsageStat        `json:"usage"`
 	Balances  map[string]*Balance `json:"balances"`
+	Logs      []*LogEntry         `json:"logs"`
 	AutoModel string              `json:"auto_model"`
 }
 
@@ -41,7 +42,7 @@ func (s *Store) SnapshotJSON() []byte {
 		}
 	}
 	// 空状态也要输出 [] 而非 null，前端才不会拿到 null 数组
-	v := StateView{Providers: []*Provider{}, Models: []ModelView{}, APIKeys: []*APIKey{}, Usage: []*UsageStat{}, Balances: map[string]*Balance{}}
+	v := StateView{Providers: []*Provider{}, Models: []ModelView{}, APIKeys: []*APIKey{}, Usage: []*UsageStat{}, Balances: map[string]*Balance{}, Logs: []*LogEntry{}}
 	if s.Providers != nil {
 		v.Providers = s.Providers
 	}
@@ -50,6 +51,9 @@ func (s *Store) SnapshotJSON() []byte {
 	}
 	if s.Balances != nil {
 		v.Balances = s.Balances
+	}
+	if s.Logs != nil {
+		v.Logs = s.Logs
 	}
 	for _, m := range s.Models {
 		v.Models = append(v.Models, ModelView{Model: m, UsedToday: used[m.ProviderID+"\x00"+m.Name]})
@@ -146,6 +150,12 @@ func (s *Server) handleReorder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.store.Reorder(req.IDs)
+	s.replyState(w, r)
+}
+
+// handleLogsClear 清空异常日志
+func (s *Server) handleLogsClear(w http.ResponseWriter, r *http.Request) {
+	s.store.ClearLogs()
 	s.replyState(w, r)
 }
 

@@ -71,6 +71,7 @@ func (s *Server) routes() *http.ServeMux {
 	api.HandleFunc("POST /api/keys", s.handleKeyCreate)
 	api.HandleFunc("DELETE /api/keys/{id}", s.handleKeyDelete)
 	api.HandleFunc("PUT /api/settings", s.handleSettings)
+	api.HandleFunc("DELETE /api/logs", s.handleLogsClear)
 	mux.Handle("/api/", s.adminAuth(api))
 	return mux
 }
@@ -83,7 +84,13 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 		}
 		ip := s.clientIP(r)
 		if until, locked := s.adminLocked(ip); locked {
-			writeErr(w, http.StatusUnauthorized, fmt.Sprintf("尝试次数过多，请 %d 秒后再试", int(time.Until(until).Seconds())+1))
+			secs := int(time.Until(until).Seconds()) + 1
+			s.logFail(LogEntry{
+				Level: "warn", Kind: kindAdminLocked, Status: http.StatusUnauthorized,
+				Message: "管理令牌锁定期间的访问尝试",
+				Detail:  fmt.Sprintf("来源 %s，剩余 %d 秒", ip, secs),
+			})
+			writeErr(w, http.StatusUnauthorized, fmt.Sprintf("尝试次数过多，请 %d 秒后再试", secs))
 			return
 		}
 		tok := r.Header.Get("X-Admin-Token")
@@ -98,6 +105,11 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 			} else if n := s.adminFailCount(ip); n > 0 && adminMaxFails-n <= 2 {
 				msg = fmt.Sprintf("管理令牌错误，再错 %d 次将锁定", adminMaxFails-n)
 			}
+			s.logFail(LogEntry{
+				Level: "warn", Kind: kindAdminAuth, Status: http.StatusUnauthorized,
+				Message: msg,
+				Detail:  fmt.Sprintf("来源 %s，%s %s", ip, r.Method, r.URL.Path),
+			})
 			writeErr(w, http.StatusUnauthorized, msg)
 			return
 		}

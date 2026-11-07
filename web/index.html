@@ -39,6 +39,11 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",mo
 .brand b{display:block;font-size:14.5px;letter-spacing:.01em}
 .brand small{display:block;color:#7c8aa5;font-size:11.5px;line-height:1.4}
 .side-nav{display:flex;flex-direction:column;gap:4px}
+.nav-badge{
+  margin-left:auto;min-width:18px;height:18px;padding:0 5px;border-radius:9px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:#dc2626;color:#fff;font-size:10.5px;font-weight:700;line-height:1;
+}
 .nav-item{
   display:flex;align-items:center;gap:10px;width:100%;border:none;background:none;
   padding:9px 12px;border-radius:10px;cursor:pointer;color:#9aa8c0;font-size:13.5px;text-align:left;
@@ -181,6 +186,21 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .bal b{color:var(--ok);font-weight:650}
 .test-res{font-size:11.5px;line-height:1.45;margin-top:3px;max-width:230px}
 
+/* ---------- 异常日志 ---------- */
+.log-time{font-size:12px;color:var(--tx2);white-space:nowrap;font-variant-numeric:tabular-nums}
+.log-time small{display:block;color:var(--mut);font-size:11px}
+.log-msg{font-size:12.5px;line-height:1.55;word-break:break-word}
+.log-detail{
+  margin-top:6px;padding:7px 10px;border-radius:8px;background:#f8fafc;border:1px solid var(--bd2);
+  font-family:ui-monospace,Consolas,monospace;font-size:11.5px;line-height:1.6;color:var(--tx2);
+  white-space:pre-wrap;word-break:break-all;max-height:190px;overflow:auto;
+}
+.log-expand{background:none;border:none;color:var(--mut);cursor:pointer;padding:2px 4px;border-radius:6px;font-size:12px}
+.log-expand:hover{background:#eef2f8;color:var(--acc)}
+/* 窄屏下让表格横向滚动，而不是把「说明」列挤成单字一行 */
+#logs-body{white-space:normal}
+#page-logs table{min-width:820px}
+
 /* ---------- 设置页 ---------- */
 .settings-head{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:16px}
 .settings-tabs{display:inline-flex;gap:4px;background:#e9edf5;border-radius:11px;padding:4px;flex-wrap:wrap}
@@ -277,6 +297,11 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 16v-5"/><path d="M13 16V8"/><path d="M18 16v-3"/></svg>
         用量总览
       </button>
+      <button class="nav-item" data-page="logs">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2.4 17.4A2 2 0 0 0 4.1 20.4h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+        异常日志
+        <span class="nav-badge" id="log-badge" hidden></span>
+      </button>
     </nav>
     <div class="side-foot">
       <div class="foot-row">
@@ -355,6 +380,45 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
             <table>
               <thead id="detail-head"></thead>
               <tbody id="detail-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 异常日志 ================= -->
+      <section id="page-logs" hidden>
+        <div class="panel" style="margin-bottom:14px">
+          <div class="panel-head" style="margin-bottom:0">
+            <div class="row-inline">
+              <div class="seg sm" id="log-filter">
+                <button data-kind="all" class="on">全部</button>
+                <button data-kind="upstream">上游失败</button>
+                <button data-kind="routing">路由异常</button>
+                <button data-kind="auth">鉴权</button>
+              </div>
+              <span class="hint" id="log-sum"></span>
+            </div>
+            <div class="row-inline">
+              <button class="btn icon" title="刷新" onclick="load()">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+              </button>
+              <button class="btn danger" onclick="clearLogs()">清空日志</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr>
+                <th style="width:150px">时间</th>
+                <th style="width:96px">类型</th>
+                <th style="min-width:280px">说明</th>
+                <th style="min-width:150px">模型 / Provider</th>
+                <th style="width:70px" class="num">状态</th>
+                <th style="width:40px"></th>
+              </tr></thead>
+              <tbody id="logs-body"></tbody>
             </table>
           </div>
         </div>
@@ -548,8 +612,9 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
 <script>
 'use strict';
-let S = {providers: [], models: [], usage: [], balances: {}, api_keys: []};
+let S = {providers: [], models: [], usage: [], balances: {}, api_keys: [], logs: []};
 let page = 'home', stab = 'models', range = 'today', detailMode = 'model';
+let logFilter = 'all', expandedLogs = new Set();
 let needAuth = false, authorized = false, authMessage = '', editingModel = null, editingProvider = null;
 
 const $ = id => document.getElementById(id);
@@ -682,6 +747,7 @@ async function load() {
     S.usage ||= [];
     S.balances ||= {};
     S.api_keys ||= [];
+    S.logs ||= [];
     needAuth = false;
     authorized = true; // 成功取到状态，说明当前令牌（或无需令牌）是有效的
     authMessage = '';
@@ -709,10 +775,16 @@ function go(p) {
   page = p;
   document.querySelectorAll('[data-page]').forEach(b => b.classList.toggle('on', b.dataset.page === p));
   $('page-home').hidden = p !== 'home';
+  $('page-logs').hidden = p !== 'logs';
   $('page-settings').hidden = p !== 'settings';
   $('range-seg').hidden = p !== 'home';
-  $('page-title').textContent = p === 'home' ? '用量总览' : '设置';
-  $('page-sub').textContent = p === 'home' ? '实时 token 用量与请求趋势' : '模型路由、上游 Provider 与访问密钥';
+  const meta = {
+    home: ['用量总览', '实时 token 用量与请求趋势'],
+    logs: ['异常日志', '上游失败、路由异常与鉴权拒绝记录'],
+    settings: ['设置', '模型路由、上游 Provider 与访问密钥'],
+  }[p] || ['用量总览', ''];
+  $('page-title').textContent = meta[0];
+  $('page-sub').textContent = meta[1];
   window.scrollTo({top: 0});
 }
 
@@ -726,6 +798,12 @@ document.querySelectorAll('#detail-seg button').forEach(b => b.onclick = () => {
   detailMode = b.dataset.detail;
   document.querySelectorAll('#detail-seg button').forEach(x => x.classList.toggle('on', x === b));
   renderHome();
+});
+
+document.querySelectorAll('#log-filter button').forEach(b => b.onclick = () => {
+  logFilter = b.dataset.kind;
+  document.querySelectorAll('#log-filter button').forEach(x => x.classList.toggle('on', x === b));
+  renderLogs();
 });
 
 document.querySelectorAll('#stab-nav button').forEach(b => b.onclick = () => {
@@ -754,6 +832,94 @@ function renderAll() {
   renderKeys();
   renderGeneral();
   renderStabAction();
+  renderLogs();
+}
+
+/* ---------- 异常日志 ---------- */
+// 服务端的 kind 分组到界面的三个筛选档
+const LOG_KINDS = {
+  all: null,
+  upstream: ['upstream', 'all_failed'],
+  routing: ['no_candidate', 'bad_request'],
+  auth: ['auth', 'admin_auth', 'admin_locked'],
+};
+const LOG_KIND_LABEL = {
+  auth: ['bad', 'API Key'],
+  bad_request: ['warn', '请求体'],
+  no_candidate: ['warn', '无可用上游'],
+  upstream: ['bad', '上游失败'],
+  all_failed: ['bad', '全部失败'],
+  admin_auth: ['warn', '后台令牌'],
+  admin_locked: ['bad', '已锁定'],
+};
+
+function filteredLogs() {
+  const kinds = LOG_KINDS[logFilter];
+  const rows = [...(S.logs || [])].sort((a, b) => new Date(b.time) - new Date(a.time));
+  return kinds ? rows.filter(l => kinds.includes(l.kind)) : rows;
+}
+
+function renderLogs() {
+  // 侧边栏未读提示：只看最近 1 小时的异常
+  const recent = (S.logs || []).filter(l => Date.now() - new Date(l.time) < 3600e3).length;
+  const badge = $('log-badge');
+  if (badge) {
+    badge.hidden = recent === 0;
+    badge.textContent = recent > 99 ? '99+' : String(recent);
+  }
+
+  const rows = filteredLogs();
+  const total = (S.logs || []).length;
+  $('log-sum').textContent = rows.length === total
+    ? (total ? `共 ${total} 条` : '')
+    : `${rows.length} / ${total} 条`;
+
+  const tb = $('logs-body');
+  if (!rows.length) {
+    tb.innerHTML = `<tr><td colspan="6" class="empty">${
+      total ? '当前筛选下没有记录' : '暂无异常记录。请求失败、上游报错、鉴权被拒时会记在这里'
+    }</td></tr>`;
+    return;
+  }
+
+  tb.innerHTML = rows.map(l => {
+    const [cls, label] = LOG_KIND_LABEL[l.kind] || ['bad', l.kind];
+    const t = new Date(l.time);
+    const open = expandedLogs.has(l.id);
+    const hasDetail = !!l.detail;
+    const modelProv = [l.model, l.provider_id ? pname(l.provider_id) : ''].filter(Boolean);
+    return `<tr>
+      <td class="log-time">${t.toLocaleDateString()} <small>${t.toLocaleTimeString()}</small></td>
+      <td><span class="pill ${cls}">${esc(label)}</span></td>
+      <td>
+        <div class="log-msg">${esc(l.message)}</div>
+        ${hasDetail && open ? `<div class="log-detail">${esc(l.detail)}</div>` : ''}
+      </td>
+      <td class="cell-sub">${
+        modelProv.length
+          ? `<span class="mono">${esc(l.model || '—')}</span>${l.provider_id ? '<br>' + esc(pname(l.provider_id)) : ''}`
+          : '<span class="hint">—</span>'
+      }${l.key_id !== undefined && l.key_id !== '' ? `<div class="hint">Key: ${esc(keyName(l.key_id))}</div>` : ''}</td>
+      <td class="num">${l.status ? l.status : '<span class="hint">—</span>'}</td>
+      <td>${hasDetail ? `<button class="log-expand" title="${open ? '收起' : '展开详情'}" onclick="toggleLog('${l.id}')">${open ? '▾' : '▸'}</button>` : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+function toggleLog(id) {
+  if (expandedLogs.has(id)) expandedLogs.delete(id); else expandedLogs.add(id);
+  renderLogs();
+}
+
+async function clearLogs() {
+  if (!confirm('确定清空全部异常日志？此操作不可恢复')) return;
+  try {
+    S = await api('DELETE', '/api/logs');
+    S.logs ||= [];
+    expandedLogs.clear();
+    renderLogs();
+    toast('日志已清空');
+  } catch (e) { alert(e.message); }
 }
 
 /* ---------- 首页：用量 ---------- */
