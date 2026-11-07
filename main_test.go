@@ -417,6 +417,102 @@ func TestAdminAuthAndCRUD(t *testing.T) {
 	}
 }
 
+// 连续输错 5 次后锁定：此后即使提交正确令牌也直接拒绝，且不再做校验
+func TestAdminTokenLockout(t *testing.T) {
+	s, app := newTestServer(t)
+	s.adminToken = "secret"
+
+	wrong := func() *http.Response {
+		r, _ := postJSONWithHeader(t, app, "GET", "/api/state", "", "X-Admin-Token", "bad")
+		return r
+	}
+	// 前 4 次仍是普通错误
+	for i := 1; i < adminMaxFails; i++ {
+		if r := wrong(); r.StatusCode != 401 {
+			t.Fatalf("第 %d 次错误应 401, got %d", i, r.StatusCode)
+		}
+	}
+	// 第 5 次触发锁定
+	if r := wrong(); r.StatusCode != 401 {
+		t.Fatalf("第 %d 次错误应 401, got %d", adminMaxFails, r.StatusCode)
+	}
+	if n := len(s.fails); n != 1 {
+		t.Fatalf("应记录 1 个来源的失败, got %d", n)
+	}
+	var lockedIP string
+	for ip, f := range s.fails {
+		lockedIP = ip
+		if f.lockedUntil.IsZero() {
+			t.Fatal("连续 5 次失败后应处于锁定状态")
+		}
+	}
+	// 锁定期间即使令牌正确也被拒绝
+	r, body := postJSONWithHeader(t, app, "GET", "/api/state", "", "X-Admin-Token", "secret")
+	if r.StatusCode != 401 {
+		t.Fatalf("锁定期内正确令牌也应 401, got %d %s", r.StatusCode, body)
+	}
+	if !strings.Contains(body, "尝试次数过多") {
+		t.Fatalf("应提示锁定, got %s", body)
+	}
+	// 锁定到期后恢复校验，正确令牌可进入
+	s.failMu.Lock()
+	s.fails[lockedIP].lockedUntil = time.Now().Add(-time.Second)
+	s.failMu.Unlock()
+	if r, _ := postJSONWithHeader(t, app, "GET", "/api/state", "", "X-Admin-Token", "secret"); r.StatusCode != 200 {
+		t.Fatalf("锁定到期后正确令牌应放行, got %d", r.StatusCode)
+	}
+}
+
+// 令牌正确时清空失败计数，不会因为零散的输错被误锁
+func TestAdminTokenFailCountReset(t *testing.T) {
+	s, app := newTestServer(t)
+	s.adminToken = "secret"
+
+	for i := 0; i < adminMaxFails-1; i++ {
+		postJSONWithHeader(t, app, "GET", "/api/state", "", "X-Admin-Token", "bad")
+	}
+	if r, _ := postJSONWithHeader(t, app, "GET", "/api/state", "", "X-Admin-Token", "secret"); r.StatusCode != 200 {
+		t.Fatalf("正确令牌应放行, got %d", r.StatusCode)
+	}
+	s.failMu.Lock()
+	n := len(s.fails)
+	s.failMu.Unlock()
+	if n != 0 {
+		t.Fatalf("成功后失败记录应清空, got %d", n)
+	}
+}
+
+// 未配置管理令牌时后台开放，不受失败计数影响
+func TestAdminTokenNoLockoutWhenDisabled(t *testing.T) {
+	_, app := newTestServer(t)
+	for i := 0; i < adminMaxFails+3; i++ {
+		if r, _ := postJSONWithHeader(t, app, "GET", "/api/state", "", "X-Admin-Token", "bad"); r.StatusCode != 200 {
+			t.Fatalf("未启用鉴权时应始终 200, got %d", r.StatusCode)
+		}
+	}
+}
+
+// 默认不采信转发头（防伪造绕过），开启 trustProxy 后才使用
+func TestClientIPTrustProxy(t *testing.T) {
+	req := httptest.NewRequest("GET", "/api/state", nil)
+	req.RemoteAddr = "10.0.0.9:1234"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
+
+	s := &Server{}
+	if got := s.clientIP(req); got != "10.0.0.9" {
+		t.Fatalf("默认应取 TCP 对端, got %q", got)
+	}
+	s.trustProxy = true
+	if got := s.clientIP(req); got != "1.2.3.4" {
+		t.Fatalf("开启后应取 XFF 首个, got %q", got)
+	}
+	req.Header.Del("X-Forwarded-For")
+	req.Header.Set("X-Real-IP", "9.9.9.9")
+	if got := s.clientIP(req); got != "9.9.9.9" {
+		t.Fatalf("应回退到 X-Real-IP, got %q", got)
+	}
+}
+
 func postJSONWithHeader(t *testing.T, app *httptest.Server, method, path, body, hk, hv string) (*http.Response, string) {
 	t.Helper()
 	req, _ := http.NewRequest(method, app.URL+path, strings.NewReader(body))

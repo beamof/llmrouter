@@ -213,6 +213,10 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 .field input,.field select{flex:1;min-width:0}
 .field .inline{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
 .mute-row{display:flex;align-items:center;gap:6px;margin:6px 0}
+.auth-error{
+  margin:0 0 10px;padding:8px 11px;border-radius:9px;font-size:12.5px;line-height:1.6;
+  color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
+}
 
 /* ---------- 提示条 ---------- */
 #toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,14px);z-index:60;opacity:0;pointer-events:none;
@@ -305,7 +309,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
       <div id="banner">
         <b>需要管理令牌</b>
-        <span>服务端启用了后台鉴权，请填写令牌后重试。</span>
+        <span id="banner-msg">服务端启用了后台鉴权，请填写令牌后重试。</span>
         <button class="btn mini" onclick="openToken()">填写令牌</button>
       </div>
 
@@ -529,6 +533,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
   <div class="dlg-body">
     <div class="dlg-head"><h3>管理令牌</h3></div>
     <p class="hint" style="margin:0 0 12px">服务端以 <code>-admin-token</code> 启动时需要填写。令牌只保存在本机浏览器 localStorage，不会上传到别处。</p>
+    <div id="token-error" class="auth-error" hidden></div>
     <input id="tokenin" type="password" placeholder="输入管理令牌" style="width:100%" autocomplete="off">
   </div>
   <div class="dlg-foot">
@@ -543,7 +548,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 'use strict';
 let S = {providers: [], models: [], usage: [], balances: {}, api_keys: []};
 let page = 'home', stab = 'models', range = 'today', detailMode = 'model';
-let needAuth = false, authorized = false, editingModel = null, editingProvider = null;
+let needAuth = false, authorized = false, authMessage = '', editingModel = null, editingProvider = null;
 
 const $ = id => document.getElementById(id);
 const dlgProvider = $('dlg-provider'), dlgModel = $('dlg-model'), dlgToken = $('dlg-token');
@@ -611,12 +616,15 @@ async function api(method, path, body) {
   if (t) headers['X-Admin-Token'] = t;
   const res = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : undefined});
   if (res.status === 401) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data.error?.message || '需要管理令牌';
     needAuth = true;
     authorized = false;
+    authMessage = msg;
     renderAuthState();
     if (page === 'settings') go('home'); // 令牌失效时立刻退出设置页
     if (!dlgToken.open) openToken();
-    throw new Error('需要管理令牌');
+    throw new Error(msg);
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error?.message || ('HTTP ' + res.status));
@@ -628,8 +636,15 @@ function renderAuthState() {
   $('token-dot').classList.toggle('off', needAuth || !has);
   $('token-label').textContent = has ? '管理令牌' : '未设置令牌';
   $('banner').classList.toggle('on', needAuth);
+  const bannerMsg = $('banner-msg');
+  if (bannerMsg) bannerMsg.textContent = needAuth && authMessage ? authMessage : '服务端启用了后台鉴权，请填写令牌后重试。';
   const st = $('token-status');
   if (st) st.textContent = has ? '已设置管理令牌' : '当前未设置管理令牌';
+  const dlgErr = $('token-error');
+  if (dlgErr) {
+    dlgErr.textContent = needAuth ? authMessage : '';
+    dlgErr.hidden = !needAuth || !authMessage;
+  }
   // 只有确认过鉴权通过才解锁设置；令牌缺失或无效时锁定入口
   const locked = !authorized;
   const gear = document.querySelector('.icon-nav[data-page="settings"]');
@@ -667,6 +682,7 @@ async function load() {
     S.api_keys ||= [];
     needAuth = false;
     authorized = true; // 成功取到状态，说明当前令牌（或无需令牌）是有效的
+    authMessage = '';
     renderAll();
   } catch (e) {
     console.error(e);

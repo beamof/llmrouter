@@ -5,7 +5,9 @@ import (
 	_ "embed"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -16,14 +18,32 @@ import (
 //go:embed web/index.html
 var indexHTML []byte
 
+// 管理令牌防爆破：同一来源连续输错 adminMaxFails 次后锁定 adminLockout，
+// 锁定期间不再校验令牌，直接返回令牌错误。
+const (
+	adminMaxFails = 5
+	adminLockout  = 15 * time.Minute
+)
+
+// adminFail 某个来源的失败记录
+type adminFail struct {
+	count       int       // 连续失败次数
+	lockedUntil time.Time // 锁定到期时间，零值 = 未锁定
+	last        time.Time // 最近一次失败时间，用于清理
+}
+
 type Server struct {
 	store      *Store
 	client     *http.Client
 	adminToken string // 后台令牌，空则不鉴权
 	apiToken   string // 代理入口令牌，空则不鉴权
+	trustProxy bool   // 是否信任 X-Forwarded-For / X-Real-IP 判定来源 IP
 
 	sessMu   sync.Mutex
 	sessions map[string]session // 会话粘性绑定，仅内存，重启即清
+
+	failMu sync.Mutex
+	fails  map[string]*adminFail // 管理令牌失败计数，按来源 IP，仅内存
 }
 
 func (s *Server) routes() *http.ServeMux {
@@ -57,18 +77,118 @@ func (s *Server) routes() *http.ServeMux {
 
 func (s *Server) adminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.adminToken != "" {
-			tok := r.Header.Get("X-Admin-Token")
-			if tok == "" {
-				tok = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			}
-			if subtle.ConstantTimeCompare([]byte(tok), []byte(s.adminToken)) != 1 {
-				writeErr(w, http.StatusUnauthorized, "需要正确的管理令牌")
-				return
-			}
+		if s.adminToken == "" {
+			next.ServeHTTP(w, r)
+			return
 		}
+		ip := s.clientIP(r)
+		if until, locked := s.adminLocked(ip); locked {
+			writeErr(w, http.StatusUnauthorized, fmt.Sprintf("尝试次数过多，请 %d 秒后再试", int(time.Until(until).Seconds())+1))
+			return
+		}
+		tok := r.Header.Get("X-Admin-Token")
+		if tok == "" {
+			tok = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		}
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(s.adminToken)) != 1 {
+			locked := s.recordAdminFail(ip)
+			msg := "需要正确的管理令牌"
+			if locked {
+				msg = fmt.Sprintf("令牌错误次数过多，已锁定 %d 分钟", int(adminLockout.Minutes()))
+			} else if n := s.adminFailCount(ip); n > 0 && adminMaxFails-n <= 2 {
+				msg = fmt.Sprintf("管理令牌错误，再错 %d 次将锁定", adminMaxFails-n)
+			}
+			writeErr(w, http.StatusUnauthorized, msg)
+			return
+		}
+		s.clearAdminFail(ip)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// clientIP 判定请求来源，用作失败计数与锁定的键。
+// 默认取 TCP 对端地址；只有显式开启 -trust-proxy（部署在反向代理之后）才采信转发头，
+// 否则客户端可伪造 X-Forwarded-For 绕过计数。
+func (s *Server) clientIP(r *http.Request) string {
+	if s.trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if i := strings.IndexByte(xff, ','); i >= 0 {
+				xff = xff[:i]
+			}
+			if ip := strings.TrimSpace(xff); ip != "" {
+				return ip
+			}
+		}
+		if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
+			return ip
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// adminLocked 该来源是否仍在锁定期内（调用方无需持锁）
+func (s *Server) adminLocked(ip string) (time.Time, bool) {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	f, ok := s.fails[ip]
+	if !ok || f.lockedUntil.IsZero() {
+		return time.Time{}, false
+	}
+	if time.Now().Before(f.lockedUntil) {
+		return f.lockedUntil, true
+	}
+	// 锁定已过期，重置该来源的记录
+	delete(s.fails, ip)
+	return time.Time{}, false
+}
+
+// recordAdminFail 记一次失败，返回本次是否触发锁定
+func (s *Server) recordAdminFail(ip string) bool {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	if s.fails == nil {
+		s.fails = map[string]*adminFail{}
+	}
+	now := time.Now()
+	f, ok := s.fails[ip]
+	if !ok {
+		f = &adminFail{}
+		s.fails[ip] = f
+	}
+	f.count++
+	f.last = now
+	if f.count >= adminMaxFails {
+		f.lockedUntil = now.Add(adminLockout)
+	}
+	if len(s.fails) > 1024 { // 顺手清理长期无活动的记录，避免内存无界增长
+		for k, v := range s.fails {
+			if v.lockedUntil.IsZero() && now.Sub(v.last) > adminLockout {
+				delete(s.fails, k)
+			}
+		}
+	}
+	return !f.lockedUntil.IsZero()
+}
+
+// adminFailCount 当前来源的连续失败次数
+func (s *Server) adminFailCount(ip string) int {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	if f, ok := s.fails[ip]; ok {
+		return f.count
+	}
+	return 0
+}
+
+// clearAdminFail 令牌校验通过后清空该来源的失败记录
+func (s *Server) clearAdminFail(ip string) {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	delete(s.fails, ip)
 }
 
 // checkAPIToken 校验客户端密钥，返回命中的 key ID（"env" = 环境变量令牌，空串 = 免鉴权放行）
@@ -113,6 +233,7 @@ func main() {
 	data := flag.String("data", getenv("LLMROUTER_DATA", "data.json"), "状态文件路径")
 	adminToken := flag.String("admin-token", os.Getenv("LLMROUTER_ADMIN_TOKEN"), "管理后台令牌（空 = 不鉴权）")
 	apiToken := flag.String("api-token", os.Getenv("LLMROUTER_API_TOKEN"), "代理入口令牌（空 = 不鉴权）")
+	trustProxy := flag.Bool("trust-proxy", os.Getenv("LLMROUTER_TRUST_PROXY") != "", "部署在反向代理后时开启：按 X-Forwarded-For 判定来源 IP（默认取 TCP 对端）")
 	flag.Parse()
 
 	store, err := LoadStore(*data)
@@ -124,6 +245,7 @@ func main() {
 		client:     &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, MaxIdleConnsPerHost: 16, IdleConnTimeout: 90 * time.Second}},
 		adminToken: *adminToken,
 		apiToken:   *apiToken,
+		trustProxy: *trustProxy,
 	}
 	if s.adminToken == "" {
 		log.Println("提示：未设置管理令牌，后台完全开放；建议 -admin-token XXX 或环境变量 LLMROUTER_ADMIN_TOKEN")
