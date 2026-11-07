@@ -136,9 +136,9 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			}
 		}
 		if len(cands) == 0 {
-			msg := fmt.Sprintf("模型 %q 当前没有可用上游（未配置、处于静音时段或已达每日上限）", req.Model)
+			msg := fmt.Sprintf("模型 %q 当前没有可用上游（未配置、处于静音时段、已达每日上限或并行已满）", req.Model)
 			if isAuto {
-				msg = "当前没有可用模型（全部未配置、处于静音时段或已达每日上限）"
+				msg = "当前没有可用模型（全部未配置、处于静音时段、已达每日上限或并行已满）"
 			}
 			s.logFail(LogEntry{
 				Level: "error", Kind: kindNoCandidate, Status: http.StatusNotFound,
@@ -151,12 +151,20 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 		lastErr := fmt.Sprintf("模型 %q 无候选", req.Model)
 		var failures []string // 逐个上游的失败原因，全部失败时一并写进日志
 		for _, c := range cands {
+			// 原子占位：候选列表是乐观筛选的，多个并发请求可能同时看到"还有空位"。
+			// 真正发请求前再抢一次，抢不到说明该模型已满，跳到下一个候选。
+			if !s.store.TryAcquire(c.Model.ID) {
+				lastErr = fmt.Sprintf("%s 已达并行上限 %d", c.Model.Name, c.Model.MaxConcurrent)
+				failures = append(failures, lastErr)
+				continue
+			}
 			sendBody := body
 			if isAuto {
 				sendBody = withModel(body, c.Model.Name) // 仅替换顶层 model 字段的值
 			}
 			up, err := s.upstreamRequest(r, c.Provider, suffix, sendBody)
 			if err != nil {
+				s.store.Release(c.Model.ID)
 				lastErr = err.Error()
 				failures = append(failures, fmt.Sprintf("%s: 构造请求失败: %v", c.Provider.Name, err))
 				s.logFail(LogEntry{
@@ -168,6 +176,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			}
 			resp, err := s.client.Do(up)
 			if err != nil {
+				s.store.Release(c.Model.ID)
 				lastErr = fmt.Sprintf("%s: %v", c.Provider.Name, err)
 				failures = append(failures, lastErr)
 				s.logFail(LogEntry{
@@ -181,6 +190,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			if resp.StatusCode >= 400 {
 				eb, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 				resp.Body.Close()
+				s.store.Release(c.Model.ID)
 				lastErr = fmt.Sprintf("%s: HTTP %d: %s", c.Provider.Name, resp.StatusCode, errSnippet(eb))
 				failures = append(failures, lastErr)
 				s.logFail(LogEntry{
@@ -194,7 +204,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			if sessKey != "" {
 				s.setSession(sessKey, c.Model.ID) // 成功即绑定/续期
 			}
-			s.relay(w, resp, c.Model, keyID)
+			s.relay(w, resp, c.Model, keyID) // relay 返回前会释放名额
 			return
 		}
 		if sessKey != "" {
@@ -325,8 +335,10 @@ func extractStreamUsage(tail []byte) Usage {
 	return u
 }
 
-// relay 把上游响应原样写回客户端；非流式响应顺带读取 usage 记账
+// relay 把上游响应原样写回客户端；非流式响应顺带读取 usage 记账。
+// 函数返回时释放该模型的并行名额（defer 保证流式/非流式/204 各路径都会释放）。
 func (s *Server) relay(w http.ResponseWriter, resp *http.Response, m Model, keyID string) {
+	defer s.store.Release(m.ID)
 	defer resp.Body.Close()
 	for k, vv := range resp.Header {
 		if skipRespHeader(k) {

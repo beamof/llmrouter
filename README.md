@@ -57,7 +57,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 - 请求体里的 `model` 字段用于路由（唯一的读取项），其余内容一概不碰
 - Provider 有两个基址：`Chat 基址`（chat completions）与 `Responses 基址`（responses 协议，留空则跟随 Chat 基址）。两种协议基址不同的厂商（如智谱 Coding Plan 没有 `/responses`，可单独填 `https://open.bigmodel.cn/api/v1`）一个 Provider 即可搞定
-- 候选 = 该名字的所有模型条目，剔除「当前时间处于静音时段」和「今日 token 用量已达上限」的，按优先级从大到小依次尝试
+- 候选 = 该名字的所有模型条目，剔除「当前时间处于静音时段」「今日 token 用量已达上限」「并行请求数已达上限」的，按优先级从大到小依次尝试
 - 上游返回**任何 4xx/5xx**（含 400/404/429 等）或网络错误时自动换下一个候选；全部失败时返回 502，并附上最后一个上游的状态码与错误详情
 - **会话粘性**：客户端请求带 `X-Session-ID: <任意会话标识>` 头时，该会话首次请求按上述规则选模型并绑定；后续请求直连绑定的模型（不再套用优先级/静音/每日上限规则），仅当绑定上游失败才按规则重选并重新绑定。绑定 1 小时无活动过期，仅存内存（重启即清）：
 
@@ -68,6 +68,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
     -d '{"model":"gpt-4o","messages":[...]}'
   ```
 - 静音时段按服务器本地时间，每天重复，支持跨零点（如 22:00~06:00）
+- **并行上限**：每个模型条目可设「并行上限」（`max_concurrent`，0 = 不限）。某条路由的在途请求数达到上限后，新请求**不再排队**，而是自动落到该模型名的下一个候选；全部候选都满时返回 404。计数按模型条目独立，同一模型名挂在多个 Provider 上互不影响；仅存内存，重启归零。后台模型列表的「并行」列实时显示 `在途 / 上限`
 - 非流式响应会顺带读取 `usage` 字段记账 token（兼容 `prompt_tokens/completion_tokens` 与 `input_tokens/output_tokens`）；流式响应透传时保留 8KB 滚动尾部副本（不改任何字节），从末尾 `usage` 事件提取 token，同样计入统计与每日上限
 - 缓存命中单独统计：读取 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`（含在输入 token 内），用量页展示缓存量与命中率
 - Provider 的 API Key 为空时，客户端的 Authorization 头会原样转发（自带 Key 模式）

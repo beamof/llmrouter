@@ -30,12 +30,13 @@ type MuteWindow struct {
 
 // Model 一条路由规则：某 provider 上的某个模型
 type Model struct {
-	ID         string       `json:"id"`
-	ProviderID string       `json:"provider_id"`
-	Name       string       `json:"name"`        // 对外模型名，须与请求体 model 字段一致
-	Priority   int          `json:"priority"`    // 越大越优先
-	DailyLimit int64        `json:"daily_limit"` // 每日请求上限，0 = 不限
-	Mutes      []MuteWindow `json:"mutes,omitempty"`
+	ID            string       `json:"id"`
+	ProviderID    string       `json:"provider_id"`
+	Name          string       `json:"name"`           // 对外模型名，须与请求体 model 字段一致
+	Priority      int          `json:"priority"`       // 越大越优先
+	DailyLimit    int64        `json:"daily_limit"`    // 每日请求上限，0 = 不限
+	MaxConcurrent int          `json:"max_concurrent"` // 最大并行请求数，0 = 不限；超出后新请求改走后续候选
+	Mutes         []MuteWindow `json:"mutes,omitempty"`
 }
 
 // APIKey 客户端访问本网关 /v1/* 的密钥
@@ -78,6 +79,10 @@ type Store struct {
 	Balances  map[string]*Balance `json:"balances"`
 	Logs      []*LogEntry         `json:"logs,omitempty"`       // 异常/失败日志，最多 maxLogs 条
 	AutoModel string              `json:"auto_model,omitempty"` // 对外声明的自动模型名，空 = "auto"
+
+	// inflight 各模型条目当前在途请求数，仅内存、不落盘（重启归零）。
+	// 键是模型条目 ID，这样同一模型名挂在多个 Provider 上时各自独立计数。
+	inflight map[string]int
 }
 
 func LoadStore(path string) (*Store, error) {
@@ -343,6 +348,58 @@ func (s *Store) SetBalance(pid string, b *Balance) {
 	s.save()
 }
 
+// TryAcquire 尝试占用一个并行名额。成功返回 true，调用方必须配对调用 Release。
+// 判断与自增在同一把锁内完成，避免并发请求同时看到"还有空位"而超发。
+func (s *Store) TryAcquire(modelID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var limit int
+	for _, m := range s.Models {
+		if m.ID == modelID {
+			limit = m.MaxConcurrent
+			break
+		}
+	}
+	if limit > 0 && s.inflight[modelID] >= limit {
+		return false
+	}
+	if s.inflight == nil {
+		s.inflight = map[string]int{}
+	}
+	s.inflight[modelID]++
+	return true
+}
+
+// Release 释放一个并行名额
+func (s *Store) Release(modelID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight == nil {
+		return
+	}
+	if s.inflight[modelID] <= 1 {
+		delete(s.inflight, modelID) // 归零即删，避免 map 无限增长
+		return
+	}
+	s.inflight[modelID]--
+}
+
+// atCapacity 该模型是否已达并行上限（调用方需持锁）
+func (s *Store) atCapacity(m *Model) bool {
+	return m.MaxConcurrent > 0 && s.inflight[m.ID] >= m.MaxConcurrent
+}
+
+// Inflight 返回各模型当前在途请求数（给后台页面展示）
+func (s *Store) Inflight() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]int, len(s.inflight))
+	for k, v := range s.inflight {
+		out[k] = v
+	}
+	return out
+}
+
 // Candidate 参与本次路由的一个候选（拷贝，避免和后台编辑竞态）
 type Candidate struct {
 	Provider Provider
@@ -393,7 +450,7 @@ func (s *Store) AllCandidates(now time.Time) []Candidate {
 	today := now.Format("2006-01-02")
 	var out []Candidate
 	for _, m := range s.Models {
-		if mutedNow(m.Mutes, now) || s.overLimit(m, today) {
+		if mutedNow(m.Mutes, now) || s.overLimit(m, today) || s.atCapacity(m) {
 			continue
 		}
 		for _, p := range s.Providers {
@@ -416,7 +473,7 @@ func (s *Store) Candidates(name string, now time.Time) []Candidate {
 	today := now.Format("2006-01-02")
 	var out []Candidate
 	for _, m := range s.Models {
-		if m.Name != name || mutedNow(m.Mutes, now) || s.overLimit(m, today) {
+		if m.Name != name || mutedNow(m.Mutes, now) || s.overLimit(m, today) || s.atCapacity(m) {
 			continue
 		}
 		for _, p := range s.Providers {

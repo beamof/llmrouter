@@ -447,7 +447,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
               <table>
                 <thead><tr>
                   <th style="width:88px">优先级</th><th>模型</th><th>Provider</th><th>状态</th>
-                  <th class="num">今日用量</th><th>静音时段</th><th>连通性</th><th style="width:150px">操作</th>
+                  <th class="num">今日用量</th><th class="num">并行</th><th>静音时段</th><th>连通性</th><th style="width:150px">操作</th>
                 </tr></thead>
                 <tbody id="models-body"></tbody>
               </table>
@@ -579,6 +579,9 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
     <div class="field"><label>优先级</label><div class="inline"><input id="m-priority" type="number" value="10" style="max-width:110px"><span class="hint">越大越优先</span></div></div>
     <div class="field"><label>每日上限</label>
       <div class="inline"><input id="m-limit" type="number" min="0" step="0.1" value="0" style="max-width:110px"><span class="hint">万 tokens / 天（填 50 = 50 万），0 = 不限</span></div>
+    </div>
+    <div class="field"><label>并行上限</label>
+      <div class="inline"><input id="m-concurrent" type="number" min="0" step="1" value="0" style="max-width:110px"><span class="hint">同时处理的最大请求数，0 = 不限；满了新请求自动走后续候选</span></div>
     </div>
     <div class="field" style="align-items:flex-start"><label>静音时段</label>
       <div style="flex:1;min-width:0">
@@ -1137,18 +1140,26 @@ function isMuted(ws) {
 function renderModels() {
   const tb = $('models-body');
   if (!S.models.length) {
-    tb.innerHTML = `<tr><td colspan="8" class="empty">还没有模型，点右上角「添加模型」开始</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="9" class="empty">还没有模型，点右上角「添加模型」开始</td></tr>`;
     return;
   }
   tb.innerHTML = sortedModels().map((m, i) => {
     const muted = isMuted(m.mutes);
     const over = m.daily_limit > 0 && m.used_today >= m.daily_limit;
+    const full = m.max_concurrent > 0 && (m.inflight || 0) >= m.max_concurrent;
     const status = muted ? '<span class="pill warn">静音中</span>'
-      : over ? '<span class="pill bad">已超限</span>' : '<span class="pill ok">可用</span>';
+      : over ? '<span class="pill bad">已超限</span>'
+      : full ? '<span class="pill warn">并行已满</span>'
+      : '<span class="pill ok">可用</span>';
     const pct = m.daily_limit > 0 ? Math.min(100, Math.round(m.used_today / m.daily_limit * 100)) : 0;
     const limitTxt = m.daily_limit > 0 ? fmtTok(m.daily_limit) : '∞';
     const bar = m.daily_limit > 0
       ? `<div class="mini-bar"><i class="${over ? 'over' : ''}" style="width:${Math.max(pct, m.used_today > 0 ? 2 : 0)}%"></i></div>` : '';
+    // 并行占用：有上限时显示 在途/上限，无上限只显示在途数
+    const concPct = m.max_concurrent > 0 ? Math.min(100, Math.round((m.inflight || 0) / m.max_concurrent * 100)) : 0;
+    const concBar = m.max_concurrent > 0
+      ? `<div class="mini-bar" style="min-width:70px"><i class="${full ? 'over' : ''}" style="width:${Math.max(concPct, (m.inflight || 0) > 0 ? 3 : 0)}%"></i></div>` : '';
+    const concTxt = m.max_concurrent > 0 ? `${m.inflight || 0} / ${m.max_concurrent}` : `${m.inflight || 0} / ∞`;
     return `<tr>
       <td style="white-space:nowrap">
         <span class="hint" style="display:inline-block;width:18px">${i + 1}</span>
@@ -1163,6 +1174,12 @@ function renderModels() {
         <div class="usage-cell" style="align-items:flex-end">
           ${bar}
           <span title="${exact(m.used_today)} / ${m.daily_limit > 0 ? exact(m.daily_limit) : '不限'}">${fmtTok(m.used_today)} / ${limitTxt}</span>
+        </div>
+      </td>
+      <td class="num">
+        <div class="usage-cell" style="align-items:flex-end">
+          ${concBar}
+          <span title="当前在途 ${m.inflight || 0} 个请求${m.max_concurrent > 0 ? '，上限 ' + m.max_concurrent : '，不限'}">${concTxt}</span>
         </div>
       </td>
       <td>${(m.mutes || []).map(w => `<span class="cell-sub">${esc(w.from + '~' + w.to)}</span>`).join('<br>') || '<span class="hint">—</span>'}</td>
@@ -1224,6 +1241,7 @@ function editModel(id) {
   $('m-name').value = editingModel?.name || '';
   $('m-priority').value = editingModel?.priority ?? ((sortedModels()[0]?.priority || 0) + 1);
   $('m-limit').value = editingModel?.daily_limit ? editingModel.daily_limit / 10000 : 0;
+  $('m-concurrent').value = editingModel?.max_concurrent || 0;
   $('mutes').innerHTML = '';
   (editingModel?.mutes || []).forEach(w => addMuteRow(w.from, w.to));
   dlgModel.showModal();
@@ -1268,6 +1286,7 @@ async function saveModel() {
     name: $('m-name').value.trim(),
     priority: parseInt($('m-priority').value) || 0,
     daily_limit: Math.round((parseFloat($('m-limit').value) || 0) * 10000), // 界面单位：万 tokens
+    max_concurrent: Math.max(0, parseInt($('m-concurrent').value) || 0),
     mutes,
   };
   if (!body.name) { alert('模型名必填'); return; }

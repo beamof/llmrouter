@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1150,5 +1151,179 @@ func TestStateIncludesLogs(t *testing.T) {
 	}
 	if len(*v.Logs) != 0 {
 		t.Fatalf("空状态应为空数组, got %d", len(*v.Logs))
+	}
+}
+
+// TryAcquire/Release 的计数语义：满额拒绝、释放后可再取、归零即删键
+func TestTryAcquireRelease(t *testing.T) {
+	s, _ := newTestServer(t)
+	m := addProviderModel(t, s, "http://x.invalid", "m", func(m *Model) { m.MaxConcurrent = 2 })
+
+	if !s.store.TryAcquire(m.ID) || !s.store.TryAcquire(m.ID) {
+		t.Fatal("前两个名额应能取到")
+	}
+	if s.store.TryAcquire(m.ID) {
+		t.Fatal("超出上限应拒绝")
+	}
+	s.store.Release(m.ID)
+	if !s.store.TryAcquire(m.ID) {
+		t.Fatal("释放后应能再取")
+	}
+	if got := s.store.Inflight()[m.ID]; got != 2 {
+		t.Fatalf("在途数应为 2, got %d", got)
+	}
+	s.store.Release(m.ID)
+	s.store.Release(m.ID)
+	s.store.mu.Lock()
+	_, exists := s.store.inflight[m.ID]
+	s.store.mu.Unlock()
+	if exists {
+		t.Fatal("归零后应删除键，避免 map 增长")
+	}
+}
+
+// 无上限（0）时不应拦截
+func TestNoConcurrentLimitWhenZero(t *testing.T) {
+	s, _ := newTestServer(t)
+	m := addProviderModel(t, s, "http://x.invalid", "m", nil)
+	for i := 0; i < 50; i++ {
+		if !s.store.TryAcquire(m.ID) {
+			t.Fatalf("无上限时第 %d 次应成功", i+1)
+		}
+	}
+}
+
+// 并行已满的模型不进入候选，请求自动落到后续候选
+func TestFullModelSkippedByCandidates(t *testing.T) {
+	s, _ := newTestServer(t)
+	full := addProviderModel(t, s, "http://a.invalid", "m", func(m *Model) {
+		m.Priority = 20
+		m.MaxConcurrent = 1
+	})
+	backup := addProviderModel(t, s, "http://b.invalid", "m", func(m *Model) {
+		m.Priority = 10
+		m.MaxConcurrent = 1
+	})
+
+	cands := s.store.Candidates("m", time.Now())
+	if len(cands) != 2 {
+		t.Fatalf("初始应有 2 个候选, got %d", len(cands))
+	}
+	s.store.TryAcquire(full.ID) // 占满高优先级模型
+	cands = s.store.Candidates("m", time.Now())
+	if len(cands) != 1 || cands[0].Model.ID != backup.ID {
+		t.Fatalf("满额模型应被剔除，只剩备用候选: %+v", cands)
+	}
+	// 全部占满时无候选
+	s.store.TryAcquire(backup.ID)
+	if cands = s.store.Candidates("m", time.Now()); len(cands) != 0 {
+		t.Fatalf("全部满额应无候选, got %d", len(cands))
+	}
+}
+
+// 端到端：并行满时新请求改走后续候选，且请求结束后名额被释放
+func TestConcurrentLimitFailover(t *testing.T) {
+	release := make(chan struct{})
+	var hitA, hitB int32
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hitA, 1)
+		<-release // 挂住第一个请求，保持名额被占用
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upA.Close()
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hitB, 1)
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upB.Close()
+
+	s, app := newTestServer(t)
+	a := addProviderModel(t, s, upA.URL, "m", func(m *Model) {
+		m.Priority = 20
+		m.MaxConcurrent = 1
+	})
+	addProviderModel(t, s, upB.URL, "m", func(m *Model) { m.Priority = 10 })
+
+	// 第一个请求占住 A（会阻塞在 release 上）
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`)
+	}()
+	// 等 A 的在途数变成 1
+	deadline := time.Now().Add(2 * time.Second)
+	for s.store.Inflight()[a.ID] == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("第一个请求未占用名额")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 此时 A 已满，第二个请求应落到 B
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+		t.Fatalf("第二个请求应成功走 B: %d %s", resp.StatusCode, body)
+	}
+	if atomic.LoadInt32(&hitB) == 0 {
+		t.Fatal("第二个请求应打到备用上游 B")
+	}
+
+	close(release)
+	<-done
+	// 第一个请求结束后名额应释放
+	deadline = time.Now().Add(2 * time.Second)
+	for s.store.Inflight()[a.ID] != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("名额未释放, inflight=%d", s.store.Inflight()[a.ID])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&hitA) != 1 {
+		t.Fatalf("A 应只被调用 1 次, got %d", atomic.LoadInt32(&hitA))
+	}
+}
+
+// 上游失败路径也要释放名额，否则名额会泄漏
+func TestConcurrentSlotReleasedOnFailure(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		fmt.Fprint(w, `{"error":{"message":"boom"}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	m := addProviderModel(t, s, up.URL, "m", func(m *Model) { m.MaxConcurrent = 1 })
+
+	for i := 0; i < 3; i++ {
+		if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 502 {
+			t.Fatalf("第 %d 次应 502, got %d", i+1, resp.StatusCode)
+		}
+		if got := s.store.Inflight()[m.ID]; got != 0 {
+			t.Fatalf("第 %d 次失败后名额应已释放, got %d", i+1, got)
+		}
+	}
+}
+
+// 后台状态里带 inflight 字段，前端才能展示并行占用
+func TestStateIncludesInflight(t *testing.T) {
+	s, app := newTestServer(t)
+	m := addProviderModel(t, s, "http://x.invalid", "m", func(m *Model) { m.MaxConcurrent = 3 })
+	s.store.TryAcquire(m.ID)
+
+	resp, body := postJSONWithHeader(t, app, "GET", "/api/state", "", "X-Admin-Token", "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("应 200, got %d", resp.StatusCode)
+	}
+	var v struct {
+		Models []struct {
+			ID            string `json:"id"`
+			MaxConcurrent int    `json:"max_concurrent"`
+			Inflight      int    `json:"inflight"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.Models) != 1 || v.Models[0].Inflight != 1 || v.Models[0].MaxConcurrent != 3 {
+		t.Fatalf("状态应带 inflight/max_concurrent: %+v", v.Models)
 	}
 }

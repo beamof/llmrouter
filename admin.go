@@ -17,6 +17,7 @@ import (
 type ModelView struct {
 	*Model
 	UsedToday int64 `json:"used_today"` // 今日已用 tokens
+	Inflight  int   `json:"inflight"`   // 当前在途请求数（并行）
 }
 
 // StateView 后台页面所需的完整状态
@@ -56,7 +57,7 @@ func (s *Store) SnapshotJSON() []byte {
 		v.Logs = s.Logs
 	}
 	for _, m := range s.Models {
-		v.Models = append(v.Models, ModelView{Model: m, UsedToday: used[m.ProviderID+"\x00"+m.Name]})
+		v.Models = append(v.Models, ModelView{Model: m, UsedToday: used[m.ProviderID+"\x00"+m.Name], Inflight: s.inflight[m.ID]})
 	}
 	v.Usage = append(v.Usage, s.Usage...)
 	v.AutoModel = s.AutoModel // 已持锁，直接读；空值由前端按默认 auto 处理
