@@ -944,10 +944,14 @@ function renderLogs() {
   }).join('');
 }
 
-// 会话日志展开：候选顺序 + 被剔除的条目及原因
+// 会话日志展开：候选顺序 + 被剔除的条目及原因（含规则剔除与尝试失败降级）
 function renderSessionDetail(l) {
-  const cands = (l.candidates || []).map((c, i) =>
-    `<div>${i + 1}. ${esc(c)}${i === 0 ? ' ← 已选中' : ''}</div>`).join('');
+  // 选中的是实际绑定的 provider/model，未必是列表第 0 个（前面的候选可能尝试失败让位）
+  const chosen = l.provider_id ? `${pname(l.provider_id)}/${l.model}` : '';
+  const cands = (l.candidates || []).map((c, i) => {
+    const mark = chosen && c.startsWith(chosen) ? ' ← 已选中' : '';
+    return `<div>${i + 1}. ${esc(c)}${mark}</div>`;
+  }).join('');
   const skips = (l.skipped || []).map(s =>
     `<div>${esc(pname(s.provider_id))}/${esc(s.model)}：${esc(s.reason)}</div>`).join('');
   return `<div class="log-detail">${

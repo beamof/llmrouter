@@ -150,7 +150,8 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 		}
 
 		lastErr := fmt.Sprintf("模型 %q 无候选", req.Model)
-		var failures []string // 逐个上游的失败原因，全部失败时一并写进日志
+		var failures []string         // 逐个上游的失败原因，全部失败时一并写进日志
+		var attemptSkips []SkipReason // 循环中实际尝试过但让位的候选及原因（随会话日志落盘）
 		// 候选成功后的会话绑定（普通透传与 WorkBuddy 适配两条路径共用）
 		bind := func(c Candidate, status int) {
 			if sessKey == "" {
@@ -167,7 +168,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 					Requested:  req.Model,
 					Switched:   boundID != "",
 					Status:     status,
-				}, c, boundID, cands, skips, isAuto))
+				}, c, boundID, cands, skips, attemptSkips, isAuto))
 			}
 		}
 		for _, c := range cands {
@@ -176,6 +177,10 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			if !s.store.TryAcquire(c.Model.ID) {
 				lastErr = fmt.Sprintf("%s 已达并行上限 %d", c.Model.Name, c.Model.MaxConcurrent)
 				failures = append(failures, lastErr)
+				attemptSkips = append(attemptSkips, SkipReason{
+					ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+					Reason: fmt.Sprintf("尝试时并行已满（上限 %d），让位给下一候选", c.Model.MaxConcurrent),
+				})
 				continue
 			}
 			// WorkBuddy 候选走适配分支：归一化出站、专用请求头、token 续期、
@@ -189,6 +194,10 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				if err := s.wbAttempt(w, r, c, sendBody, keyID, suffix == "/responses"); err != nil {
 					lastErr = err.Error()
 					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
+					attemptSkips = append(attemptSkips, SkipReason{
+						ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+						Reason: "尝试失败：" + truncateRunes(lastErr, 160),
+					})
 					continue // 名额释放与失败日志由 wbAttempt 处理
 				}
 				bind(c, http.StatusOK)
@@ -203,6 +212,10 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				s.store.Release(c.Model.ID)
 				lastErr = err.Error()
 				failures = append(failures, fmt.Sprintf("%s: 构造请求失败: %v", c.Provider.Name, err))
+				attemptSkips = append(attemptSkips, SkipReason{
+					ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+					Reason: "尝试失败：构造请求失败: " + truncateRunes(lastErr, 160),
+				})
 				s.logFail(LogEntry{
 					Level: "error", Kind: kindUpstream, KeyID: keyID,
 					ProviderID: c.Provider.ID, Model: c.Model.Name,
@@ -215,6 +228,10 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				s.store.Release(c.Model.ID)
 				lastErr = fmt.Sprintf("%s: %v", c.Provider.Name, err)
 				failures = append(failures, lastErr)
+				attemptSkips = append(attemptSkips, SkipReason{
+					ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+					Reason: "尝试失败：" + truncateRunes(lastErr, 160),
+				})
 				s.logFail(LogEntry{
 					Level: "error", Kind: kindUpstream, KeyID: keyID,
 					ProviderID: c.Provider.ID, Model: c.Model.Name,
@@ -229,6 +246,10 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				s.store.Release(c.Model.ID)
 				lastErr = fmt.Sprintf("%s: HTTP %d: %s", c.Provider.Name, resp.StatusCode, errSnippet(eb))
 				failures = append(failures, lastErr)
+				attemptSkips = append(attemptSkips, SkipReason{
+					ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+					Reason: "尝试失败：" + truncateRunes(lastErr, 160),
+				})
 				// 429 视为明确限流：把该模型条目自动静音一段时间，后续请求直接跳过它
 				if resp.StatusCode == http.StatusTooManyRequests {
 					if until, ok := s.store.MuteOn429(c.Model.ID, rateLimitMute, "上游返回 429 限流"); ok {
@@ -268,12 +289,14 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 
 // buildSessionLog 生成会话日志：在基础字段上补选路理由、候选顺序与被剔除的原因。
 // 只在新建会话或会话中途换模型时调用，所以理由只有「新会话」「会话切换」两类。
-func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, cands []Candidate, skips []SkipReason, isAuto bool) LogEntry {
+// skips 是选路规则的剔除项（静音/上限等），attemptSkips 是循环中实际尝试过但
+// 让位的候选（并行抢不到名额、上游失败后降级），两者合并进 skipped 一并落盘。
+func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, cands []Candidate, skips, attemptSkips []SkipReason, isAuto bool) LogEntry {
 	// 候选顺序，带上优先级，便于看清"为什么是它"
 	for _, c := range cands {
 		e.Candidates = append(e.Candidates, fmt.Sprintf("%s/%s (优先级 %d)", c.Provider.Name, c.Model.Name, c.Model.Priority))
 	}
-	e.Skipped = skips
+	e.Skipped = append(append([]SkipReason(nil), skips...), attemptSkips...)
 
 	switch {
 	case boundID != "" && boundID != chosen.Model.ID:
@@ -283,6 +306,9 @@ func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, c
 		e.Reason = fmt.Sprintf("新会话，auto 虚拟模型：全部可用模型中优先级最高（%d）", chosen.Model.Priority)
 	default:
 		e.Reason = fmt.Sprintf("新会话，按优先级选中最高可用候选（%d）", chosen.Model.Priority)
+	}
+	if len(attemptSkips) > 0 {
+		e.Reason += fmt.Sprintf("；前 %d 个候选尝试失败已降级（原因见已剔除）", len(attemptSkips))
 	}
 
 	// 把「与选中项同优先级、但因并行已满而让位」的情况说清楚

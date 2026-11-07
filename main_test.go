@@ -1475,6 +1475,98 @@ func TestSessionLogRecordsSwitch(t *testing.T) {
 	}
 }
 
+// 高优先级候选尝试失败降级到下一个时，会话日志要记录失败原因与降级说明
+func TestSessionLogRecordsAttemptFailures(t *testing.T) {
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		fmt.Fprint(w, `{"error":{"message":"boom"}}`)
+	}))
+	defer upA.Close()
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upB.Close()
+
+	s, app := newTestServer(t)
+	ma := addProviderModel(t, s, upA.URL, "m", func(m *Model) { m.Priority = 20 })
+	addProviderModel(t, s, upB.URL, "m", func(m *Model) { m.Priority = 10 })
+
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "sess-failover"); resp.StatusCode != 200 {
+		t.Fatalf("降级后应 200, got %d %s", resp.StatusCode, body)
+	}
+	s.store.mu.Lock()
+	var sess *LogEntry
+	for _, l := range s.store.Logs {
+		if l.Kind == kindSession {
+			sess = l
+		}
+	}
+	s.store.mu.Unlock()
+	if sess == nil {
+		t.Fatal("应记录会话日志")
+	}
+	if len(sess.Candidates) != 2 {
+		t.Errorf("候选应保留完整顺序: %v", sess.Candidates)
+	}
+	if len(sess.Skipped) != 1 {
+		t.Fatalf("应记录尝试失败的候选: %+v", sess.Skipped)
+	}
+	sk := sess.Skipped[0]
+	if sk.ModelID != ma.ID || !strings.Contains(sk.Reason, "尝试失败") || !strings.Contains(sk.Reason, "HTTP 500") {
+		t.Errorf("失败原因应指向高优先级候选并带上游错误: %+v", sk)
+	}
+	if !strings.Contains(sess.Reason, "1 个候选尝试失败已降级") {
+		t.Errorf("理由应说明降级: %q", sess.Reason)
+	}
+}
+
+// 请求时并行名额已被占满而让位的候选，会话日志要记录让位原因
+// （名额已占时在规则筛选阶段即被剔除并带原因；循环内 TryAcquire 失败是并发
+// 竞态的兜底路径，同样会以「尝试时并行已满」记录，此处覆盖规则路径）
+func TestSessionLogRecordsConcurrencyYield(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	ma := addProviderModel(t, s, up.URL, "m", func(m *Model) { m.Priority = 20; m.MaxConcurrent = 1 })
+	addProviderModel(t, s, up.URL, "m", func(m *Model) { m.Priority = 10 })
+	if !s.store.TryAcquire(ma.ID) { // 预占高优先级候选唯一的并行名额
+		t.Fatal("预占名额失败")
+	}
+	defer s.store.Release(ma.ID)
+
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "sess-yield"); resp.StatusCode != 200 {
+		t.Fatalf("让位后应 200, got %d %s", resp.StatusCode, body)
+	}
+	s.store.mu.Lock()
+	var sess *LogEntry
+	for _, l := range s.store.Logs {
+		if l.Kind == kindSession {
+			sess = l
+		}
+	}
+	s.store.mu.Unlock()
+	if sess == nil {
+		t.Fatal("应记录会话日志")
+	}
+	found := false
+	for _, sk := range sess.Skipped {
+		if sk.ModelID == ma.ID && strings.Contains(sk.Reason, "并行已满") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("应记录并行让位原因: %+v", sess.Skipped)
+	}
+	if !strings.Contains(sess.Reason, "并行已满") {
+		t.Errorf("理由应点出让位原因: %q", sess.Reason)
+	}
+}
+
 // auto 虚拟模型的理由应说明是全局最高优先级
 func TestSessionLogAutoModel(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

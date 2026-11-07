@@ -360,8 +360,12 @@ func TestWBParseResetAt(t *testing.T) {
 	if !wbParseResetAt("没有任何时间信息").IsZero() {
 		t.Fatal("无信息应返回零值")
 	}
-	// 当日 HH:MM：已过时刻视为没有信息，未来时刻返回今天
+	// 当日 HH:MM：已过时刻视为没有信息，未来时刻返回今天。
+	// 临近午夜时 now+70min 会跨天，HH:MM 无法与「今天」区分，跳过该场景避免 flaky
 	future := time.Now().In(wbUTC8).Add(time.Hour + 10*time.Minute)
+	if future.Day() != time.Now().In(wbUTC8).Day() {
+		t.Skip("临近午夜，当日 HH:MM 场景跨天不可测")
+	}
 	t2 := wbParseResetAt("当日 " + future.Format("15:04") + " 恢复")
 	if t2.IsZero() {
 		t.Fatal("当日未来时刻应解析")
