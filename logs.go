@@ -21,9 +21,10 @@ type LogEntry struct {
 	Detail     string    `json:"detail,omitempty"` // 上游错误详情（已截断）
 
 	// 会话建立相关（kind = session）
+	// 只在新会话首次选路、或会话中途重新选模型时记录；同一会话复用绑定不重复记。
 	SessionID  string       `json:"session_id,omitempty"` // 客户端 X-Session-ID 原文
 	Requested  string       `json:"requested,omitempty"`  // 请求体里的 model 字段
-	Bound      bool         `json:"bound,omitempty"`      // true = 复用已有绑定，false = 新建绑定
+	Switched   bool         `json:"switched,omitempty"`   // true = 会话中途换了模型，false = 新会话建立
 	Reason     string       `json:"reason,omitempty"`     // 选择该模型的理由（一句话）
 	Candidates []string     `json:"candidates,omitempty"` // 候选顺序：Provider/模型（优先级）
 	Skipped    []SkipReason `json:"skipped,omitempty"`    // 被剔除的条目及原因

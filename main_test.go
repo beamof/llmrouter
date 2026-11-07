@@ -1365,8 +1365,8 @@ func TestSessionLogNewBinding(t *testing.T) {
 	if sess.Model != "m" || sess.SessionID != "sess-1" || sess.Requested != "m" {
 		t.Errorf("会话日志字段不对: %+v", sess)
 	}
-	if sess.Bound {
-		t.Error("首次建立应为新建绑定（bound=false）")
+	if sess.Switched {
+		t.Error("首次建立不应标记为会话换模型")
 	}
 	if !strings.Contains(sess.Reason, "按优先级") {
 		t.Errorf("理由应说明按优先级选中: %q", sess.Reason)
@@ -1379,8 +1379,8 @@ func TestSessionLogNewBinding(t *testing.T) {
 	}
 }
 
-// 第二次同会话请求应标记为复用绑定
-func TestSessionLogReuseBinding(t *testing.T) {
+// 同一会话的后续请求复用绑定，不应重复记录日志（只记一次）
+func TestSessionLogOnlyOncePerSession(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
 	}))
@@ -1389,8 +1389,11 @@ func TestSessionLogReuseBinding(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", nil)
 
-	for i := 0; i < 2; i++ {
-		postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "X-Session-ID", "sess-2")
+	for i := 0; i < 5; i++ {
+		if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+			"X-Session-ID", "sess-once"); resp.StatusCode != 200 {
+			t.Fatalf("第 %d 次应 200, got %d %s", i+1, resp.StatusCode, body)
+		}
 	}
 	s.store.mu.Lock()
 	var sess []*LogEntry
@@ -1400,14 +1403,74 @@ func TestSessionLogReuseBinding(t *testing.T) {
 		}
 	}
 	s.store.mu.Unlock()
+	if len(sess) != 1 {
+		t.Fatalf("5 次同会话请求只应记 1 条日志, got %d", len(sess))
+	}
+	if sess[0].Switched {
+		t.Error("首条应为新会话（switched=false）")
+	}
+	if !strings.Contains(sess[0].Reason, "新会话") {
+		t.Errorf("理由应为新会话: %q", sess[0].Reason)
+	}
+}
+
+// 会话中途换模型（原绑定不可用）要额外记一条，并标记 switched
+func TestSessionLogRecordsSwitch(t *testing.T) {
+	var upAHealthy atomic.Bool
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !upAHealthy.Load() {
+			w.WriteHeader(500)
+			fmt.Fprint(w, `{"error":{"message":"boom"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upA.Close()
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upB.Close()
+
+	s, app := newTestServer(t)
+	addProviderModel(t, s, upA.URL, "m", func(m *Model) { m.Priority = 20 })
+	addProviderModel(t, s, upB.URL, "m", func(m *Model) { m.Priority = 10 })
+
+	// 第一次：A 正常，会话绑定到 A
+	upAHealthy.Store(true)
+	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "sess-sw"); resp.StatusCode != 200 {
+		t.Fatalf("首次应 200, got %d", resp.StatusCode)
+	}
+
+	// 第二次：A 开始报错，会话应切到 B 并记录切换
+	upAHealthy.Store(false)
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "sess-sw"); resp.StatusCode != 200 {
+		t.Fatalf("切换后应 200, got %d %s", resp.StatusCode, body)
+	}
+
+	s.store.mu.Lock()
+	var sess []*LogEntry
+	for _, l := range s.store.Logs {
+		if l.Kind == kindSession {
+			sess = append(sess, l)
+		}
+	}
+	s.store.mu.Unlock()
 	if len(sess) != 2 {
-		t.Fatalf("应记录 2 条会话日志, got %d", len(sess))
+		t.Fatalf("建立 + 切换应共 2 条, got %d", len(sess))
 	}
-	if sess[0].Bound {
-		t.Error("第一条应为新建绑定")
+	if sess[0].Switched {
+		t.Error("第一条应为新会话")
 	}
-	if !sess[1].Bound || !strings.Contains(sess[1].Reason, "复用") {
-		t.Errorf("第二条应复用绑定: bound=%v reason=%q", sess[1].Bound, sess[1].Reason)
+	if !sess[1].Switched {
+		t.Error("第二条应标记为会话换模型")
+	}
+	if !strings.Contains(sess[1].Reason, "会话内更换模型") {
+		t.Errorf("理由应说明会话内换模型: %q", sess[1].Reason)
+	}
+	if !strings.Contains(sess[1].Message, "会话换模型") {
+		t.Errorf("消息应体现换模型: %q", sess[1].Message)
 	}
 }
 
@@ -1421,7 +1484,8 @@ func TestSessionLogAutoModel(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "real-model", func(m *Model) { m.Priority = 7 })
 
-	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"auto"}`); resp.StatusCode != 200 {
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
+		"X-Session-ID", "sess-auto"); resp.StatusCode != 200 {
 		t.Fatalf("应 200, got %d %s", resp.StatusCode, body)
 	}
 	s.store.mu.Lock()
@@ -1458,7 +1522,8 @@ func TestSessionLogMentionsFullModel(t *testing.T) {
 	addProviderModel(t, s, up.URL, "m", func(m *Model) { m.Priority = 10 })
 	s.store.TryAcquire(full.ID) // 占满高优先级模型
 
-	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "sess-full"); resp.StatusCode != 200 {
 		t.Fatalf("应 200, got %d %s", resp.StatusCode, body)
 	}
 	s.store.mu.Lock()

@@ -896,9 +896,10 @@ function renderLogs() {
     // 会话日志的「详情」由理由/候选/剔除项拼成；其他类型是上游错误原文
     const expandable = isSession ? true : !!l.detail;
     const modelProv = [l.model, l.provider_id ? pname(l.provider_id) : ''].filter(Boolean);
+    // 会话日志只在新会话建立、或会话内换模型时产生
     const bindTag = isSession
-      ? (l.bound ? '<span class="pill ok" style="margin-left:4px">复用绑定</span>'
-                 : '<span class="pill warn" style="margin-left:4px">新建绑定</span>')
+      ? (l.switched ? '<span class="pill warn" style="margin-left:4px">会话换模型</span>'
+                    : '<span class="pill ok" style="margin-left:4px">新会话</span>')
       : '';
     return `<tr>
       <td class="log-time">${t.toLocaleDateString()} <small>${t.toLocaleTimeString()}</small></td>
