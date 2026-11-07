@@ -508,7 +508,7 @@ func TestWBParseInfoBytes(t *testing.T) {
 		c.EnterpriseID != "ent-1" || c.Department != "研发" || c.Domain != "x" {
 		t.Fatalf("字段提取不对: %#v", c)
 	}
-	if !c.ExpiresAt.Equal(time.UnixMilli(1893456000000)) {
+	if c.ExpiresAt == nil || !c.ExpiresAt.Equal(time.UnixMilli(1893456000000)) {
 		t.Fatalf("expiresAt 应按毫秒换算: %v", c.ExpiresAt)
 	}
 	// 扁平形态
@@ -580,7 +580,7 @@ func TestWBChatHeadersAndBody(t *testing.T) {
 	})
 	s, app := newTestServer(t)
 	cred := &WorkBuddyCred{UID: "uid-123456789", AccessToken: "at-1", RefreshToken: "rt-1",
-		ExpiresAt: time.Now().Add(time.Hour)}
+		ExpiresAt: wbTimePtr(time.Now().Add(time.Hour))}
 	addWBProviderModel(t, s, up.URL, "glm-5.0", cred)
 
 	resp, body := postJSON(t, app, "/v1/chat/completions", `{
@@ -801,7 +801,7 @@ func TestWBRefreshOn401(t *testing.T) {
 	s, app := newTestServer(t)
 	p, _ := addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{
 		UID: "u", AccessToken: "at-old", RefreshToken: "rt-old",
-		ExpiresAt: time.Now().Add(time.Hour), // 未临期：懒刷新不触发，只有 401 强制刷新
+		ExpiresAt: wbTimePtr(time.Now().Add(time.Hour)), // 未临期：懒刷新不触发，只有 401 强制刷新
 	})
 	resp, body := postJSON(t, app, "/v1/chat/completions",
 		`{"model":"glm-5.0","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
@@ -819,7 +819,7 @@ func TestWBRefreshOn401(t *testing.T) {
 	if cur.WB.AccessToken != "at-new" || cur.WB.RefreshToken != "rt-new" {
 		t.Fatalf("凭证应回写: %#v", cur.WB)
 	}
-	if time.Until(cur.WB.ExpiresAt) < 55*time.Minute {
+	if cur.WB.ExpiresAt == nil || time.Until(*cur.WB.ExpiresAt) < 55*time.Minute {
 		t.Fatalf("expiresAt 应按 expiresIn 换算: %v", cur.WB.ExpiresAt)
 	}
 }
@@ -968,7 +968,7 @@ func TestWBImportEndpoint(t *testing.T) {
 	}
 	p := s.store.Providers[0]
 	if p.Kind != "workbuddy" || p.BaseURL != "https://www.workbuddy.cn/v2" || p.Name != "我的WB" ||
-		p.WB == nil || p.WB.AccessToken != "at-1" || !p.WB.ExpiresAt.Equal(time.UnixMilli(1893456000000)) {
+		p.WB == nil || p.WB.AccessToken != "at-1" || p.WB.ExpiresAt == nil || !p.WB.ExpiresAt.Equal(time.UnixMilli(1893456000000)) {
 		t.Fatalf("导入的 provider 字段不对: %#v", p)
 	}
 	// 同 uid 重复导入：原地更新，不新建
@@ -1081,7 +1081,7 @@ func TestWBLazyRefreshNearExpiry(t *testing.T) {
 	s, app := newTestServer(t)
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{
 		UID: "u", AccessToken: "at-stale", RefreshToken: "rt",
-		ExpiresAt: time.Now().Add(2 * time.Minute), // 临期窗口（<5min）内
+		ExpiresAt: wbTimePtr(time.Now().Add(2 * time.Minute)), // 临期窗口（<5min）内
 	})
 	resp, body := postJSON(t, app, "/v1/chat/completions",
 		`{"model":"glm-5.0","stream":true,"messages":[{"role":"user","content":"hi"}]}`)

@@ -196,10 +196,10 @@ func wbParseInfoBytes(data []byte, secret string) *wbScanHit {
 		Department:   str("departmentFullName"),
 	}
 	if f, ok := pick("expiresAt").(float64); ok && f > 0 {
-		cred.ExpiresAt = time.UnixMilli(int64(f))
+		cred.ExpiresAt = wbTimePtr(time.UnixMilli(int64(f)))
 	}
 	if f, ok := pick("refreshExpiresAt").(float64); ok && f > 0 {
-		cred.RefreshExpiresAt = time.UnixMilli(int64(f))
+		cred.RefreshExpiresAt = wbTimePtr(time.UnixMilli(int64(f)))
 	}
 	hit.Cred = cred
 	hit.Nickname = nickname

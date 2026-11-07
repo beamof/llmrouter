@@ -84,15 +84,16 @@ Provider「类型」选 **WorkBuddy 国内版 / 国际版** 后，可复用腾�
 - **扫描本机凭证**：自动读取官方客户端的登录态快照（Windows：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info`，macOS/Linux 对应 `CodeBuddyExtension` 数据目录；另兜底扫描 `~/.workbuddy`、`~/.codebuddy` 等 CLI 目录）。客户端 v5.6.2+ 的快照对 token 加密（AES-256-GCM 信封），需在「凭证密钥」栏提供 `atRestSecretKey` 才能解开
 - **粘贴凭证 JSON**：粘贴 `{account:{uid…}, auth:{accessToken…, refreshToken…, expiresAt…}}` 形态的 JSON（可从其他工具导出）
 
-导入后 llmrouter 持有 refreshToken **自动续期**（临期 5 分钟窗口懒刷新 + 401 强制刷新各一次重试，refresh token 一次性轮换、单飞并发保护、JWT 身份核对），与客户端互不影响；同一账号重复导入会原地更新。凭证明文保存在 `data.json`（与 API Key 同级），请妥善保管该文件。
+导入后 llmrouter 持有 refreshToken **自动续期**（临期 5 分钟窗口懒刷新 + 凭证失效时强制续期各一次重试，refresh token 一次性轮换、单飞并发保护、JWT 身份核对），与客户端互不影响；同一账号重复导入会原地更新。凭证明文保存在 `data.json`（与 API Key 同级，文件权限 0600），请妥善保管该文件。复用官方客户端登录态是否被上游服务条款允许，请自行确认。
 
 **行为差异**（与标准 Provider 相比）：
 
-- 请求按上游要求做**出站归一化**：`developer` 角色折成 `system`、`tool_choice` 折成字符串、`image_url` 字符串包对象、`max_completion_tokens` 翻译、注入首条 system、注入前缀缓存键（`prompt_cache_key`）；推理档位（`reasoning_effort`）按模型目录（`GET /v3/config`，自动拉取缓存，失败退回内置清单）解析注入
-- 上游**只支持流式**：非流式客户端的请求由本网关强制流式后聚合成完整 `chat.completion` 返回；流式透传时过滤上游插入的「整片只有换行」的节拍分片
-- 上游 429 限流文案若带恢复时刻（如 `2026-09-11 19:43:46 UTC+8 重置`），自动静音到该时刻（解析不出退 5 小时）；`code 11128` 为内容拦截（疑似敏感词），换下一候选不静音
+- 请求按上游要求做**出站归一化**：`developer` 角色折成 `system`、`tool_choice` 折成字符串、`image_url` 字符串包对象、`max_completion_tokens` 翻译、注入首条 system、注入前缀缓存键（`prompt_cache_key`）、强制 `stream_options.include_usage`（用量统计依赖最终帧）；推理档位（`reasoning_effort`）按模型目录（`GET /v3/config`，自动拉取缓存 6 小时，失败退回内置清单）解析注入
+- 上游**只支持流式**：非流式客户端的请求由本网关强制流式后聚合成完整 `chat.completion` 返回（响应头改回 `application/json`，不透传上游 `Content-Length`）；流式透传时过滤上游插入的「整片只有换行」的节拍分片
+- 上游 429 限流文案若带恢复时刻（如 `2026-09-11 19:43:46 UTC+8 重置`），自动静音到该时刻（解析不出退 5 小时）；`code 11128` 为上游对请求形态/参数的拒绝，换下一候选不静音
 - 上游无 `/responses` 协议：`/v1/responses` 请求会跳过 WorkBuddy 候选
 - 模型「测试」改用 `/v3/config` 目录探测；添加模型时的上游模型下拉来自目录
+- 该类型的基址固定为由地区端点派生的官方地址，不能自定义（避免把凭证发往其他主机）
 
 > WorkBuddy 适配移植自 [Agent2Providers](https://github.com/ProvidersPlugin/Agent2Providers)（AGPL-3.0）；本仓库中该部分为衍生作品，适用 AGPL-3.0。
 

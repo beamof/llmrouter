@@ -26,17 +26,34 @@ type Provider struct {
 
 // WorkBuddyCred WorkBuddy 上游的账号凭证（本机客户端扫描导入或后台粘贴）。
 // accessToken/refreshToken 与 uid 等字段名与官方客户端落盘的会话形状一致。
+// 过期时刻用指针：time.Time 的 omitempty 不生效，零值会被序列化成 0001-01-01。
 type WorkBuddyCred struct {
-	UID              string    `json:"uid,omitempty"`
-	Nickname         string    `json:"nickname,omitempty"`
-	EnterpriseID     string    `json:"enterprise_id,omitempty"`
-	Department       string    `json:"department,omitempty"`
-	Domain           string    `json:"domain,omitempty"`
-	TokenType        string    `json:"token_type,omitempty"`
-	AccessToken      string    `json:"access_token,omitempty"`
-	RefreshToken     string    `json:"refresh_token,omitempty"`
-	ExpiresAt        time.Time `json:"expires_at,omitempty"`         // accessToken 过期时刻，零值 = 未知
-	RefreshExpiresAt time.Time `json:"refresh_expires_at,omitempty"` // refreshToken 过期时刻，零值 = 未知
+	UID              string     `json:"uid,omitempty"`
+	Nickname         string     `json:"nickname,omitempty"`
+	EnterpriseID     string     `json:"enterprise_id,omitempty"`
+	Department       string     `json:"department,omitempty"`
+	Domain           string     `json:"domain,omitempty"`
+	TokenType        string     `json:"token_type,omitempty"`
+	AccessToken      string     `json:"access_token,omitempty"`
+	RefreshToken     string     `json:"refresh_token,omitempty"`
+	ExpiresAt        *time.Time `json:"expires_at,omitempty"`         // accessToken 过期时刻，nil = 未知
+	RefreshExpiresAt *time.Time `json:"refresh_expires_at,omitempty"` // refreshToken 过期时刻，nil = 未知
+}
+
+// expires 取 accessToken 过期时刻（nil 安全）
+func (c *WorkBuddyCred) expires() time.Time {
+	if c == nil || c.ExpiresAt == nil {
+		return time.Time{}
+	}
+	return *c.ExpiresAt
+}
+
+// refreshExpires 取 refreshToken 过期时刻（nil 安全）
+func (c *WorkBuddyCred) refreshExpires() time.Time {
+	if c == nil || c.RefreshExpiresAt == nil {
+		return time.Time{}
+	}
+	return *c.RefreshExpiresAt
 }
 
 // MuteWindow 每天重复的静音时段，支持跨零点（如 22:00~06:00）
@@ -144,7 +161,7 @@ func (s *Store) save() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(s.path+".tmp", b, 0o644); err != nil {
+	if err := os.WriteFile(s.path+".tmp", b, 0o600); err != nil { // 含上游凭证与 API Key，仅属主可读
 		return
 	}
 	os.Rename(s.path+".tmp", s.path)

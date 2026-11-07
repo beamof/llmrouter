@@ -202,7 +202,7 @@ func wbNormalizeOutbound(body map[string]any, uid string) {
 	wbInjectCacheKey(body, uid)
 }
 
-// wbNormalizeRoles 上游不认 developer 角色（返回 400 code 11128），统一折成 system
+// wbNormalizeRoles 上游不认 developer 角色，统一折成 system
 func wbNormalizeRoles(body map[string]any) {
 	for _, m := range wbMessages(body) {
 		msg, ok := m.(map[string]any)
@@ -301,11 +301,16 @@ func wbTranslateMaxTokens(body map[string]any) {
 	body["max_tokens"] = int64(f)
 }
 
-// wbEnsureStreamOptions usage 只随最终 SSE 帧返回，出站必须带 include_usage
+// wbEnsureStreamOptions usage 只随最终 SSE 帧返回，出站必须带 include_usage。
+// 客户端传 include_usage:false 时也强制改回 true：流式请求的用量记账唯一来源
+// 就是最终帧里的 usage，关掉等于放弃统计（其余 stream_options 字段原样保留）。
 func wbEnsureStreamOptions(body map[string]any) {
-	if _, ok := body["stream_options"]; !ok {
-		body["stream_options"] = map[string]any{"include_usage": true}
+	so, _ := body["stream_options"].(map[string]any)
+	if so == nil {
+		so = map[string]any{}
 	}
+	so["include_usage"] = true
+	body["stream_options"] = so
 }
 
 // wbInjectCacheKey 注入前缀缓存键（实测 8k 上下文命中后费用差约 17 倍）。
@@ -512,11 +517,12 @@ func wbReasoningNormalize(body map[string]any, m *wbModelMeta, modelID string) {
 		return
 	}
 	if effort, ok := wbClientEffort(body); ok {
+		resolved := wbResolveEffort(effort, m)
 		switch {
 		case wbIsOff(effort):
 			body["reasoning_effort"] = effort
-		case wbResolveEffort(effort, m) != "":
-			body["reasoning_effort"] = wbResolveEffort(effort, m)
+		case resolved != "":
+			body["reasoning_effort"] = resolved
 		case body["reasoning_effort"] == nil:
 			body["reasoning_effort"] = effort // 目录无档位信息时透传客户端原值
 		}
@@ -753,7 +759,23 @@ func (s *Server) wbInvalidateCatalog(providerID string) {
 	s.wbMu.Unlock()
 }
 
-// wbCatalogFor 取该 provider 的目录缓存；远端目录长期有效，兜底目录 10 分钟后重试拉取
+// wbCatalogTTL 远端目录的缓存时长：上游新增/下线模型后最多这么久生效
+const wbCatalogTTL = 6 * time.Hour
+
+// wbUseCatalog 缓存条目是否可直接复用：远端目录有 TTL，内置兜底目录 10 分钟后重试拉取
+func wbUseCatalog(c *wbCatalog) bool {
+	if c == nil || len(c.IDs) == 0 {
+		return false // 空目录不作为有效目录
+	}
+	if c.Remote {
+		return time.Since(c.At) < wbCatalogTTL
+	}
+	return time.Since(c.At) < 10*time.Minute
+}
+
+// wbCatalogFor 取该 provider 的目录缓存；失效或为空时重新拉取，失败退回内置清单。
+// 拉取失败或返回空目录时缓存内置兜底（Remote=false，10 分钟后重试），
+// 避免把一次失败当成长期有效的远端目录。
 func (s *Server) wbCatalogFor(p Provider) *wbCatalog {
 	e, cred := wbOf(p)
 	if e == nil || cred == nil || cred.AccessToken == "" {
@@ -762,7 +784,7 @@ func (s *Server) wbCatalogFor(p Provider) *wbCatalog {
 	s.wbMu.Lock()
 	c := s.wbCats[p.ID]
 	s.wbMu.Unlock()
-	if c != nil && (c.Remote || time.Since(c.At) < 10*time.Minute) {
+	if wbUseCatalog(c) {
 		return c
 	}
 	nc, err := wbFetchCatalog(wbEndpoint(p), e, cred)
@@ -802,6 +824,14 @@ func (s *Server) wbProviderLock(id string) *sync.Mutex {
 	return l
 }
 
+// wbForgetProvider 丢弃该 provider 的续期锁与目录缓存（删除 Provider 时调用）
+func (s *Server) wbForgetProvider(id string) {
+	s.wbMu.Lock()
+	delete(s.wbLocks, id)
+	delete(s.wbCats, id)
+	s.wbMu.Unlock()
+}
+
 // wbRefreshToken 刷新 WorkBuddy 凭证并回写。force 时无视临期窗口（上游 401 后强制换新）。
 // refresh token 是一次性的，轮换后旧值即失效，因此按 provider 加锁单飞；
 // 等锁的请求拿到锁后先复查凭证（可能已被别人刷新）。
@@ -818,7 +848,7 @@ func (s *Server) wbRefreshToken(p Provider, force bool) (*WorkBuddyCred, error) 
 	if e == nil || cred == nil {
 		return nil, fmt.Errorf("provider 缺少 WorkBuddy 凭证")
 	}
-	if !force && !wbTokenExpiring(cred.ExpiresAt) {
+	if !force && !wbTokenExpiring(cred.expires()) {
 		return cred, nil
 	}
 	if cred.RefreshToken == "" {
@@ -868,8 +898,8 @@ func (s *Server) wbRefreshToken(p Provider, force bool) (*WorkBuddyCred, error) 
 	if rt, _ := v.Data["refreshToken"].(string); rt != "" {
 		nc.RefreshToken = rt
 	}
-	nc.ExpiresAt = wbExpiryOf(v.Data, cred.ExpiresAt, "expiresAt", "expiresIn")
-	nc.RefreshExpiresAt = wbExpiryOf(v.Data, cred.RefreshExpiresAt, "refreshExpiresAt", "refreshExpiresIn")
+	nc.ExpiresAt = wbTimePtr(wbExpiryOf(v.Data, cred.expires(), "expiresAt", "expiresIn"))
+	nc.RefreshExpiresAt = wbTimePtr(wbExpiryOf(v.Data, cred.refreshExpires(), "refreshExpiresAt", "refreshExpiresIn"))
 	// 轻量身份校验：新 accessToken 的 JWT sub 应仍是同一账号（仅解码，不验签）
 	if sub := wbJWTSub(nc.AccessToken); sub != "" && nc.UID != "" && sub != nc.UID {
 		return nil, fmt.Errorf("续期后账号身份变化（sub=%s ≠ uid=%s），已放弃回写", sub, nc.UID)
@@ -889,6 +919,14 @@ func wbExpiryOf(data map[string]any, old time.Time, atKey, inKey string) time.Ti
 		return time.Now().Add(time.Duration(f) * time.Second)
 	}
 	return old
+}
+
+// wbTimePtr 零值时刻返回 nil（序列化时省略，前端不显示 0001-01-01）
+func wbTimePtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // wbJWTSub 解码 JWT payload 的 sub（仅用于身份核对，不验签）
@@ -917,7 +955,7 @@ type wbErrClass int
 const (
 	wbErrTokenExpired   wbErrClass = iota // 401 / 12153：续期后重试
 	wbErrQuota                            // 限流/额度：静音该模型条目
-	wbErrContentBlocked                   // 敏感词拦截：换候选，不静音
+	wbErrContentBlocked                   // 请求被上游拒绝（参数/内容）：换候选，不静音
 	wbErrFatal                            // 其余：换候选
 )
 
@@ -940,6 +978,8 @@ func wbClassify(status int, body []byte) (wbErrClass, int64, string, time.Time) 
 		code == 11101 || code == 11133 || code == 11158:
 		return wbErrFatal, code, msg, time.Time{}
 	case code == 11128:
+		// 上游把请求形态/参数拒绝也归到这个码（与 developer 角色折 system 同一来源），
+		// 语义不是「内容拦截」：只换候选、不静音
 		return wbErrContentBlocked, code, msg, time.Time{}
 	case status == 402 || status == 429 ||
 		code == 14001 || code == 14012 || code == 14013 || code == 14014 ||
@@ -1156,7 +1196,11 @@ type wbSSEFilter struct {
 	buf []byte // 已读入、待切帧
 	out []byte // 已放行、待交付
 	eof bool
+	err error // 底层读错误：残余帧交付完后返回，避免中途断流被当成正常结束
 }
+
+// wbMaxPending 单个未完成帧的最大缓冲：异常上游一直不发空行时防止内存无界增长
+const wbMaxPending = 4 << 20
 
 func (f *wbSSEFilter) Read(p []byte) (int, error) {
 	for len(f.out) == 0 {
@@ -1165,11 +1209,17 @@ func (f *wbSSEFilter) Read(p []byte) (int, error) {
 				f.out, f.buf = f.buf, nil
 				break
 			}
+			if f.err != nil {
+				return 0, f.err
+			}
 			return 0, io.EOF
 		}
 		if err := f.pump(); err != nil {
 			f.eof = true
-			if len(f.buf) > 0 { // 先把残余帧按规则放行，再在下一轮返回 EOF
+			if err != io.EOF {
+				f.err = err
+			}
+			if len(f.buf) > 0 { // 先把残余帧按规则放行，再在下一轮返回错误
 				if !wbNewlineBeat(f.buf) {
 					f.out = append(f.out, f.buf...)
 				}
@@ -1197,6 +1247,9 @@ func (f *wbSSEFilter) pump() error {
 		if !wbNewlineBeat(frame) {
 			f.out = append(f.out, frame...)
 		}
+	}
+	if len(f.buf) > wbMaxPending {
+		return fmt.Errorf("单帧超过 %d 字节仍未结束，放弃该响应", wbMaxPending)
 	}
 	return err
 }
@@ -1349,8 +1402,14 @@ func (a *wbAgg) feed(d []byte) {
 // result 生成 chat.completion 响应与记账用量
 func (a *wbAgg) result(model string) ([]byte, Usage) {
 	msg := map[string]any{"role": "assistant"}
+	// content 为 null 而非缺失：仅在纯 tool_calls 分支省略时，部分严格 SDK 会取
+	// message.content 拿到 undefined 后报错（OpenAI 规范此处是 null）
 	if a.content.Len() > 0 {
 		msg["content"] = a.content.String()
+	} else if len(a.tools) == 0 {
+		msg["content"] = ""
+	} else {
+		msg["content"] = nil
 	}
 	if a.reasoning.Len() > 0 {
 		msg["reasoning_content"] = a.reasoning.String()
@@ -1451,7 +1510,7 @@ func (s *Server) wbPrepareBody(e *wbEdition, c Candidate, sendBody []byte) ([]by
 }
 
 // wbAttempt 处理一个 WorkBuddy 候选的完整生命周期：懒续期 → 出站准备 → 专用请求头
-// → 发送（401 强制续期后原候选重试一次）→ 错误分类（限流按上游恢复时刻静音）
+// → 发送（凭证失效时强制续期后原候选重试一次）→ 错误分类（限流按上游恢复时刻静音）
 // → 流式节拍过滤透传 / 非流式聚合。成功时已向客户端写出响应并返回 nil；
 // 失败时返回错误描述（并行名额已释放、失败日志已记，调用方换下一个候选）。
 func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, sendBody []byte, keyID string) error {
@@ -1479,8 +1538,8 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 		req.Header = wbChatHeader(e, cred)
 		return s.client.Do(req)
 	}
-	// 懒续期：临期自动刷新，失败不阻断（沿用现有 token，上游 401 时再强制刷新）
-	if cred.RefreshToken != "" && wbTokenExpiring(cred.ExpiresAt) {
+	// 懒续期：临期自动刷新，失败不阻断（沿用现有 token，上游报失效时再强制刷新）
+	if cred.RefreshToken != "" && wbTokenExpiring(cred.expires()) {
 		if nc, err := s.wbRefreshToken(c.Provider, false); err == nil {
 			cred = nc
 		} else {
@@ -1489,67 +1548,109 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 				Message: "WorkBuddy token 临期续期失败（沿用现有 token）", Detail: err.Error()})
 		}
 	}
-	resp, err := do()
-	if err != nil {
-		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
-			ProviderID: c.Provider.ID, Model: c.Model.Name,
-			Message: "连接上游失败（网络错误或超时）", Detail: err.Error()})
-		return err
-	}
-	// 上游 401：强制续期一次并原候选重试（业务码 12153 的凭证失效走分类路径）
-	if resp.StatusCode == http.StatusUnauthorized {
-		resp.Body.Close()
-		nc, rerr := s.wbRefreshToken(c.Provider, true)
-		if rerr != nil {
-			err := fmt.Errorf("凭证已失效，续期失败: %v", rerr)
-			s.logFail(LogEntry{Level: "error", Kind: kindUpstream, Status: http.StatusUnauthorized, KeyID: keyID,
-				ProviderID: c.Provider.ID, Model: c.Model.Name,
-				Message: "WorkBuddy 凭证失效且续期失败，请重新导入", Detail: rerr.Error()})
-			return err
-		}
-		cred = nc
-		if resp, err = do(); err != nil {
+	// 发请求并分类。凭证失效（HTTP 401 或上游把 12153 包在 200/400 里）时强制续期
+	// 一次并原候选重试；refreshed 保证不会反复续期。
+	var resp *http.Response
+	refreshed := false
+	for {
+		resp, err = do()
+		if err != nil {
 			s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
 				ProviderID: c.Provider.ID, Model: c.Model.Name,
 				Message: "连接上游失败（网络错误或超时）", Detail: err.Error()})
 			return err
 		}
-	}
-	// SSE 端点上收到 JSON 响应即错误信封（含 200 的情况）
-	if resp.StatusCode >= 400 || strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		// SSE 端点上收到 JSON 响应即错误信封（含 200 的情况）
+		if resp.StatusCode < 400 && !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+			break // 正常响应
+		}
 		eb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return s.wbFailResponse(c, keyID, resp.StatusCode, eb)
+		class, ferr := s.wbFailResponse(c, keyID, resp.StatusCode, eb)
+		if class != wbErrTokenExpired {
+			return ferr
+		}
+		// 凭证失效：续期后重试一次。没有 refresh token 或已重试过，记 error 并换候选
+		if refreshed || cred.RefreshToken == "" {
+			s.logFail(LogEntry{Level: "error", Kind: kindUpstream, Status: resp.StatusCode, KeyID: keyID,
+				ProviderID: c.Provider.ID, Model: c.Model.Name,
+				Message: "WorkBuddy 凭证失效且无法自动续期，请重新导入凭证", Detail: errSnippet(eb)})
+			return ferr
+		}
+		nc, rerr := s.wbRefreshToken(c.Provider, true)
+		if rerr != nil {
+			err := fmt.Errorf("凭证失效，续期失败: %v", rerr)
+			s.logFail(LogEntry{Level: "error", Kind: kindUpstream, Status: resp.StatusCode, KeyID: keyID,
+				ProviderID: c.Provider.ID, Model: c.Model.Name,
+				Message: "WorkBuddy 凭证失效且续期失败，请重新导入", Detail: rerr.Error()})
+			return err
+		}
+		s.logFail(LogEntry{Level: "warn", Kind: kindUpstream, Status: resp.StatusCode, KeyID: keyID,
+			ProviderID: c.Provider.ID, Model: c.Model.Name,
+			Message: "WorkBuddy 凭证已失效，已自动续期并重试该候选"})
+		cred = nc
+		refreshed = true
 	}
-	// 成功：写头并按客户端期望分派
-	for k, vv := range resp.Header {
-		if skipRespHeader(k) {
+
+	filter := &wbSSEFilter{r: resp.Body}
+	defer resp.Body.Close()
+
+	if wantStream {
+		wbCopyRespHeaders(w, resp.Header, true)
+		w.WriteHeader(resp.StatusCode)
+		sn := &sseSniffer{w: flushWriter{w}}
+		_, cerr := io.Copy(sn, filter)
+		s.store.AddUsage(&c.Model, keyID, extractStreamUsage(sn.tail))
+		if cerr != nil {
+			// 响应头已发出，无法换候选；记一条日志便于排查截断
+			s.logFail(LogEntry{Level: "warn", Kind: kindUpstream, KeyID: keyID,
+				ProviderID: c.Provider.ID, Model: c.Model.Name,
+				Message: "WorkBuddy 流式响应中断（已透传部分内容）", Detail: cerr.Error()})
+		}
+		return nil
+	}
+
+	// 非流式：先聚合再写响应。中途断流时不提交 200，交给调用方换下一个候选。
+	var agg wbAgg
+	_, cerr := io.Copy(&agg, filter)
+	if cerr != nil {
+		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
+			ProviderID: c.Provider.ID, Model: c.Model.Name,
+			Message: "WorkBuddy 响应中断，聚合失败", Detail: cerr.Error()})
+		return fmt.Errorf("上游流式响应中断: %v", cerr)
+	}
+	out, usage := agg.result(c.Model.Name)
+	wbCopyRespHeaders(w, resp.Header, false)
+	w.WriteHeader(resp.StatusCode)
+	w.Write(out)
+	s.store.AddUsage(&c.Model, keyID, usage)
+	return nil
+}
+
+// wbCopyRespHeaders 复制上游响应头。Content-Length 一律丢弃：流式会被节拍过滤改变
+// 字节数，非流式要换成聚合后的 JSON 长度。非流式还要把 Content-Type 改正为 JSON
+// （上游固定回 text/event-stream，照抄会让客户端按 SSE 解析），并去掉 SSE 的缓存头。
+func wbCopyRespHeaders(w http.ResponseWriter, h http.Header, stream bool) {
+	for k, vv := range h {
+		if skipRespHeader(k) || http.CanonicalHeaderKey(k) == "Content-Length" ||
+			http.CanonicalHeaderKey(k) == "Content-Type" {
 			continue
 		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	filter := &wbSSEFilter{r: resp.Body}
-	if wantStream {
-		sn := &sseSniffer{w: flushWriter{w}}
-		io.Copy(sn, filter)
-		resp.Body.Close()
-		s.store.AddUsage(&c.Model, keyID, extractStreamUsage(sn.tail))
-		return nil
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		return
 	}
-	agg := &wbAgg{}
-	io.Copy(agg, filter)
-	resp.Body.Close()
-	out, usage := agg.result(c.Model.Name)
-	w.Write(out)
-	s.store.AddUsage(&c.Model, keyID, usage)
-	return nil
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Del("Cache-Control")
 }
 
-// wbFailResponse 分类上游错误并做相应处置（限流静音/日志），返回给候选循环的错误
-func (s *Server) wbFailResponse(c Candidate, keyID string, status int, body []byte) error {
+// wbFailResponse 分类上游错误并做相应处置（限流静音/日志），返回分类与给候选循环的错误。
+// 调用方据分类决定是否续期重试（wbErrTokenExpired）。
+func (s *Server) wbFailResponse(c Candidate, keyID string, status int, body []byte) (wbErrClass, error) {
 	class, code, msg, resetAt := wbClassify(status, body)
 	switch class {
 	case wbErrQuota:
@@ -1567,15 +1668,13 @@ func (s *Server) wbFailResponse(c Candidate, keyID string, status int, body []by
 	case wbErrContentBlocked:
 		s.logFail(LogEntry{Level: "warn", Kind: kindUpstream, Status: status, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
-			Message: "WorkBuddy 内容拦截（疑似提示词命中敏感词，code 11128）", Detail: errSnippet(body)})
+			Message: fmt.Sprintf("WorkBuddy 拒绝请求（code %d），已换下一候选", code), Detail: errSnippet(body)})
 	case wbErrTokenExpired:
-		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, Status: status, KeyID: keyID,
-			ProviderID: c.Provider.ID, Model: c.Model.Name,
-			Message: "WorkBuddy 凭证失效（code 12153），请重新导入凭证", Detail: errSnippet(body)})
+		// 日志由调用方按「续期重试是否成功」决定级别，这里不记
 	default:
 		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, Status: status, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
 			Message: fmt.Sprintf("WorkBuddy 上游返回 HTTP %d", status), Detail: errSnippet(body)})
 	}
-	return fmt.Errorf("上游返回 %d: %s", status, msg)
+	return class, fmt.Errorf("上游返回 %d: %s", status, msg)
 }

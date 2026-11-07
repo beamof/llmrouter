@@ -102,15 +102,14 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 	switch p.Kind {
 	case "":
 	case "workbuddy", "workbuddy-intl":
-		// WorkBuddy 类型：基址由地区端点派生（{endpoint}/v2），凭证必须携带
+		// WorkBuddy 类型：基址固定由地区端点派生，不接受自定义——凭证随请求发出，
+		// 允许改写基址等于允许把 accessToken 发往任意主机
 		e, _ := wbOf(p)
 		if e == nil {
 			writeErr(w, http.StatusBadRequest, "kind 非法")
 			return
 		}
-		if p.BaseURL == "" {
-			p.BaseURL = e.endpoint + "/v2"
-		}
+		p.BaseURL = e.endpoint + "/v2"
 		if p.WB == nil || strings.TrimSpace(p.WB.AccessToken) == "" {
 			writeErr(w, http.StatusBadRequest, "WorkBuddy 类型的 provider 必须携带凭证（wb.access_token），编辑时请勿丢弃 wb 字段")
 			return
@@ -128,10 +127,12 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProviderDelete(w http.ResponseWriter, r *http.Request) {
-	if !s.store.DeleteProvider(r.PathValue("id")) {
+	id := r.PathValue("id")
+	if !s.store.DeleteProvider(id) {
 		writeErr(w, http.StatusNotFound, "provider 不存在")
 		return
 	}
+	s.wbForgetProvider(id)
 	s.replyState(w, r)
 }
 
@@ -642,7 +643,7 @@ func (s *Server) handleWBImport(w http.ResponseWriter, r *http.Request) {
 	}
 	p := &Provider{Kind: req.Kind, BaseURL: e.endpoint + "/v2", WB: cred}
 	if old, ok := s.store.ProviderByWBUID(req.Kind, cred.UID); ok {
-		p.ID, p.Name = old.ID, old.Name // 原地更新
+		p.ID, p.Name = old.ID, old.Name // 原地更新（基址始终由地区端点派生）
 	} else {
 		p.Name = strings.TrimSpace(req.Name)
 		if p.Name == "" {
@@ -674,10 +675,11 @@ func (s *Server) handleWBRefresh(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "续期失败: "+err.Error())
 		return
 	}
+	p.WB = cred // 续期后的凭证在 store 里已换新，这里同步快照，否则拉目录仍用旧 token
 	s.wbInvalidateCatalog(p.ID)
 	cat := s.wbCatalogFor(p)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"expires_at": cred.ExpiresAt,
+		"expires_at": cred.expires(),
 		"models":     len(cat.IDs),
 		"remote":     cat.Remote,
 	})
@@ -695,14 +697,22 @@ func (s *Server) wbModelTest(w http.ResponseWriter, m Model, p Provider, e *wbEd
 		writeJSON(w, http.StatusOK, res)
 		return
 	}
-	s.wbMu.Lock()
-	if s.wbCats == nil {
-		s.wbCats = map[string]*wbCatalog{}
+	if len(cat.IDs) > 0 { // 空目录不入缓存，否则会盖掉可用的兜底清单
+		s.wbMu.Lock()
+		if s.wbCats == nil {
+			s.wbCats = map[string]*wbCatalog{}
+		}
+		s.wbCats[p.ID] = cat
+		s.wbMu.Unlock()
 	}
-	s.wbCats[p.ID] = cat
-	s.wbMu.Unlock()
+	if len(cat.IDs) == 0 {
+		res["level"] = "warn"
+		res["message"] = "端口通，但目录为空（可能无权访问模型清单）"
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
 	res["level"] = "ok"
-	res["message"] = fmt.Sprintf("端口通，目录共 %d 个模型%s", len(cat.IDs), map[bool]string{true: "（远端）", false: "（内置兜底）"}[cat.Remote])
+	res["message"] = fmt.Sprintf("端口通，目录共 %d 个模型", len(cat.IDs))
 	for _, id := range cat.IDs {
 		if strings.EqualFold(id, m.Name) {
 			writeJSON(w, http.StatusOK, res)
