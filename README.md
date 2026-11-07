@@ -1,12 +1,13 @@
 # 🚦 llmrouter
 
-一个用 Go 写的大模型代理路由：统一入口 + 网页后台管理。请求体与响应一律透传，不改动任何内容。
+一个用 Go 写的大模型代理路由：统一入口 + 网页后台管理。标准上游请求体与响应一律透传，不改动任何内容；WorkBuddy 类型上游由内置适配器按其私有协议转发。
 
 ## 特性
 
 - **统一入口**：`/v1/chat/completions`、`/v1/responses`、`/v1/models`
 - **多 Provider 管理**：同一模型名可挂多个 Provider，按优先级自动故障转移（网络错误 / 401 / 403 / 408 / 429 / 5xx 时切换下一个）
 - **字节级透传**：请求体只读取 `model` 字段用于路由，其余不解析、不改写、不注入；流式（SSE）响应边收边发，非流式响应原样回传
+- **WorkBuddy 适配**：国内版（workbuddy.cn）/ 国际版（workbuddy.ai）两种内置 Provider 类型，复用官方客户端登录态调用其模型额度（详见下文）
 - **网页后台**（中文，单文件，无前端依赖）：Provider / 模型增删改、优先级排序、用量统计（按 token 计）、每日 token 上限、并行上限、按时段静音（mute）、上游余额查询、会话与异常日志
 - 状态落盘为单个 JSON 文件（默认 `data.json`），零外部依赖，单二进制
 
@@ -73,6 +74,27 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - 非流式响应会顺带读取 `usage` 字段记账 token（兼容 `prompt_tokens/completion_tokens` 与 `input_tokens/output_tokens`）；流式响应透传时保留 8KB 滚动尾部副本（不改任何字节），从末尾 `usage` 事件提取 token，同样计入统计与每日上限
 - 缓存命中单独统计：读取 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`（含在输入 token 内），用量页展示缓存量与命中率
 - Provider 的 API Key 为空时，客户端的 Authorization 头会原样转发（自带 Key 模式）
+
+## WorkBuddy 上游
+
+Provider「类型」选 **WorkBuddy 国内版 / 国际版** 后，可复用腾讯 WorkBuddy / CodeBuddy 客户端的登录态调用其模型额度（glm、deepseek、minimax、kimi、hunyuan 等），与标准 Provider 混挂、共用全部路由规则（优先级 / 故障转移 / 会话粘性 / 每日上限 / 并行上限 / 用量记账）。
+
+**凭证导入**（后台 Provider 弹窗，二选一）：
+
+- **扫描本机凭证**：自动读取官方客户端的登录态快照（Windows：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info`，macOS/Linux 对应 `CodeBuddyExtension` 数据目录；另兜底扫描 `~/.workbuddy`、`~/.codebuddy` 等 CLI 目录）。客户端 v5.6.2+ 的快照对 token 加密（AES-256-GCM 信封），需在「凭证密钥」栏提供 `atRestSecretKey` 才能解开
+- **粘贴凭证 JSON**：粘贴 `{account:{uid…}, auth:{accessToken…, refreshToken…, expiresAt…}}` 形态的 JSON（可从其他工具导出）
+
+导入后 llmrouter 持有 refreshToken **自动续期**（临期 5 分钟窗口懒刷新 + 401 强制刷新各一次重试，refresh token 一次性轮换、单飞并发保护、JWT 身份核对），与客户端互不影响；同一账号重复导入会原地更新。凭证明文保存在 `data.json`（与 API Key 同级），请妥善保管该文件。
+
+**行为差异**（与标准 Provider 相比）：
+
+- 请求按上游要求做**出站归一化**：`developer` 角色折成 `system`、`tool_choice` 折成字符串、`image_url` 字符串包对象、`max_completion_tokens` 翻译、注入首条 system、注入前缀缓存键（`prompt_cache_key`）；推理档位（`reasoning_effort`）按模型目录（`GET /v3/config`，自动拉取缓存，失败退回内置清单）解析注入
+- 上游**只支持流式**：非流式客户端的请求由本网关强制流式后聚合成完整 `chat.completion` 返回；流式透传时过滤上游插入的「整片只有换行」的节拍分片
+- 上游 429 限流文案若带恢复时刻（如 `2026-09-11 19:43:46 UTC+8 重置`），自动静音到该时刻（解析不出退 5 小时）；`code 11128` 为内容拦截（疑似敏感词），换下一候选不静音
+- 上游无 `/responses` 协议：`/v1/responses` 请求会跳过 WorkBuddy 候选
+- 模型「测试」改用 `/v3/config` 目录探测；添加模型时的上游模型下拉来自目录
+
+> WorkBuddy 适配移植自 [Agent2Providers](https://github.com/ProvidersPlugin/Agent2Providers)（AGPL-3.0）；本仓库中该部分为衍生作品，适用 AGPL-3.0。
 
 ## 模型测试按钮
 

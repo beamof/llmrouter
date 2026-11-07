@@ -14,12 +14,29 @@ import (
 
 // Provider 一个上游服务商
 type Provider struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	BaseURL      string `json:"base_url"`                // chat completions 基址，填到 /v1，如 https://api.openai.com/v1
-	ResponsesURL string `json:"responses_url,omitempty"` // responses 协议基址，空 = 同 BaseURL（如智谱两协议不同基址时分别填写）
-	APIKey       string `json:"api_key,omitempty"`       // 上游密钥
-	BalanceURL   string `json:"balance_url,omitempty"`   // 可选的余额查询地址（GET + 本密钥）
+	ID           string         `json:"id"`
+	Name         string         `json:"name"`
+	BaseURL      string         `json:"base_url"`                // chat completions 基址，填到 /v1，如 https://api.openai.com/v1
+	ResponsesURL string         `json:"responses_url,omitempty"` // responses 协议基址，空 = 同 BaseURL（如智谱两协议不同基址时分别填写）
+	APIKey       string         `json:"api_key,omitempty"`       // 上游密钥
+	BalanceURL   string         `json:"balance_url,omitempty"`   // 可选的余额查询地址（GET + 本密钥）
+	Kind         string         `json:"kind,omitempty"`          // 上游类型：空 = 标准 OpenAI 兼容；"workbuddy" / "workbuddy-intl" = 复用 WorkBuddy 客户端登录态
+	WB           *WorkBuddyCred `json:"wb,omitempty"`            // WorkBuddy 凭证（Kind 为 workbuddy 系时使用，凭证明文存于状态文件）
+}
+
+// WorkBuddyCred WorkBuddy 上游的账号凭证（本机客户端扫描导入或后台粘贴）。
+// accessToken/refreshToken 与 uid 等字段名与官方客户端落盘的会话形状一致。
+type WorkBuddyCred struct {
+	UID              string    `json:"uid,omitempty"`
+	Nickname         string    `json:"nickname,omitempty"`
+	EnterpriseID     string    `json:"enterprise_id,omitempty"`
+	Department       string    `json:"department,omitempty"`
+	Domain           string    `json:"domain,omitempty"`
+	TokenType        string    `json:"token_type,omitempty"`
+	AccessToken      string    `json:"access_token,omitempty"`
+	RefreshToken     string    `json:"refresh_token,omitempty"`
+	ExpiresAt        time.Time `json:"expires_at,omitempty"`         // accessToken 过期时刻，零值 = 未知
+	RefreshExpiresAt time.Time `json:"refresh_expires_at,omitempty"` // refreshToken 过期时刻，零值 = 未知
 }
 
 // MuteWindow 每天重复的静音时段，支持跨零点（如 22:00~06:00）
@@ -166,6 +183,34 @@ func (s *Store) UpsertProvider(p *Provider) {
 	}
 	s.Providers = append(s.Providers, p)
 	s.save()
+}
+
+// UpdateWBAuth 回写 WorkBuddy 续期后的凭证（refresh token 一次性，轮换后旧值即失效，必须落盘）。
+// 整体替换 WB 指针而非原地改字段：Candidate 里的 Provider 是浅拷贝，共享同一 WB 指针，
+// 换指针可让并发请求各自持有不可变的旧快照，不产生数据竞争。
+func (s *Store) UpdateWBAuth(providerID string, c *WorkBuddyCred) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.WB == nil {
+		return false
+	}
+	cp := *c
+	p.WB = &cp
+	s.save()
+	return true
+}
+
+// ProviderByWBUID 按 Kind + WorkBuddy 账号 uid 找 provider（凭证重复导入时原地更新）
+func (s *Store) ProviderByWBUID(kind, uid string) (Provider, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.Providers {
+		if p.Kind == kind && p.WB != nil && p.WB.UID == uid {
+			return *p, true
+		}
+	}
+	return Provider{}, false
 }
 
 // DeleteProvider 连同其模型、用量、余额记录一起删

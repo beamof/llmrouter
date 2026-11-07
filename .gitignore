@@ -2,3 +2,4 @@ data.json
 data.json.tmp
 *.exe
 *.exe~
+.zcode/

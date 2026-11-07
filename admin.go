@@ -99,6 +99,26 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 	if id := r.PathValue("id"); id != "" {
 		p.ID = id
 	}
+	switch p.Kind {
+	case "":
+	case "workbuddy", "workbuddy-intl":
+		// WorkBuddy 类型：基址由地区端点派生（{endpoint}/v2），凭证必须携带
+		e, _ := wbOf(p)
+		if e == nil {
+			writeErr(w, http.StatusBadRequest, "kind 非法")
+			return
+		}
+		if p.BaseURL == "" {
+			p.BaseURL = e.endpoint + "/v2"
+		}
+		if p.WB == nil || strings.TrimSpace(p.WB.AccessToken) == "" {
+			writeErr(w, http.StatusBadRequest, "WorkBuddy 类型的 provider 必须携带凭证（wb.access_token），编辑时请勿丢弃 wb 字段")
+			return
+		}
+	default:
+		writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy 或 workbuddy-intl")
+		return
+	}
 	if p.BaseURL == "" {
 		writeErr(w, http.StatusBadRequest, "base_url 不能为空")
 		return
@@ -219,6 +239,17 @@ func (s *Server) handleUpstreamModels(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "provider 不存在")
 		return
 	}
+	// WorkBuddy：模型清单来自 /v3/config 目录（含缓存与内置兜底）
+	if e, cred := wbOf(p); e != nil {
+		if cred == nil || cred.AccessToken == "" {
+			writeErr(w, http.StatusBadRequest, "该 provider 未导入 WorkBuddy 凭证")
+			return
+		}
+		ids := append([]string(nil), s.wbCatalogFor(p).IDs...)
+		sort.Strings(ids)
+		writeJSON(w, http.StatusOK, map[string]any{"models": ids})
+		return
+	}
 	req, _ := http.NewRequest(http.MethodGet, strings.TrimRight(p.BaseURL, "/")+"/models", nil)
 	if p.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
@@ -304,6 +335,15 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.store.Provider(m.ProviderID)
 	if !ok {
 		writeErr(w, http.StatusBadRequest, "provider 不存在")
+		return
+	}
+	// WorkBuddy：用 /v3/config 目录做连通性探测，并核对模型名
+	if e, cred := wbOf(p); e != nil {
+		if cred == nil || cred.AccessToken == "" {
+			writeJSON(w, http.StatusOK, map[string]any{"level": "warn", "message": "未导入 WorkBuddy 凭证，请先在 Provider 弹窗导入"})
+			return
+		}
+		s.wbModelTest(w, m, p, e, cred)
 		return
 	}
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(p.BaseURL, "/")+"/models", nil)
@@ -541,4 +581,135 @@ func isLeaf(v any) bool {
 		return false
 	}
 	return true
+}
+
+// ─────────────────── WorkBuddy 凭证扫描 / 导入 / 续期 ───────────────────
+
+// handleWBScan 扫描本机 WorkBuddy/CodeBuddy 客户端的登录态快照。
+// 客户端 v5.6.2+ 的快照是加密信封，需在请求体里带 atRestSecretKey 才能解开。
+func (s *Server) handleWBScan(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Key string `json:"key"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hits": wbScan(strings.TrimSpace(req.Key))})
+}
+
+// handleWBImport 导入 WorkBuddy 凭证（扫描结果回传 cred，或粘贴 raw JSON）。
+// 同一账号（Kind + uid）重复导入时原地更新，不会产生重复 Provider。
+func (s *Server) handleWBImport(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Kind string         `json:"kind"` // workbuddy | workbuddy-intl
+		Name string         `json:"name"`
+		Cred *WorkBuddyCred `json:"cred"` // 扫描结果里的凭证对象
+		Raw  string         `json:"raw"`  // 或粘贴的 .info 形态 JSON
+		Key  string         `json:"key"`  // raw 含加密信封时的 atRestSecretKey
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	e := &wbCN
+	switch req.Kind {
+	case "workbuddy":
+	case "workbuddy-intl":
+		e = &wbIntl
+	default:
+		writeErr(w, http.StatusBadRequest, "kind 必须是 workbuddy 或 workbuddy-intl")
+		return
+	}
+	cred := req.Cred
+	if cred == nil && strings.TrimSpace(req.Raw) != "" {
+		hit := wbParseInfoBytes([]byte(req.Raw), strings.TrimSpace(req.Key))
+		if hit == nil {
+			writeErr(w, http.StatusBadRequest, "无法从粘贴的 JSON 解析出凭证（需要 uid 与 accessToken 字段）")
+			return
+		}
+		if hit.Encrypted || hit.Cred == nil {
+			writeErr(w, http.StatusBadRequest, "粘贴的凭证是加密信封，请提供正确的 atRestSecretKey")
+			return
+		}
+		cred = hit.Cred
+	}
+	if cred == nil || strings.TrimSpace(cred.AccessToken) == "" {
+		writeErr(w, http.StatusBadRequest, "缺少凭证（cred 或 raw 二选一）")
+		return
+	}
+	if strings.TrimSpace(cred.UID) == "" {
+		writeErr(w, http.StatusBadRequest, "凭证缺少 uid 字段")
+		return
+	}
+	p := &Provider{Kind: req.Kind, BaseURL: e.endpoint + "/v2", WB: cred}
+	if old, ok := s.store.ProviderByWBUID(req.Kind, cred.UID); ok {
+		p.ID, p.Name = old.ID, old.Name // 原地更新
+	} else {
+		p.Name = strings.TrimSpace(req.Name)
+		if p.Name == "" {
+			uid := cred.UID
+			if len(uid) > 8 {
+				uid = uid[:8]
+			}
+			p.Name = "WorkBuddy " + e.label + " · " + uid
+		}
+	}
+	s.store.UpsertProvider(p)
+	s.wbInvalidateCatalog(p.ID)
+	s.replyState(w, r)
+}
+
+// handleWBRefresh 手动触发续期并拉取远端模型目录
+func (s *Server) handleWBRefresh(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.store.Provider(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "provider 不存在")
+		return
+	}
+	if e, _ := wbOf(p); e == nil {
+		writeErr(w, http.StatusBadRequest, "该 provider 不是 WorkBuddy 类型")
+		return
+	}
+	cred, err := s.wbRefreshToken(p, true)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "续期失败: "+err.Error())
+		return
+	}
+	s.wbInvalidateCatalog(p.ID)
+	cat := s.wbCatalogFor(p)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"expires_at": cred.ExpiresAt,
+		"models":     len(cat.IDs),
+		"remote":     cat.Remote,
+	})
+}
+
+// wbModelTest WorkBuddy 模型探测：GET /v3/config（daemon UA + 凭证），
+// 核对模型名是否在目录中，顺带把目录写进缓存
+func (s *Server) wbModelTest(w http.ResponseWriter, m Model, p Provider, e *wbEdition, cred *WorkBuddyCred) {
+	start := time.Now()
+	cat, err := wbFetchCatalog(wbEndpoint(p), e, cred)
+	res := map[string]any{"latency_ms": time.Since(start).Milliseconds()}
+	if err != nil {
+		res["level"] = "warn"
+		res["message"] = "目录接口异常（不影响对话接口）: " + err.Error()
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
+	s.wbMu.Lock()
+	if s.wbCats == nil {
+		s.wbCats = map[string]*wbCatalog{}
+	}
+	s.wbCats[p.ID] = cat
+	s.wbMu.Unlock()
+	res["level"] = "ok"
+	res["message"] = fmt.Sprintf("端口通，目录共 %d 个模型%s", len(cat.IDs), map[bool]string{true: "（远端）", false: "（内置兜底）"}[cat.Remote])
+	for _, id := range cat.IDs {
+		if strings.EqualFold(id, m.Name) {
+			writeJSON(w, http.StatusOK, res)
+			return
+		}
+	}
+	res["level"] = "warn"
+	res["message"] = fmt.Sprintf("端口通，但目录（%d 个）中没有 %q，请核对模型名", len(cat.IDs), m.Name)
+	writeJSON(w, http.StatusOK, res)
 }

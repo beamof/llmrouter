@@ -42,6 +42,10 @@ type Server struct {
 	sessMu   sync.Mutex
 	sessions map[string]session // 会话粘性绑定，仅内存，重启即清
 
+	wbMu    sync.Mutex
+	wbLocks map[string]*sync.Mutex // WorkBuddy 续期单飞锁（键 = provider ID），仅内存
+	wbCats  map[string]*wbCatalog  // WorkBuddy 模型目录缓存（键 = provider ID），仅内存
+
 	failMu sync.Mutex
 	fails  map[string]*adminFail // 管理令牌失败计数，按来源 IP，仅内存
 }
@@ -62,7 +66,10 @@ func (s *Server) routes() *http.ServeMux {
 	api.HandleFunc("PUT /api/providers/{id}", s.handleProviderUpsert)
 	api.HandleFunc("DELETE /api/providers/{id}", s.handleProviderDelete)
 	api.HandleFunc("POST /api/providers/{id}/balance", s.handleBalance)
+	api.HandleFunc("POST /api/providers/{id}/wb-refresh", s.handleWBRefresh)
 	api.HandleFunc("GET /api/providers/{id}/models", s.handleUpstreamModels)
+	api.HandleFunc("POST /api/workbuddy/scan", s.handleWBScan)
+	api.HandleFunc("POST /api/workbuddy/import", s.handleWBImport)
 	api.HandleFunc("POST /api/models", s.handleModelUpsert)
 	api.HandleFunc("PUT /api/models/{id}", s.handleModelUpsert)
 	api.HandleFunc("DELETE /api/models/{id}", s.handleModelDelete)

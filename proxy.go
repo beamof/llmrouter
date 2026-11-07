@@ -151,6 +151,25 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 
 		lastErr := fmt.Sprintf("模型 %q 无候选", req.Model)
 		var failures []string // 逐个上游的失败原因，全部失败时一并写进日志
+		// 候选成功后的会话绑定（普通透传与 WorkBuddy 适配两条路径共用）
+		bind := func(c Candidate, status int) {
+			if sessKey == "" {
+				return
+			}
+			s.setSession(sessKey, c.Model.ID) // 成功即绑定/续期
+			// 只在「新建会话」或「会话内换模型」时记日志；同一会话复用绑定不重复记录
+			if boundID != c.Model.ID {
+				s.logSession(s.buildSessionLog(LogEntry{
+					KeyID:      keyID,
+					ProviderID: c.Provider.ID,
+					Model:      c.Model.Name,
+					SessionID:  sid,
+					Requested:  req.Model,
+					Switched:   boundID != "",
+					Status:     status,
+				}, c, boundID, cands, skips, isAuto))
+			}
+		}
 		for _, c := range cands {
 			// 原子占位：候选列表是乐观筛选的，多个并发请求可能同时看到"还有空位"。
 			// 真正发请求前再抢一次，抢不到说明该模型已满，跳到下一个候选。
@@ -158,6 +177,27 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				lastErr = fmt.Sprintf("%s 已达并行上限 %d", c.Model.Name, c.Model.MaxConcurrent)
 				failures = append(failures, lastErr)
 				continue
+			}
+			// WorkBuddy 候选走适配分支：归一化出站、专用请求头、token 续期、
+			// 流式节拍过滤与非流式聚合都在 wbAttempt 里完成
+			if e, _ := wbOf(c.Provider); e != nil {
+				if suffix == "/responses" {
+					s.store.Release(c.Model.ID) // 上游没有 /responses 协议
+					lastErr = fmt.Sprintf("%s: WorkBuddy 上游不支持 /responses 协议", c.Provider.Name)
+					failures = append(failures, lastErr)
+					continue
+				}
+				sendBody := body
+				if isAuto {
+					sendBody = withModel(body, c.Model.Name)
+				}
+				if err := s.wbAttempt(w, r, c, sendBody, keyID); err != nil {
+					lastErr = err.Error()
+					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
+					continue // 名额释放与失败日志由 wbAttempt 处理
+				}
+				bind(c, http.StatusOK)
+				return
 			}
 			sendBody := body
 			if isAuto {
@@ -214,21 +254,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				})
 				continue
 			}
-			if sessKey != "" {
-				s.setSession(sessKey, c.Model.ID) // 成功即绑定/续期
-				// 只在「新建会话」或「会话内换模型」时记日志；同一会话复用绑定不重复记录
-				if boundID != c.Model.ID {
-					s.logSession(s.buildSessionLog(LogEntry{
-						KeyID:      keyID,
-						ProviderID: c.Provider.ID,
-						Model:      c.Model.Name,
-						SessionID:  sid,
-						Requested:  req.Model,
-						Switched:   boundID != "",
-						Status:     resp.StatusCode,
-					}, c, boundID, cands, skips, isAuto))
-				}
-			}
+			bind(c, resp.StatusCode)
 			s.relay(w, resp, c.Model, keyID) // relay 返回前会释放名额
 			return
 		}
