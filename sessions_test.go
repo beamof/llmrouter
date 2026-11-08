@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -121,6 +122,175 @@ func TestSessionTTLConfigurable(t *testing.T) {
 	s.store.SetSessionTTL(1 << 40)
 	if got := s.store.SessionTTL(); got != maxSessionTTL {
 		t.Fatalf("超大 TTL 应截到 30 天，got %v", got)
+	}
+}
+
+// 会话维度吞吐：流式请求结束后，活跃会话应带上输出 tokens、输出速度与首字节耗时；
+// 同一会话再来一次请求时累计（速度取累计输出 token / 累计生成耗时）。
+func TestSessionTokenSpeed(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		time.Sleep(20 * time.Millisecond) // 保证首字节耗时可以被测到（毫秒级）
+		for i := 0; i < 3; i++ {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"x"}}]}`+"\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		fmt.Fprint(w, `data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":20}}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "glm", nil)
+
+	fetch := func() sessionInfo {
+		t.Helper()
+		resp, err := app.Client().Get(app.URL + "/api/sessions")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var v struct {
+			Sessions []sessionInfo `json:"sessions"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+			t.Fatal(err)
+		}
+		if len(v.Sessions) != 1 {
+			t.Fatalf("应有 1 个活跃会话: %#v", v.Sessions)
+		}
+		return v.Sessions[0]
+	}
+
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm","stream":true}`, "X-Session-ID", "speed-1")
+	got := fetch()
+	if got.OutTokens != 20 || got.Count != 1 {
+		t.Fatalf("首次请求后应累计 20 输出 tokens / 1 次请求: %#v", got)
+	}
+	if got.TokPerSec <= 0 || got.LastTokPerSec <= 0 {
+		t.Fatalf("应算出输出速度: %#v", got)
+	}
+	if got.TTFTMs <= 0 || got.LastTTFTMs <= 0 {
+		t.Fatalf("流式请求应测到首字节耗时: %#v", got)
+	}
+
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm","stream":true}`, "X-Session-ID", "speed-1")
+	got = fetch()
+	if got.OutTokens != 40 || got.Count != 2 {
+		t.Fatalf("再次请求后应累计 40 输出 tokens / 2 次请求: %#v", got)
+	}
+	if got.TokPerSec <= 0 || got.LastTokPerSec <= 0 {
+		t.Fatalf("累计后仍应有速度: %#v", got)
+	}
+
+	// 同时写进了按会话的落盘统计（不含在活跃列表里，但用量页「按会话」可查）
+	s.store.mu.Lock()
+	stats := append([]*SessionStat(nil), s.store.SessionUsage...)
+	s.store.mu.Unlock()
+	if len(stats) != 1 {
+		t.Fatalf("应有 1 行会话用量: %#v", stats)
+	}
+	st := stats[0]
+	if st.SessionID != "speed-1" || st.Requests != 2 || st.PromptTokens != 10 || st.CompletionTokens != 40 {
+		t.Fatalf("会话用量累计不对: %#v", st)
+	}
+	if st.GenNanos <= 0 || st.TTFTSamples != 2 {
+		t.Fatalf("会话用量应带生成耗时与首字节样本: %#v", st)
+	}
+}
+
+// 会话过期或被主动结束后，按会话的用量仍保留在状态快照里，且全局用量照常记账。
+func TestSessionUsageKeptAfterEnd(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"x"}}]}`+"\n\n")
+		fmt.Fprint(w, `data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":7}}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "glm", nil)
+
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm","stream":true}`, "X-Session-ID", "hist-1")
+	req, _ := http.NewRequest("DELETE", app.URL+"/api/sessions?id=hist-1", nil)
+	resp, err := app.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := s.activeSessions(); len(got) != 0 {
+		t.Fatalf("会话结束后不应再有活跃绑定: %#v", got)
+	}
+
+	st, err := app.Client().Get(app.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Body.Close()
+	var v struct {
+		Usage        []*UsageStat   `json:"usage"`
+		SessionUsage []*SessionStat `json:"session_usage"`
+	}
+	if err := json.NewDecoder(st.Body).Decode(&v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.SessionUsage) != 1 || v.SessionUsage[0].SessionID != "hist-1" {
+		t.Fatalf("结束的会话用量应保留: %#v", v.SessionUsage)
+	}
+	if len(v.Usage) != 1 {
+		t.Fatalf("全局用量也应照常记录: %#v", v.Usage)
+	}
+}
+
+// 按会话用量随状态落盘：重启（重新 LoadStore）后仍在；删除 Provider 时一并清理。
+func TestSessionUsagePersistsAcrossReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.json")
+	st, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.UpsertProvider(&Provider{ID: "p1", Name: "P", BaseURL: "http://example.com"})
+	m := &Model{Name: "glm", ProviderID: "p1"}
+	st.AddCallUsage("s1", "auto", m, "k1", usageSample{
+		Usage:  Usage{Prompt: 10, Cached: 4, Completion: 20},
+		Stream: true, TTFT: 50 * time.Millisecond, Gen: time.Second,
+	})
+	st.AddCallUsage("s1", "auto", m, "k1", usageSample{
+		Usage:  Usage{Prompt: 5, Completion: 5},
+		Stream: true, TTFT: 30 * time.Millisecond, Gen: 250 * time.Millisecond,
+	})
+
+	st2, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st2.SessionUsage) != 1 {
+		t.Fatalf("重新加载后应保留 1 行会话用量: %#v", st2.SessionUsage)
+	}
+	got := st2.SessionUsage[0]
+	if got.Requests != 2 || got.PromptTokens != 15 || got.CachedTokens != 4 || got.CompletionTokens != 25 {
+		t.Fatalf("会话用量累计不对: %#v", got)
+	}
+	if got.GenNanos != int64(1250*time.Millisecond) {
+		t.Fatalf("生成耗时累计不对: %v", time.Duration(got.GenNanos))
+	}
+	if got.TTFTSamples != 2 || got.TTFTNanos != int64(80*time.Millisecond) {
+		t.Fatalf("首字节累计不对: %#v", got)
+	}
+	if got.FirstAt.IsZero() || got.LastAt.Before(got.FirstAt) {
+		t.Fatalf("时刻字段不对: %#v", got)
+	}
+
+	st2.DeleteProvider("p1")
+	st3, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st3.SessionUsage) != 0 {
+		t.Fatalf("删除 Provider 时应清理其会话用量: %#v", st3.SessionUsage)
 	}
 }
 

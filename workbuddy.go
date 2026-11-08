@@ -1725,7 +1725,7 @@ func (s *Server) wbPrepareBody(e *wbEdition, c Candidate, sendBody []byte) ([]by
 // 失败时返回错误描述（并行名额已释放、失败日志已记，调用方换下一个候选）。
 // responsesMode 时入站是 /v1/responses 协议：先翻成 chat 出站，回程渲染回
 // responses 事件流或聚合为 response 对象（见 workbuddy_responses.go）。
-func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, sendBody []byte, keyID string, responsesMode bool) error {
+func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, sendBody []byte, keyID string, responsesMode bool, tm *requestTiming, sm *usageSample) error {
 	defer s.store.Release(c.Model.ID)
 	e, cred := wbOf(c.Provider)
 	if e == nil || cred == nil || cred.AccessToken == "" {
@@ -1822,6 +1822,8 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 
 	filter := &wbSSEFilter{r: resp.Body}
 	defer resp.Body.Close()
+	// 首字节在过滤之前打点：上游发出的第一个 SSE 分片（含保活注释）即算响应到达
+	upBody := &firstByteReader{r: filter, t: tm}
 
 	if wantStream {
 		wbCopyRespHeaders(w, resp.Header, true)
@@ -1830,9 +1832,11 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 			// chat 分片 → responses 事件流，边收边渲染
 			rs := newWBRespStream(w, c.Model.Name)
 			rs.begin()
-			_, cerr := io.Copy(rs, filter)
+			_, cerr := io.Copy(rs, upBody)
 			usage := rs.finish(cerr)
-			s.store.AddUsage(&c.Model, keyID, usage)
+			if sm != nil {
+				*sm = tm.sample(usage, true)
+			}
 			if cerr != nil {
 				s.logFail(LogEntry{Level: "warn", Kind: kindUpstream, KeyID: keyID,
 					ProviderID: c.Provider.ID, Model: c.Model.Name,
@@ -1841,8 +1845,11 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 			return nil
 		}
 		sn := &sseSniffer{w: flushWriter{w}}
-		_, cerr := io.Copy(sn, filter)
-		s.store.AddUsage(&c.Model, keyID, extractStreamUsage(sn.tail))
+		_, cerr := io.Copy(sn, upBody)
+		usage := extractStreamUsage(sn.tail)
+		if sm != nil {
+			*sm = tm.sample(usage, true)
+		}
 		if cerr != nil {
 			// 响应头已发出，无法换候选；记一条日志便于排查截断
 			s.logFail(LogEntry{Level: "warn", Kind: kindUpstream, KeyID: keyID,
@@ -1854,7 +1861,7 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 
 	// 非流式：先聚合再写响应。中途断流时不提交 200，交给调用方换下一个候选。
 	var agg wbAgg
-	_, cerr := io.Copy(&agg, filter)
+	_, cerr := io.Copy(&agg, upBody)
 	if cerr != nil {
 		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
@@ -1871,7 +1878,9 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 	wbCopyRespHeaders(w, resp.Header, false)
 	w.WriteHeader(resp.StatusCode)
 	w.Write(out)
-	s.store.AddUsage(&c.Model, keyID, usage)
+	if sm != nil {
+		*sm = tm.sample(usage, false)
+	}
 	return nil
 }
 

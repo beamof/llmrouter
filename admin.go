@@ -22,13 +22,15 @@ type ModelView struct {
 
 // StateView 后台页面所需的完整状态
 type StateView struct {
-	Providers []*Provider         `json:"providers"`
-	Models    []ModelView         `json:"models"`
-	APIKeys   []*APIKey           `json:"api_keys"`
-	Usage     []*UsageStat        `json:"usage"`
-	Balances  map[string]*Balance `json:"balances"`
-	Logs      []*LogEntry         `json:"logs"`
-	AutoModel string              `json:"auto_model"`
+	Providers []*Provider  `json:"providers"`
+	Models    []ModelView  `json:"models"`
+	APIKeys   []*APIKey    `json:"api_keys"`
+	Usage     []*UsageStat `json:"usage"`
+	// SessionUsage 按天 × 会话 聚合的用量，含已过期会话；用量页「按会话」视图用。
+	SessionUsage []*SessionStat      `json:"session_usage"`
+	Balances     map[string]*Balance `json:"balances"`
+	Logs         []*LogEntry         `json:"logs"`
+	AutoModel    string              `json:"auto_model"`
 	// ResponsesConvert responses 协议转换开关（默认关闭），设置页据此渲染
 	ResponsesConvert bool `json:"responses_convert"`
 	// SessionTTLSeconds 生效中的会话粘性有效期（秒），设置页据此渲染
@@ -47,7 +49,7 @@ func (s *Store) SnapshotJSON() []byte {
 		}
 	}
 	// 空状态也要输出 [] 而非 null，前端才不会拿到 null 数组
-	v := StateView{Providers: []*Provider{}, Models: []ModelView{}, APIKeys: []*APIKey{}, Usage: []*UsageStat{}, Balances: map[string]*Balance{}, Logs: []*LogEntry{}}
+	v := StateView{Providers: []*Provider{}, Models: []ModelView{}, APIKeys: []*APIKey{}, Usage: []*UsageStat{}, SessionUsage: []*SessionStat{}, Balances: map[string]*Balance{}, Logs: []*LogEntry{}}
 	if s.Providers != nil {
 		v.Providers = s.Providers
 	}
@@ -64,6 +66,7 @@ func (s *Store) SnapshotJSON() []byte {
 		v.Models = append(v.Models, ModelView{Model: m, UsedToday: used[m.ProviderID+"\x00"+m.Name], Inflight: s.inflight[m.ID]})
 	}
 	v.Usage = append(v.Usage, s.Usage...)
+	v.SessionUsage = append(v.SessionUsage, s.SessionUsage...)
 	v.AutoModel = s.AutoModel // 已持锁，直接读；空值由前端按默认 auto 处理
 	v.ResponsesConvert = s.ResponsesConvert
 	v.SessionTTLSeconds = int64(s.sessionTTLLocked() / time.Second)
@@ -76,6 +79,13 @@ func (s *Store) SnapshotJSON() []byte {
 			return a.ProviderID < b.ProviderID
 		}
 		return a.Model < b.Model
+	})
+	sort.Slice(v.SessionUsage, func(i, j int) bool {
+		a, b := v.SessionUsage[i], v.SessionUsage[j]
+		if a.Date != b.Date {
+			return a.Date > b.Date
+		}
+		return a.LastAt.After(b.LastAt)
 	})
 	b, err := json.Marshal(v)
 	if err != nil {

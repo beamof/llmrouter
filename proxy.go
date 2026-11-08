@@ -40,6 +40,15 @@ type session struct {
 	lastAt    time.Time // 最近一次成功请求时刻
 	count     int       // 会话内成功请求数
 	expires   time.Time
+
+	// 吞吐统计：只累计上游报告了 usage 的成功请求。平均速度用「累计输出 token /
+	// 累计生成耗时」，避免一次慢请求把均值带偏。
+	outTokens     int64         // 累计输出 tokens
+	genNanos      int64         // 累计生成耗时（流式 = 首字节→结束；非流式 = 端到端）
+	lastTokPerSec float64       // 最近一次请求的输出速度
+	ttftNanos     int64         // 累计首字节耗时（仅流式）
+	ttftSamples   int           // 有首字节计时的请求数（仅流式）
+	lastTTFT      time.Duration // 最近一次流式请求的首字节耗时
 }
 
 const sessionTTL = time.Hour
@@ -82,6 +91,8 @@ func (s *Server) setSession(key, modelID, keyID, requested string) {
 		modelID: modelID, keyID: keyID, requested: requested,
 		firstAt: old.firstAt, count: old.count + 1,
 		lastAt: now, expires: now.Add(ttl),
+		outTokens: old.outTokens, genNanos: old.genNanos, lastTokPerSec: old.lastTokPerSec,
+		ttftNanos: old.ttftNanos, ttftSamples: old.ttftSamples, lastTTFT: old.lastTTFT,
 	}
 	if sess.firstAt.IsZero() {
 		sess.firstAt = now
@@ -138,6 +149,14 @@ type sessionInfo struct {
 	FirstAt   time.Time `json:"first_at"`
 	LastAt    time.Time `json:"last_at"`
 	Expires   time.Time `json:"expires"`
+
+	// 吞吐：输出 tokens 取上游 usage 报告的 completion/output 分项；速度取累计值，
+	// 样本不足时为 0。
+	OutTokens     int64   `json:"out_tokens,omitempty"`
+	TokPerSec     float64 `json:"tok_per_sec,omitempty"`      // 平均输出速度（tokens/s）
+	LastTokPerSec float64 `json:"last_tok_per_sec,omitempty"` // 最近一次请求的输出速度
+	TTFTMs        int64   `json:"ttft_ms,omitempty"`          // 平均首字节耗时（毫秒，仅流式）
+	LastTTFTMs    int64   `json:"last_ttft_ms,omitempty"`     // 最近一次流式请求的首字节耗时
 }
 
 // activeSessions 当前活跃（未过期）的会话绑定，按最近活跃倒序
@@ -155,13 +174,47 @@ func (s *Server) activeSessions() []sessionInfo {
 		if i := strings.IndexByte(k, 0x00); i >= 0 {
 			id = k[:i]
 		}
-		out = append(out, sessionInfo{
+		info := sessionInfo{
 			ID: id, KeyID: v.keyID, ModelID: v.modelID, Requested: v.requested,
 			Count: v.count, FirstAt: v.firstAt, LastAt: v.lastAt, Expires: v.expires,
-		})
+			OutTokens: v.outTokens, LastTokPerSec: v.lastTokPerSec,
+			LastTTFTMs: int64(v.lastTTFT / time.Millisecond),
+		}
+		if v.genNanos > 0 {
+			info.TokPerSec = float64(v.outTokens) / (float64(v.genNanos) / float64(time.Second))
+		}
+		if v.ttftSamples > 0 {
+			info.TTFTMs = int64(time.Duration(v.ttftNanos/int64(v.ttftSamples)) / time.Millisecond)
+		}
+		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].LastAt.After(out[j].LastAt) })
 	return out
+}
+
+// addSessionUsage 把一次成功请求的用量与计时并入会话统计。会话可能在这期间过期
+// 被清理（很慢的请求），此时直接忽略，不影响下次重新建立绑定。
+func (s *Server) addSessionUsage(key string, sm usageSample) {
+	if key == "" {
+		return
+	}
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	sess, ok := s.sessions[key]
+	if !ok || time.Now().After(sess.expires) {
+		return
+	}
+	if sm.Completion > 0 {
+		sess.outTokens += sm.Completion
+		sess.genNanos += int64(sm.Gen)
+		sess.lastTokPerSec = sm.tokPerSec()
+	}
+	if sm.Stream && sm.TTFT > 0 {
+		sess.ttftNanos += int64(sm.TTFT)
+		sess.ttftSamples++
+		sess.lastTTFT = sm.TTFT
+	}
+	s.sessions[key] = sess
 }
 
 // handleProxy 生成 /chat/completions 与 /responses 共用的透传 handler。
@@ -321,6 +374,9 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				})
 				continue
 			}
+			// 计时从本次上游尝试开始，失败换候选时重新起算，避免把前一个候选
+			// 的排队/失败耗时算进当前请求的 TTFT
+			tm := newRequestTiming()
 			// WorkBuddy 候选走适配分支：归一化出站、专用请求头、token 续期、
 			// 流式节拍过滤与非流式聚合都在 wbAttempt 里完成；/responses 请求由
 			// wbAttempt 翻译成 chat 协议发上游，回程再渲染回 responses 形态
@@ -329,7 +385,8 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				if isAuto {
 					sendBody = withModel(body, c.Model.Name)
 				}
-				if err := s.wbAttempt(w, r, c, sendBody, keyID, suffix == "/responses"); err != nil {
+				var sm usageSample
+				if err := s.wbAttempt(w, r, c, sendBody, keyID, suffix == "/responses", tm, &sm); err != nil {
 					lastErr = err.Error()
 					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
 					attemptSkips = append(attemptSkips, SkipReason{
@@ -339,6 +396,8 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 					continue // 名额释放与失败日志由 wbAttempt 处理
 				}
 				bind(c, http.StatusOK)
+				s.store.AddCallUsage(sid, req.Model, &c.Model, keyID, sm)
+				s.addSessionUsage(sessKey, sm)
 				return
 			}
 			sendBody := body
@@ -409,7 +468,9 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				continue
 			}
 			bind(c, resp.StatusCode)
-			s.relay(w, resp, c.Model, keyID) // relay 返回前会释放名额
+			sm := s.relay(w, resp, c.Model, tm) // relay 返回前会释放名额
+			s.store.AddCallUsage(sid, req.Model, &c.Model, keyID, sm)
+			s.addSessionUsage(sessKey, sm)
 			return
 		}
 		if sessKey != "" {
@@ -548,7 +609,7 @@ func skipReqHeader(k string) bool {
 
 // sseSniffer 透传 SSE 的同时保留一份滚动尾部（不改任何字节），流结束后从中提取 usage
 type sseSniffer struct {
-	w    flushWriter
+	w    io.Writer
 	tail []byte
 }
 
@@ -557,6 +618,69 @@ func (s *sseSniffer) Write(p []byte) (int, error) {
 	s.tail = append(s.tail, p[:n]...)
 	if len(s.tail) > 8192 {
 		s.tail = s.tail[len(s.tail)-8192:]
+	}
+	return n, err
+}
+
+// requestTiming 记录一次上游调用的计时点：发起时刻与首个响应字节到达时刻。
+// 首字节（TTFT）从发起请求算起，包含排队、预填充与上游出字延迟。
+type requestTiming struct {
+	start time.Time
+	first time.Time // 零值 = 还没收到任何响应字节
+}
+
+func newRequestTiming() *requestTiming { return &requestTiming{start: time.Now()} }
+
+func (t *requestTiming) markFirst() {
+	if t.first.IsZero() {
+		t.first = time.Now()
+	}
+}
+
+// sample 合成一次调用的用量与耗时。流式的生成耗时从首字节算到流结束（排除排队与
+// 预填充），非流式只有端到端耗时；两者都由 tokPerSec 统一换算。
+func (t *requestTiming) sample(u Usage, stream bool) usageSample {
+	end := time.Now()
+	sm := usageSample{Usage: u, Total: end.Sub(t.start), Stream: stream}
+	if !t.first.IsZero() {
+		sm.TTFT = t.first.Sub(t.start)
+		if stream {
+			sm.Gen = end.Sub(t.first)
+		}
+	}
+	if sm.Gen <= 0 {
+		sm.Gen = sm.Total
+	}
+	return sm
+}
+
+// usageSample 一次调用的用量 + 吞吐计时
+type usageSample struct {
+	Usage
+	Stream bool          // 是否流式响应（决定 TTFT 是否有意义）
+	TTFT   time.Duration // 首字节耗时
+	Gen    time.Duration // 生成耗时
+	Total  time.Duration // 端到端耗时
+}
+
+// tokPerSec 输出速度；没有输出 token 或耗时时返回 0
+func (u usageSample) tokPerSec() float64 {
+	if u.Completion <= 0 || u.Gen <= 0 {
+		return 0
+	}
+	return float64(u.Completion) / u.Gen.Seconds()
+}
+
+// firstByteReader 在首次从上游读到字节时给 requestTiming 打点，不改变字节流。
+type firstByteReader struct {
+	r io.Reader
+	t *requestTiming
+}
+
+func (f *firstByteReader) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	if n > 0 {
+		f.t.markFirst()
 	}
 	return n, err
 }
@@ -716,9 +840,10 @@ func lastUsageObject(tail []byte) []byte {
 	return nil
 }
 
-// relay 把上游响应原样写回客户端；非流式响应顺带读取 usage 记账。
+// relay 把上游响应原样写回客户端，并把本次调用的用量与耗时返回给调用方
+// （全局用量与会话用量的记账在 handleProxy 里统一完成）。
 // 函数返回时释放该模型的并行名额（defer 保证流式/非流式/204 各路径都会释放）。
-func (s *Server) relay(w http.ResponseWriter, resp *http.Response, m Model, keyID string) {
+func (s *Server) relay(w http.ResponseWriter, resp *http.Response, m Model, tm *requestTiming) usageSample {
 	defer s.store.Release(m.ID)
 	defer resp.Body.Close()
 	for k, vv := range resp.Header {
@@ -731,22 +856,21 @@ func (s *Server) relay(w http.ResponseWriter, resp *http.Response, m Model, keyI
 	}
 	w.WriteHeader(resp.StatusCode)
 	if resp.StatusCode == 204 || resp.StatusCode == 304 {
-		s.store.AddUsage(&m, keyID, Usage{})
-		return
+		return tm.sample(Usage{}, false)
 	}
+	body := &firstByteReader{r: resp.Body, t: tm}
 	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		sn := &sseSniffer{w: flushWriter{w}}
-		io.Copy(sn, resp.Body) // 流式：边收边发，字节不变，尾部嗅探 usage
-		s.store.AddUsage(&m, keyID, extractStreamUsage(sn.tail))
-		return
+		io.Copy(sn, body) // 流式：边收边发，字节不变，尾部嗅探 usage
+		return tm.sample(extractStreamUsage(sn.tail), true)
 	}
-	buf, _ := io.ReadAll(resp.Body)
+	buf, _ := io.ReadAll(body)
 	var top struct {
 		Usage json.RawMessage `json:"usage"`
 	}
 	json.Unmarshal(buf, &top)
 	w.Write(buf)
-	s.store.AddUsage(&m, keyID, parseUsageObject(top.Usage))
+	return tm.sample(parseUsageObject(top.Usage), false)
 }
 
 func skipRespHeader(k string) bool {

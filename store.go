@@ -113,18 +113,41 @@ type Balance struct {
 	At    time.Time `json:"at"`
 }
 
+// SessionStat 按天 × 会话 × key × provider × 模型 聚合的会话用量。
+// 与 UsageStat 的区别：多一维会话 ID，并带上吞吐计时（生成耗时/首字节）。
+// 会话粘性绑定只在内存且会过期，这张表保证过期后的用量与速度仍然可查。
+type SessionStat struct {
+	Date             string    `json:"date"`
+	SessionID        string    `json:"session_id"`
+	KeyID            string    `json:"key_id,omitempty"` // 空串 = 免鉴权，"env" = 环境变量令牌
+	ProviderID       string    `json:"provider_id"`
+	Model            string    `json:"model"`
+	Requested        string    `json:"requested,omitempty"` // 客户端请求的模型名（auto 时与 Model 不同）
+	Requests         int64     `json:"requests"`
+	PromptTokens     int64     `json:"prompt_tokens"`
+	CachedTokens     int64     `json:"cached_tokens,omitempty"`
+	CompletionTokens int64     `json:"completion_tokens"`
+	GenNanos         int64     `json:"gen_nanos,omitempty"`  // 累计生成耗时（流式 = 首字节→结束）
+	TTFTNanos        int64     `json:"ttft_nanos,omitempty"` // 累计首字节耗时（仅流式）
+	TTFTSamples      int64     `json:"ttft_samples,omitempty"`
+	FirstAt          time.Time `json:"first_at"`
+	LastAt           time.Time `json:"last_at"`
+}
+
 // Store 全部状态：内存为准，变更即落盘
 type Store struct {
 	mu        sync.Mutex
 	path      string
-	NextID    int                 `json:"next_id"`
-	Providers []*Provider         `json:"providers"`
-	Models    []*Model            `json:"models"`
-	APIKeys   []*APIKey           `json:"api_keys"`
-	Usage     []*UsageStat        `json:"usage"`
-	Balances  map[string]*Balance `json:"balances"`
-	Logs      []*LogEntry         `json:"logs,omitempty"`       // 异常/失败日志，最多 maxLogs 条
-	AutoModel string              `json:"auto_model,omitempty"` // 对外声明的自动模型名，空 = "auto"
+	NextID    int          `json:"next_id"`
+	Providers []*Provider  `json:"providers"`
+	Models    []*Model     `json:"models"`
+	APIKeys   []*APIKey    `json:"api_keys"`
+	Usage     []*UsageStat `json:"usage"`
+	// SessionUsage 按天 × 会话 聚合的用量；会话过期后仍保留，供用量页按会话查看。
+	SessionUsage []*SessionStat      `json:"session_usage,omitempty"`
+	Balances     map[string]*Balance `json:"balances"`
+	Logs         []*LogEntry         `json:"logs,omitempty"`       // 异常/失败日志，最多 maxLogs 条
+	AutoModel    string              `json:"auto_model,omitempty"` // 对外声明的自动模型名，空 = "auto"
 
 	// ResponsesConvert 是否允许把 /v1/responses 请求翻译成 chat/completions 出站。
 	// 默认关闭：仅支持 chat 的上游（WorkBuddy）不承接 responses 请求，路由会改选
@@ -172,6 +195,13 @@ func (s *Store) save() {
 		}
 	}
 	s.Usage = kept
+	keptSession := s.SessionUsage[:0]
+	for _, u := range s.SessionUsage {
+		if u.Date >= cut {
+			keptSession = append(keptSession, u)
+		}
+	}
+	s.SessionUsage = keptSession
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return
@@ -303,6 +333,14 @@ func (s *Store) DeleteProvider(id string) bool {
 		}
 	}
 	s.Usage = s.Usage[:u]
+	su := 0
+	for _, x := range s.SessionUsage {
+		if x.ProviderID != id {
+			s.SessionUsage[su] = x
+			su++
+		}
+	}
+	s.SessionUsage = s.SessionUsage[:su]
 	delete(s.Balances, id)
 	s.save()
 	return true
@@ -429,10 +467,16 @@ type Usage struct {
 	Completion int64 // 输出 tokens
 }
 
-// AddUsage 记一次调用并落盘
+// AddUsage 记一次调用并落盘（全局按天聚合）
 func (s *Store) AddUsage(m *Model, keyID string, u Usage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.addUsageLocked(m, keyID, u)
+	s.save()
+}
+
+// addUsageLocked 更新「按天 × key × provider × 模型」的全局用量（调用方需持锁，不落盘）
+func (s *Store) addUsageLocked(m *Model, keyID string, u Usage) {
 	today := time.Now().Format("2006-01-02")
 	for _, st := range s.Usage {
 		if st.Date == today && st.KeyID == keyID && st.ProviderID == m.ProviderID && st.Model == m.Name {
@@ -440,7 +484,6 @@ func (s *Store) AddUsage(m *Model, keyID string, u Usage) {
 			st.PromptTokens += u.Prompt
 			st.CachedTokens += u.Cached
 			st.CompletionTokens += u.Completion
-			s.save()
 			return
 		}
 	}
@@ -448,7 +491,57 @@ func (s *Store) AddUsage(m *Model, keyID string, u Usage) {
 		Date: today, KeyID: keyID, ProviderID: m.ProviderID, Model: m.Name,
 		Requests: 1, PromptTokens: u.Prompt, CachedTokens: u.Cached, CompletionTokens: u.Completion,
 	})
+}
+
+// AddCallUsage 记一次成功调用：全局按天用量 + （带会话 ID 时）按天会话用量。
+// 两者一次落盘，避免同一请求写两次状态文件。计时必须来自同一次调用。
+func (s *Store) AddCallUsage(sessionID, requested string, m *Model, keyID string, us usageSample) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.addUsageLocked(m, keyID, us.Usage)
+	if sessionID != "" {
+		s.addSessionStatLocked(sessionID, requested, m, keyID, us)
+	}
 	s.save()
+}
+
+// addSessionStatLocked 更新「按天 × 会话 × key × provider × 模型」的会话用量
+// （调用方需持锁，不落盘）。会话过期后这行仍保留，直到 35 天用量清理。
+func (s *Store) addSessionStatLocked(sessionID, requested string, m *Model, keyID string, us usageSample) {
+	today := time.Now().Format("2006-01-02")
+	now := time.Now()
+	for _, st := range s.SessionUsage {
+		if st.Date == today && st.SessionID == sessionID && st.KeyID == keyID &&
+			st.ProviderID == m.ProviderID && st.Model == m.Name && st.Requested == requested {
+			st.Requests++
+			st.PromptTokens += us.Prompt
+			st.CachedTokens += us.Cached
+			st.CompletionTokens += us.Completion
+			if us.Completion > 0 {
+				st.GenNanos += int64(us.Gen)
+			}
+			if us.Stream && us.TTFT > 0 {
+				st.TTFTNanos += int64(us.TTFT)
+				st.TTFTSamples++
+			}
+			st.LastAt = now
+			return
+		}
+	}
+	st := &SessionStat{
+		Date: today, SessionID: sessionID, KeyID: keyID,
+		ProviderID: m.ProviderID, Model: m.Name, Requested: requested,
+		Requests: 1, PromptTokens: us.Prompt, CachedTokens: us.Cached, CompletionTokens: us.Completion,
+		FirstAt: now, LastAt: now,
+	}
+	if us.Completion > 0 {
+		st.GenNanos = int64(us.Gen)
+	}
+	if us.Stream && us.TTFT > 0 {
+		st.TTFTNanos = int64(us.TTFT)
+		st.TTFTSamples = 1
+	}
+	s.SessionUsage = append(s.SessionUsage, st)
 }
 
 func (s *Store) SetBalance(pid string, b *Balance) {
