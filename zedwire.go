@@ -45,7 +45,7 @@ func zedCompletionsHeader(cred *ZedCred) http.Header {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "application/json")
-	h.Set("Authorization", "Bearer "+cred.AccessToken)
+	h.Set("Authorization", "Bearer "+strings.TrimSpace(cred.AccessToken))
 	h.Set("User-Agent", zedUserAgent())
 	h.Set("x-zed-version", zedVersion)
 	h.Set("x-zed-client-supports-status-messages", "true")

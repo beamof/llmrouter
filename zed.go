@@ -76,12 +76,38 @@ func zedUserAgent() string {
 }
 
 // nativeAuthorization 账号类端点（llm_tokens / users/me）的鉴权值：
-// "<user_id> <原生凭据 JSON>"（Zed 私有格式，原生凭据作为整体参与鉴权）
+// "<user_id> <原生凭据 JSON>"（Zed 私有格式，原生凭据作为整体参与鉴权）。
+//
+// 原生凭据在 data.json 里会被 MarshalIndent 重新缩进（json.RawMessage 同样被美化），
+// 载入后带换行与缩进；HTTP 头不允许换行等控制字符，原样拼进去会被 net/http 直接
+// 拒绝（invalid header field value），请求根本发不出去。这里统一压成紧凑 JSON。
 func (c *ZedCred) nativeAuthorization() string {
 	if c == nil {
 		return ""
 	}
-	return strings.TrimSpace(c.UserID) + " " + strings.TrimSpace(string(c.NativeCredential))
+	return strings.TrimSpace(c.UserID) + " " + compactCredential(c.NativeCredential)
+}
+
+// compactCredential 把原生凭据压成紧凑 JSON，保证可作为 HTTP 头值。
+// 解析失败时退化为抹掉控制字符：仍让请求发出，由上游给出更贴近事实的报错。
+func compactCredential(raw json.RawMessage) string {
+	src := bytes.TrimSpace(raw)
+	if len(src) == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, src); err == nil {
+		return buf.String()
+	}
+	var b strings.Builder
+	for _, r := range string(src) {
+		if r < 0x20 || r == 0x7f { // 换行、制表等控制字符不能出现在头里
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // tokenExpiring JWT 是否临期（过期时刻未知时视为临期，逼一次重铸拿到明确时刻）
@@ -179,7 +205,7 @@ func zedFetchModels(ctx context.Context, cli *http.Client, base string, cred *Ze
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(cred.AccessToken))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", zedUserAgent())
 	req.Header.Set("x-zed-version", zedVersion)
