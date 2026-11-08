@@ -4,9 +4,11 @@ package main
 //
 // 这不是 OAuth code/PKCE。每次登录生成临时 RSA-2048 密钥，把 PKCS#1 DER 公钥
 // （base64url）拼进 zed.dev/native_app_signin 的查询串；浏览器完成授权后，
-// zed.dev 把「RSA-OAEP/SHA-256 加密的原生凭据」重定向到本机回环端口，网关解密
-// 得到长期原生凭据（私钥用完即弃，不落盘）。无浏览器环境（服务器部署）可把浏览器
-// 地址栏里的回调 URL 粘贴进后台兜底完成。
+// zed.dev 把「加密的原生凭据」重定向到本机回环端口，网关解密得到长期原生凭据
+// （私钥用完即弃，不落盘）。密文格式由服务端决定且两种并存：V1 = RSA-OAEP/SHA-256，
+// V0 = PKCS#1 v1.5（Zed 官方客户端 decrypt_string 也是先试 OAEP 再回退 v1.5），
+// 因此解密必须两种都试。无浏览器环境（服务器部署）可把浏览器地址栏里的回调 URL
+// 粘贴进后台兜底完成。
 //
 // 流程参照 ccLoad（MIT）；与 ccLoad 一致，同一账号重复登录原地更新 Provider，
 // 并保留已绑定的 system_id 与用户调整过的模型条目。
@@ -55,16 +57,22 @@ func newZedLogin() (*zedLogin, error) {
 	}, nil
 }
 
-// authorizationURL 浏览器要打开的授权地址（携带回环端口与临时公钥）
-func (l *zedLogin) authorizationURL(port int) string {
+// authorizationURL 浏览器要打开的授权地址（携带回环端口、临时公钥与安装标识）。
+// systemID 非空时带上：Zed 原生客户端的 NativeAppSignInQueryParams 就是这三个参数。
+func (l *zedLogin) authorizationURL(port int, systemID string) string {
 	q := url.Values{}
 	q.Set("native_app_port", strconv.Itoa(port))
 	q.Set("native_app_public_key", l.publicKey)
+	if systemID != "" {
+		q.Set("system_id", systemID)
+	}
 	return zedSignInURL + "?" + q.Encode()
 }
 
 // decryptCallback 校验并解密回调 URL，返回 user_id 与原生凭据。
-// 只接受回环主机 + 根路径，密文用 RSA-OAEP/SHA-256 解开且必须是合法 JSON。
+// 只接受回环主机；路径不限（Zed 官方客户端与 magpie 插件都只认查询串，页面可能
+// 重定向到任意路径）；密文先按 RSA-OAEP/SHA-256 解，失败再回退 PKCS#1 v1.5
+// （服务端 V0/V1 两种格式并存），解出的原生凭据必须是合法 JSON。
 func (l *zedLogin) decryptCallback(rawURL string) (string, json.RawMessage, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || !u.IsAbs() || !strings.EqualFold(u.Scheme, "http") {
@@ -77,8 +85,8 @@ func (l *zedLogin) decryptCallback(rawURL string) (string, json.RawMessage, erro
 			loopback = true
 		}
 	}
-	if !loopback || u.Path != "/" {
-		return "", nil, errors.New("回调 URL 必须指向回环地址的根路径")
+	if !loopback {
+		return "", nil, errors.New("回调 URL 必须指向回环地址")
 	}
 	userID := strings.TrimSpace(u.Query().Get("user_id"))
 	encrypted := strings.TrimSpace(u.Query().Get("access_token"))
@@ -89,9 +97,14 @@ func (l *zedLogin) decryptCallback(rawURL string) (string, json.RawMessage, erro
 	if err != nil {
 		return "", nil, errors.New("回调 access_token 不是合法 base64url")
 	}
-	plaintext, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, l.privateKey, ciphertext, nil)
-	if err != nil {
-		return "", nil, errors.New("解密回调 access_token 失败（可能复制了其他会话的回调）")
+	plaintext, oaepErr := rsa.DecryptOAEP(sha256.New(), rand.Reader, l.privateKey, ciphertext, nil)
+	if oaepErr != nil {
+		// V0 密文（PKCS#1 v1.5）：与 Zed 官方客户端 decrypt_string 的回退一致
+		var v15Err error
+		plaintext, v15Err = rsa.DecryptPKCS1v15(rand.Reader, l.privateKey, ciphertext)
+		if v15Err != nil {
+			return "", nil, errors.New("解密回调 access_token 失败（OAEP 与 PKCS#1 v1.5 均未解开，可能复制了其他会话的回调）")
+		}
 	}
 	if !json.Valid(plaintext) {
 		return "", nil, errors.New("解密出的原生凭据不是合法 JSON")
@@ -311,6 +324,13 @@ func (s *Server) handleZedLoginStart(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(rw http.ResponseWriter, req *http.Request) {
+			// 浏览器落地后会附带请求 favicon 等资源：不带回调参数的请求直接 404，
+			// 不能拿去完成登录（否则会把会话误判失败）
+			q := req.URL.Query()
+			if strings.TrimSpace(q.Get("user_id")) == "" || strings.TrimSpace(q.Get("access_token")) == "" {
+				rw.WriteHeader(http.StatusNotFound)
+				return
+			}
 			callback := "http://" + req.Host + req.URL.RequestURI()
 			if _, err := s.zedCompleteLogin(state, callback); err != nil {
 				rw.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -326,7 +346,7 @@ func (s *Server) handleZedLoginStart(w http.ResponseWriter, r *http.Request) {
 		srv.Serve(ln) // listener 被会话关闭后返回 ErrClosed，会话随之不再可用
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"url": login.authorizationURL(port), "state": state, "status": "pending",
+		"url": login.authorizationURL(port, systemID), "state": state, "status": "pending",
 	})
 }
 

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -231,10 +232,19 @@ func TestZedLoginBadCallback(t *testing.T) {
 	if _, _, err := login.decryptCallback(good); err != nil {
 		t.Fatalf("合法回调应通过: %v", err)
 	}
+	// 路径不限：Zed 页面可能重定向到任意路径，只认查询串（对齐官方客户端与 magpie）
+	for _, ok := range []string{
+		"http://127.0.0.1:99/callback?user_id=u&access_token=" + base64.RawURLEncoding.EncodeToString(ct),
+		"http://127.0.0.1:99?user_id=u&access_token=" + base64.RawURLEncoding.EncodeToString(ct), // 粘贴丢尾部斜杠
+		"http://localhost:99/?user_id=u&access_token=" + base64.RawURLEncoding.EncodeToString(ct),
+	} {
+		if _, _, err := login.decryptCallback(ok); err != nil {
+			t.Fatalf("回调 %q 应通过: %v", ok, err)
+		}
+	}
 	for _, bad := range []string{
 		"https://127.0.0.1:99/?user_id=u&access_token=x",                                // 非 http
 		"http://example.com/?user_id=u&access_token=x",                                  // 非回环
-		"http://127.0.0.1:99/callback?user_id=u&access_token=x",                         // 非根路径
 		"http://127.0.0.1:99/?user_id=u",                                                // 缺 access_token
 		"http://127.0.0.1:99/?access_token=" + base64.RawURLEncoding.EncodeToString(ct), // 缺 user_id
 	} {
@@ -242,11 +252,70 @@ func TestZedLoginBadCallback(t *testing.T) {
 			t.Fatalf("回调 %q 应被拒绝", bad)
 		}
 	}
-	// 他人公钥加密的密文解不开（复制了别的会话的回调）
+	// 他人公钥加密的密文两种填充都解不开（复制了别的会话的回调）
 	other, _ := rsa.GenerateKey(rand.Reader, 2048)
 	wrong, _ := rsa.EncryptOAEP(sha256.New(), rand.Reader, &other.PublicKey, native, nil)
 	if _, _, err := login.decryptCallback("http://127.0.0.1:1/?user_id=u&access_token=" + base64.RawURLEncoding.EncodeToString(wrong)); err == nil {
 		t.Fatal("他人公钥加密的密文应解密失败")
+	}
+	wrongV15, _ := rsa.EncryptPKCS1v15(rand.Reader, &other.PublicKey, native)
+	if _, _, err := login.decryptCallback("http://127.0.0.1:1/?user_id=u&access_token=" + base64.RawURLEncoding.EncodeToString(wrongV15)); err == nil {
+		t.Fatal("他人公钥加密的 v1.5 密文应解密失败")
+	}
+}
+
+// TestZedLoginV0Callback 服务端 V0 格式（PKCS#1 v1.5）密文也要能解开：
+// Zed 官方客户端 decrypt_string 先试 OAEP 再回退 v1.5，两种格式服务端并存。
+func TestZedLoginV0Callback(t *testing.T) {
+	login, err := newZedLogin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := []byte(`{"access_token":"native-secret"}`)
+	ct, err := rsa.EncryptPKCS1v15(rand.Reader, &login.privateKey.PublicKey, native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, got, err := login.decryptCallback("http://127.0.0.1:99/?user_id=user-1&access_token=" + base64.RawURLEncoding.EncodeToString(ct))
+	if err != nil {
+		t.Fatalf("V0 (PKCS#1 v1.5) 密文应能解开: %v", err)
+	}
+	if uid != "user-1" || string(got) != string(native) {
+		t.Fatalf("解密结果不对: %q %s", uid, got)
+	}
+}
+
+// TestZedAuthorizationURL 授权地址参数：native_app_port / native_app_public_key 恒有，
+// system_id 非空时携带（对齐 Zed 原生客户端 NativeAppSignInQueryParams）。
+func TestZedAuthorizationURL(t *testing.T) {
+	login, err := newZedLogin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(login.authorizationURL(1234, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Scheme != "https" || u.Host != "zed.dev" || u.Path != "/native_app_signin" {
+		t.Fatalf("授权地址形态不对: %s", u)
+	}
+	if got := u.Query().Get("native_app_port"); got != "1234" {
+		t.Fatalf("native_app_port = %q", got)
+	}
+	if key := u.Query().Get("native_app_public_key"); key == "" {
+		t.Fatal("缺少 native_app_public_key")
+	} else if der, err := base64.RawURLEncoding.DecodeString(key); err != nil || len(der) == 0 {
+		t.Fatalf("native_app_public_key 不是合法 base64url: %v", err)
+	}
+	if _, ok := u.Query()["system_id"]; ok {
+		t.Fatal("无 system_id 时不应携带该参数")
+	}
+	u, err = url.Parse(login.authorizationURL(4321, "0ddc2e22-b830-4db5-a0e4-1f9a2f57f6eb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := u.Query().Get("system_id"); got != "0ddc2e22-b830-4db5-a0e4-1f9a2f57f6eb" {
+		t.Fatalf("system_id = %q", got)
 	}
 }
 
