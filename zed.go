@@ -144,10 +144,11 @@ func zedMintLLMToken(ctx context.Context, cli *http.Client, base string, cred *Z
 	if cred == nil || len(cred.NativeCredential) == 0 {
 		return nil, errors.New("zed 凭证缺少原生凭据")
 	}
-	// 注意：该端点要求空 body（实测发 "{}" 会被上游以
-	// "Failed to read request body: Invalid JSON" 400 拒绝），只带鉴权头即可
+	// 端点要求 body 为 {"organization_id": null}（个人账号；organization_id 传 UUID
+	// 时代表组织账号）。实测空 body 与 "{}" 都会被上游以
+	// "Failed to read request body: Invalid JSON" 400 拒绝（对齐 zed-free 抓包）。
 	body, status, err := zedAPICall(ctx, cli, http.MethodPost, strings.TrimRight(base, "/")+"/client/llm_tokens",
-		cred.nativeAuthorization(), cred.SystemID, nil)
+		cred.nativeAuthorization(), cred.SystemID, []byte(`{"organization_id":null}`))
 	if err != nil {
 		return nil, fmt.Errorf("重铸请求失败: %v", err)
 	}

@@ -264,12 +264,13 @@ func TestZedMintAndExpiry(t *testing.T) {
 	if !minted.expires().After(time.Now()) {
 		t.Fatal("过期时刻应在未来")
 	}
-	// 契约：llm_tokens 必须空 body（真实上游对 "{}" 报 400 Invalid JSON）
+	// 契约：llm_tokens body 必须是 {"organization_id":null}
+	// （真实上游对空 body / "{}" 都报 400 Invalid JSON）
 	fc.mintMu.Lock()
 	bodies := append([]string(nil), fc.mintBodies...)
 	fc.mintMu.Unlock()
-	if len(bodies) != 1 || bodies[0] != "" {
-		t.Fatalf("llm_tokens 请求必须带空 body: %q", bodies)
+	if len(bodies) != 1 || bodies[0] != `{"organization_id":null}` {
+		t.Fatalf("llm_tokens 请求 body 不符: %q", bodies)
 	}
 	// 无效原生凭据 → 401
 	if _, err := zedMintLLMToken(t.Context(), cli, fc.base, &ZedCred{UserID: "bad", NativeCredential: json.RawMessage(`{}`)}); err == nil {
