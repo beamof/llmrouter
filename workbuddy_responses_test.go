@@ -152,6 +152,7 @@ func TestWBResponsesStream(t *testing.T) {
 		fmt.Fprint(w, wbRespSSEFixture)
 	})
 	s, app := newTestServer(t)
+	s.store.SetResponsesConvert(true) // 转换默认关闭，本测试验证转换链路
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 
 	resp, body := postJSON(t, app, "/v1/responses",
@@ -235,6 +236,7 @@ func TestWBResponsesNonStream(t *testing.T) {
 		fmt.Fprint(w, wbRespSSEFixture)
 	})
 	s, app := newTestServer(t)
+	s.store.SetResponsesConvert(true) // 转换默认关闭，本测试验证转换链路
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 
 	resp, body := postJSON(t, app, "/v1/responses",
@@ -305,6 +307,7 @@ func TestWBResponsesIncomplete(t *testing.T) {
 		}, "\n\n"))
 	})
 	s, app := newTestServer(t)
+	s.store.SetResponsesConvert(true) // 转换默认关闭，本测试验证转换链路
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 
 	// 流式：response.incomplete 事件
@@ -352,6 +355,7 @@ func TestWBResponsesFailover(t *testing.T) {
 		fmt.Fprint(w, `{"code":6004,"message":"限流"}`)
 	})
 	s, app := newTestServer(t)
+	s.store.SetResponsesConvert(true) // 开启转换后 wb 候选才参与 responses 路由
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 	fallback := http.NewServeMux()
 	fallback.HandleFunc("/responses", func(w http.ResponseWriter, r *http.Request) {
@@ -366,5 +370,125 @@ func TestWBResponsesFailover(t *testing.T) {
 		`{"model":"glm-5.0","input":"hi"}`)
 	if resp.StatusCode != 200 || !strings.Contains(body, "resp_1") {
 		t.Fatalf("/responses 应故障转移到普通候选: %d %s", resp.StatusCode, body)
+	}
+}
+
+// responses 协议转换默认关闭：/v1/responses 会跳过仅支持 chat 的同名 WorkBuddy
+// 候选，改用原生支持 responses 的模型（不尝试转换，也不因 404 再故障转移）。
+func TestResponsesSkipsChatOnlyCandidate(t *testing.T) {
+	wbCalled := false
+	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		wbCalled = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"wb\"}}]}\n\ndata: [DONE]\n\n")
+	})
+	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("responses 请求应走原生 responses 端点, got %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"resp_native","object":"response","status":"completed","output":[]}`)
+	}))
+	defer native.Close()
+
+	s, app := newTestServer(t)
+	addWBProviderModel(t, s, up.URL, "shared", &WorkBuddyCred{UID: "u", AccessToken: "at-1"}) // 优先级 10
+	addProviderModel(t, s, native.URL, "shared", func(m *Model) { m.Priority = 1 })
+
+	resp, body := postJSON(t, app, "/v1/responses", `{"model":"shared","input":"hi"}`)
+	if resp.StatusCode != 200 || !strings.Contains(body, "resp_native") {
+		t.Fatalf("应改走原生 responses 模型: %d %s", resp.StatusCode, body)
+	}
+	if wbCalled {
+		t.Fatal("转换默认关闭时不应把 responses 请求发给 WorkBuddy")
+	}
+}
+
+// 请求指定的模型全部是仅支持 chat 的上游时，回落到其他支持 responses 的模型。
+func TestResponsesFallsBackToOtherModel(t *testing.T) {
+	wbCalled := false
+	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		wbCalled = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"wb\"}}]}\n\ndata: [DONE]\n\n")
+	})
+	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"resp_other","object":"response","status":"completed","output":[]}`)
+	}))
+	defer native.Close()
+
+	s, app := newTestServer(t)
+	addWBProviderModel(t, s, up.URL, "wb-only", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
+	addProviderModel(t, s, native.URL, "native-model", func(m *Model) { m.Priority = 1 })
+
+	resp, body := postJSON(t, app, "/v1/responses", `{"model":"wb-only","input":"hi"}`)
+	if resp.StatusCode != 200 || !strings.Contains(body, "resp_other") {
+		t.Fatalf("应回落到其他支持 responses 的模型: %d %s", resp.StatusCode, body)
+	}
+	if wbCalled {
+		t.Fatal("转换默认关闭时不应把 responses 请求发给 WorkBuddy")
+	}
+}
+
+// 打开转换开关后，WorkBuddy 候选按优先级正常参与 responses 路由并渲染回 responses 形态。
+func TestResponsesConvertSwitchRoutesToWorkBuddy(t *testing.T) {
+	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, wbRespSSEFixture)
+	})
+	nativeHit := false
+	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nativeHit = true
+		fmt.Fprint(w, `{"id":"resp_native","object":"response","status":"completed","output":[]}`)
+	}))
+	defer native.Close()
+
+	s, app := newTestServer(t)
+	s.store.SetResponsesConvert(true)
+	addWBProviderModel(t, s, up.URL, "shared", &WorkBuddyCred{UID: "u", AccessToken: "at-1"}) // 优先级 10
+	addProviderModel(t, s, native.URL, "shared", func(m *Model) { m.Priority = 1 })
+
+	resp, body := postJSON(t, app, "/v1/responses", `{"model":"shared","input":"hi"}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	if nativeHit {
+		t.Fatal("开启转换后应优先使用高优先级的 WorkBuddy 候选")
+	}
+	if !strings.Contains(body, `"object":"response"`) || !strings.Contains(body, "你好") {
+		t.Fatalf("应把 chat 流渲染为 response 对象: %s", body)
+	}
+}
+
+// 设置接口的两个字段互相独立：只改其中一项不会把另一项重置。
+func TestSettingsResponsesConvert(t *testing.T) {
+	_, app := newTestServer(t)
+	resp, body := postJSONWithHeader(t, app, "PUT", "/api/settings",
+		`{"responses_convert":true}`, "Content-Type", "application/json")
+	if resp.StatusCode != 200 {
+		t.Fatalf("settings 应 200: %d %s", resp.StatusCode, body)
+	}
+	var v struct {
+		AutoModel        string `json:"auto_model"`
+		ResponsesConvert bool   `json:"responses_convert"`
+	}
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		t.Fatal(err)
+	}
+	if !v.ResponsesConvert {
+		t.Fatalf("responses_convert 应为 true: %s", body)
+	}
+
+	resp, body = postJSONWithHeader(t, app, "PUT", "/api/settings",
+		`{"auto_model":"pick"}`, "Content-Type", "application/json")
+	if resp.StatusCode != 200 {
+		t.Fatalf("settings 应 200: %d %s", resp.StatusCode, body)
+	}
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.AutoModel != "pick" || !v.ResponsesConvert {
+		t.Fatalf("只改 auto_model 不应影响转换开关: %s", body)
 	}
 }

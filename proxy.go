@@ -19,6 +19,9 @@ var hopHeaders = []string{
 	"Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding", "Upgrade",
 }
 
+// skipNoResponses 候选无法承接 responses 请求时的剔除原因（用于会话日志）
+const skipNoResponses = "不支持 responses 协议（上游仅提供 chat completions）"
+
 type flushWriter struct{ w http.ResponseWriter }
 
 func (f flushWriter) Write(p []byte) (int, error) {
@@ -168,33 +171,76 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 		if suffix == "/responses" {
 			protocol = "responses"
 		}
+		// responses 协议转换开关（默认关闭）：关闭时仅支持 chat 的上游（WorkBuddy）
+		// 不承接 /responses，路由会改选原生支持 responses 的模型。
+		responsesConvert := s.store.ResponsesConvertEnabled()
 
-		// 会话绑定的候选排最前（不套用静音/上限规则），规则候选作为 fallback 池
+		// 会话绑定的候选排最前（不套用静音/上限规则），规则候选作为 fallback 池。
+		// 绑定键含接入协议：同一会话混用两种协议时各自绑定，避免因协议能力不同来回换模型。
 		sessKey := ""
 		sid := r.Header.Get("X-Session-ID")
 		if sid != "" {
-			sessKey = sid + "\x00" + req.Model
+			sessKey = sid + "\x00" + protocol + "\x00" + req.Model
 		}
 		now := time.Now()
 		var cands []Candidate
+		seen := map[string]bool{}
+		addCand := func(c Candidate) {
+			if seen[c.Model.ID] {
+				return
+			}
+			seen[c.Model.ID] = true
+			cands = append(cands, c)
+		}
 		boundID := "" // 已绑定的模型条目 ID，用于区分「复用绑定」与「新建绑定」
+		var skips []SkipReason
 		if sessKey != "" {
 			if modelID, ok := s.getSession(sessKey); ok {
 				if c, ok := s.store.CandidateByID(modelID); ok {
-					cands = append(cands, c)
-					boundID = modelID
+					boundID = modelID // 绑定存在即记下，协议不匹配改选时日志才算「会话内更换模型」
+					if candidateSupportsProtocol(c, protocol, responsesConvert) {
+						addCand(c)
+					} else {
+						skips = append(skips, SkipReason{
+							ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+							Reason: "绑定的模型" + skipNoResponses + "，改用其他模型",
+						})
+					}
 				}
 			}
 		}
-		rule, skips := s.store.CandidatesDetailed(req.Model, now, isAuto)
+		rule, ruleSkips := s.store.CandidatesDetailed(req.Model, now, isAuto)
+		skips = append(skips, ruleSkips...)
+		protocolSkipped := 0
 		for _, c := range rule {
-			if len(cands) == 0 || cands[0].Model.ID != c.Model.ID {
-				cands = append(cands, c)
+			if !candidateSupportsProtocol(c, protocol, responsesConvert) {
+				protocolSkipped++
+				skips = append(skips, SkipReason{
+					ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+					Reason: skipNoResponses,
+				})
+				continue
+			}
+			addCand(c)
+		}
+		// 请求指定的模型全部不支持该协议时，改用其他支持该协议的模型（不跨协议硬发）。
+		// 仅当确有模型因协议被剔除才触发，避免掩盖「模型未配置/静音/超限」等真实原因。
+		if protocol == "responses" && !isAuto && len(cands) == 0 && protocolSkipped > 0 {
+			all, _ := s.store.CandidatesDetailed("", now, true)
+			for _, c := range all {
+				if candidateSupportsProtocol(c, protocol, responsesConvert) {
+					addCand(c)
+				}
 			}
 		}
 		if len(cands) == 0 {
 			msg := fmt.Sprintf("模型 %q 当前没有可用上游（未配置、处于静音时段、已达每日上限或并行已满）", req.Model)
-			if isAuto {
+			if protocol == "responses" && !responsesConvert && protocolSkipped > 0 {
+				msg = fmt.Sprintf("模型 %q 不支持 Responses 协议，且没有其他可用模型能承接该协议（可在设置中开启 Responses 协议转换，或改用 Chat Completions 入口）", req.Model)
+				if isAuto {
+					msg = "当前没有可用模型支持 Responses 协议（可在设置中开启 Responses 协议转换，或改用 Chat Completions 入口）"
+				}
+			} else if isAuto {
 				msg = "当前没有可用模型（全部未配置、处于静音时段、已达每日上限或并行已满）"
 			}
 			s.logFail(LogEntry{
@@ -344,6 +390,19 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 	}
 }
 
+// candidateSupportsProtocol 判断候选能否处理该接入协议。标准 OpenAI 兼容 Provider
+// 两种协议都原样透传；WorkBuddy 上游只有 chat completions，仅在开启 responses
+// 协议转换时才由适配层翻译承接 /v1/responses。
+func candidateSupportsProtocol(c Candidate, protocol string, responsesConvert bool) bool {
+	if protocol != "responses" {
+		return true
+	}
+	if e, _ := wbOf(c.Provider); e != nil {
+		return responsesConvert
+	}
+	return true
+}
+
 // buildSessionLog 生成会话日志：在基础字段上补选路理由、候选顺序与被剔除的原因。
 // 只在新建会话或会话中途换模型时调用，所以理由只有「新会话」「会话切换」两类。
 // skips 是选路规则的剔除项（静音/上限等），attemptSkips 是循环中实际尝试过但
@@ -366,6 +425,10 @@ func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, c
 	}
 	if len(attemptSkips) > 0 {
 		e.Reason += fmt.Sprintf("；前 %d 个候选尝试失败已降级（原因见已剔除）", len(attemptSkips))
+	}
+	// 指定模型全部不支持 responses 协议时已回落到其他模型，理由里要点明
+	if !isAuto && e.Requested != "" && chosen.Model.Name != e.Requested {
+		e.Reason += fmt.Sprintf("；请求的模型 %q 不支持该协议或无可用条目，已改用支持该协议的其他模型", e.Requested)
 	}
 
 	// 把「与选中项同优先级、但因并行已满而让位」的情况说清楚

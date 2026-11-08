@@ -49,6 +49,8 @@ func TestActiveSessionsListed(t *testing.T) {
 	// conv-a 两次 + conv-b 一次；最后活跃的是 conv-b（列表应排最前）
 	for _, sid := range []string{"conv-a", "conv-a", "conv-b"} {
 		postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm"}`, "X-Session-ID", sid)
+		// Windows 的时钟粒度约 1ms，连续请求可能取到相同的 LastAt 导致排序断言不稳定
+		time.Sleep(5 * time.Millisecond)
 	}
 	got := fetch()
 	if len(got) != 2 {

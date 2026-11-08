@@ -126,6 +126,11 @@ type Store struct {
 	Logs      []*LogEntry         `json:"logs,omitempty"`       // 异常/失败日志，最多 maxLogs 条
 	AutoModel string              `json:"auto_model,omitempty"` // 对外声明的自动模型名，空 = "auto"
 
+	// ResponsesConvert 是否允许把 /v1/responses 请求翻译成 chat/completions 出站。
+	// 默认关闭：仅支持 chat 的上游（WorkBuddy）不承接 responses 请求，路由会改选
+	// 其他原生支持 responses 的模型；开启后此类模型才参与 responses 路由（由适配层转换）。
+	ResponsesConvert bool `json:"responses_convert,omitempty"`
+
 	// inflight 各模型条目当前在途请求数，仅内存、不落盘（重启归零）。
 	// 键是模型条目 ID，这样同一模型名挂在多个 Provider 上时各自独立计数。
 	inflight map[string]int
@@ -521,6 +526,24 @@ func (s *Store) SetAutoModel(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.AutoModel = name
+	s.save()
+}
+
+// ResponsesConvertEnabled 是否允许 /v1/responses → chat/completions 协议转换（默认关闭）
+func (s *Store) ResponsesConvertEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ResponsesConvert
+}
+
+// SetResponsesConvert 切换 responses 协议转换开关
+func (s *Store) SetResponsesConvert(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ResponsesConvert == v {
+		return
+	}
+	s.ResponsesConvert = v
 	s.save()
 }
 

@@ -29,6 +29,8 @@ type StateView struct {
 	Balances  map[string]*Balance `json:"balances"`
 	Logs      []*LogEntry         `json:"logs"`
 	AutoModel string              `json:"auto_model"`
+	// ResponsesConvert responses 协议转换开关（默认关闭），设置页据此渲染
+	ResponsesConvert bool `json:"responses_convert"`
 }
 
 // SnapshotJSON 持锁快照并序列化，避免和后台编辑、用量记账竞态
@@ -61,6 +63,7 @@ func (s *Store) SnapshotJSON() []byte {
 	}
 	v.Usage = append(v.Usage, s.Usage...)
 	v.AutoModel = s.AutoModel // 已持锁，直接读；空值由前端按默认 auto 处理
+	v.ResponsesConvert = s.ResponsesConvert
 	sort.Slice(v.Usage, func(i, j int) bool {
 		a, b := v.Usage[i], v.Usage[j]
 		if a.Date != b.Date {
@@ -210,19 +213,26 @@ func (s *Server) handleModelUnmute(w http.ResponseWriter, r *http.Request) {
 	s.replyState(w, r)
 }
 
-// handleSettings 更新设置（目前只有 auto 虚拟模型名）
+// handleSettings 更新设置：auto 虚拟模型名、responses 协议转换开关。
+// 字段用指针，未提交的项保持原值（前端可以只改其中一项）。
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AutoModel string `json:"auto_model"`
+		AutoModel        *string `json:"auto_model"`
+		ResponsesConvert *bool   `json:"responses_convert"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	name := strings.TrimSpace(req.AutoModel)
-	if name == "" {
-		name = "auto"
+	if req.AutoModel != nil {
+		name := strings.TrimSpace(*req.AutoModel)
+		if name == "" {
+			name = "auto"
+		}
+		s.store.SetAutoModel(name)
 	}
-	s.store.SetAutoModel(name)
+	if req.ResponsesConvert != nil {
+		s.store.SetResponsesConvert(*req.ResponsesConvert)
+	}
 	s.replyState(w, r)
 }
 

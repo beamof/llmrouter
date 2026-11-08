@@ -545,6 +545,15 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
           </div>
 
           <div class="panel">
+            <div class="panel-head"><h3>Responses 协议转换</h3></div>
+            <p class="hint" style="margin:0 0 12px">WorkBuddy 上游只提供 Chat Completions。关闭时（默认），<code>/v1/responses</code> 只路由到原生支持 Responses 的模型，仅支持 chat 的模型会被跳过；请求的模型名只挂在这类模型上时，会自动改用其他支持 Responses 的模型。开启后，网关才允许把 Responses 请求翻译成 chat 发出，再把结果渲染回 Responses 形态。</p>
+            <div class="row-inline">
+              <label class="switch"><input id="resp-convert" type="checkbox" onchange="saveResponsesConvert(this.checked)"><i></i></label>
+              <span class="hint">允许 responses → chat completions 转换</span>
+            </div>
+          </div>
+
+          <div class="panel">
             <div class="panel-head"><h3>管理令牌</h3></div>
             <p class="hint" style="margin:0 0 12px">服务端以 <code>-admin-token</code> 或环境变量 <code>LLMROUTER_ADMIN_TOKEN</code> 启动后，访问后台需要令牌。令牌仅保存在本机浏览器。</p>
             <div class="row-inline">
@@ -665,7 +674,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
 <script>
 'use strict';
-let S = {providers: [], models: [], usage: [], balances: {}, api_keys: [], logs: []};
+let S = {providers: [], models: [], usage: [], balances: {}, api_keys: [], logs: [], responses_convert: false};
 let page = 'home', stab = 'models', range = 'today', detailMode = 'model';
 let logFilter = 'all', expandedLogs = new Set();
 let needAuth = false, authorized = false, authMessage = '', editingModel = null, editingProvider = null;
@@ -1381,6 +1390,18 @@ async function saveAutoName() {
   } catch (e) { alert(e.message); }
 }
 
+// 切换 responses → chat completions 协议转换（默认关闭）
+async function saveResponsesConvert(on) {
+  try {
+    S = await api('PUT', '/api/settings', {responses_convert: on});
+    renderAll();
+    toast(on ? '已开启 Responses 协议转换' : '已关闭 Responses 协议转换');
+  } catch (e) {
+    alert(e.message);
+    renderAll(); // 失败时回滚开关状态
+  }
+}
+
 async function move(id, dir) {
   const ids = sortedModels().map(m => m.id);
   const i = ids.indexOf(id), j = i + dir;
@@ -1749,6 +1770,7 @@ function renderGeneral() {
   $('ep-resp').textContent = origin + '/v1/responses';
   $('ep-models').textContent = origin + '/v1/models';
   if (document.activeElement !== $('auto-name')) $('auto-name').value = S.auto_model || 'auto';
+  $('resp-convert').checked = !!S.responses_convert;
   renderAuthState();
 }
 
