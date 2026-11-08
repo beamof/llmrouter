@@ -86,7 +86,11 @@ func (s *Server) wbBillingPost(p Provider, path string, body []byte) (map[string
 		return nil, err
 	}
 	req.Header = wbBillingHeader(cred)
-	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	cli, cerr := s.upstreamClient(p, 20*time.Second)
+	if cerr != nil {
+		return nil, cerr
+	}
+	resp, err := cli.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("计费请求失败: %v", err)
 	}

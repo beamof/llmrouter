@@ -46,6 +46,9 @@ type Server struct {
 	wbLocks map[string]*sync.Mutex // WorkBuddy 续期单飞锁（键 = provider ID），仅内存
 	wbCats  map[string]*wbCatalog  // WorkBuddy 模型目录缓存（键 = provider ID），仅内存
 
+	pxMu   sync.Mutex
+	pxTpts map[string]*http.Transport // 按代理地址缓存的 Transport（连接池共享），仅内存
+
 	failMu sync.Mutex
 	fails  map[string]*adminFail // 管理令牌失败计数，按来源 IP，仅内存
 }

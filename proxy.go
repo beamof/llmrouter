@@ -420,7 +420,23 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				})
 				continue
 			}
-			resp, err := s.client.Do(up)
+			cli, err := s.upstreamClient(c.Provider, 0)
+			if err != nil {
+				s.store.Release(c.Model.ID)
+				lastErr = fmt.Sprintf("%s: %v", c.Provider.Name, err)
+				failures = append(failures, lastErr)
+				attemptSkips = append(attemptSkips, SkipReason{
+					ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+					Reason: "尝试失败：" + truncateRunes(lastErr, 160),
+				})
+				s.logFail(LogEntry{
+					Level: "error", Kind: kindUpstream, KeyID: keyID,
+					ProviderID: c.Provider.ID, Model: c.Model.Name,
+					Message: "上游代理配置非法", Detail: err.Error(),
+				})
+				continue
+			}
+			resp, err := cli.Do(up)
 			if err != nil {
 				s.store.Release(c.Model.ID)
 				lastErr = fmt.Sprintf("%s: %v", c.Provider.Name, err)

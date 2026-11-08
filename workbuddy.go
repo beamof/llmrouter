@@ -711,13 +711,13 @@ func wbJSTruthy(v any) bool {
 // 排除名单。CLI 清单缺失或筛后为空视为目录无效（调用方退回内置兜底清单）。
 // 注意目录筛过不等于账号余额/权限/服务实时健康（上游 11102 = service info not
 // found 表示模型无服务配置，由错误分类按换候选处理）。
-func wbFetchCatalog(endpoint string, e *wbEdition, cred *WorkBuddyCred) (*wbCatalog, error) {
+func wbFetchCatalog(hc *http.Client, endpoint string, e *wbEdition, cred *WorkBuddyCred) (*wbCatalog, error) {
 	req, err := http.NewRequest(http.MethodGet, endpoint+"/v3/config", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header = wbFrameworkHeader(e, cred)
-	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -900,7 +900,11 @@ func (s *Server) wbCatalogFor(p Provider) *wbCatalog {
 	if wbUseCatalog(c) {
 		return c
 	}
-	nc, err := wbFetchCatalog(wbEndpoint(p), e, cred)
+	cli, err := s.upstreamClient(p, 20*time.Second)
+	if err != nil {
+		return wbBuiltinCatalog()
+	}
+	nc, err := wbFetchCatalog(cli, wbEndpoint(p), e, cred)
 	if err != nil || len(nc.IDs) == 0 {
 		nc = wbBuiltinCatalog()
 	}
@@ -979,7 +983,11 @@ func (s *Server) wbRefreshToken(p Provider, force bool) (*WorkBuddyCred, error) 
 	if !e.intl {
 		timeout = 8 * time.Second
 	}
-	resp, err := (&http.Client{Timeout: timeout}).Do(req)
+	cli, cerr := s.upstreamClient(cur, timeout)
+	if cerr != nil {
+		return nil, cerr
+	}
+	resp, err := cli.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("续期请求失败: %v", err)
 	}
@@ -1758,13 +1766,20 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 			Message: "构造 WorkBuddy 出站请求失败", Detail: err.Error()})
 		return err
 	}
+	cli, err := s.upstreamClient(c.Provider, 0)
+	if err != nil {
+		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
+			ProviderID: c.Provider.ID, Model: c.Model.Name,
+			Message: "上游代理配置非法", Detail: err.Error()})
+		return err
+	}
 	do := func() (*http.Response, error) {
 		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, wbEndpoint(c.Provider)+"/v2/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		req.Header = wbChatHeader(e, cred, wbEndpoint(c.Provider))
-		return s.client.Do(req)
+		return cli.Do(req)
 	}
 	// 懒续期：临期自动刷新，失败不阻断（沿用现有 token，上游报失效时再强制刷新）
 	if cred.RefreshToken != "" && wbTokenExpiring(cred.expires()) {

@@ -20,6 +20,7 @@ type Provider struct {
 	ResponsesURL string         `json:"responses_url,omitempty"` // responses 协议基址，空 = 同 BaseURL（如智谱两协议不同基址时分别填写）
 	APIKey       string         `json:"api_key,omitempty"`       // 上游密钥
 	BalanceURL   string         `json:"balance_url,omitempty"`   // 可选的余额查询地址（GET + 本密钥）
+	Proxy        string         `json:"proxy,omitempty"`         // 可选代理地址，支持 http(s):// 与 socks5(h)://；空 = 不代理（仍读环境变量）
 	Kind         string         `json:"kind,omitempty"`          // 上游类型：空 = 标准 OpenAI 兼容；"workbuddy" / "workbuddy-intl" = 复用 WorkBuddy 客户端登录态
 	WB           *WorkBuddyCred `json:"wb,omitempty"`            // WorkBuddy 凭证（Kind 为 workbuddy 系时使用，凭证明文存于状态文件）
 }

@@ -59,6 +59,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 - 请求体里的 `model` 字段用于路由（唯一的读取项），其余内容一概不碰
 - Provider 有两个基址：`Chat 基址`（chat completions）与 `Responses 基址`（responses 协议，留空则跟随 Chat 基址）。两种协议基址不同的厂商（如智谱 Coding Plan 没有 `/responses`，可单独填 `https://open.bigmodel.cn/api/v1`）一个 Provider 即可搞定
+- **每个 Provider 可单独配置网络代理**（`proxy` 字段）：支持 `http://`、`https://`、`socks5://`、`socks5h://`（socks5 由标准库实现，域名交由代理解析；裸写 `127.0.0.1:7890` 视为 http 代理，支持 `user:pass@host:port` 认证）。该 Provider 的所有出站请求——对话转发、模型列表、余额查询、WorkBuddy 续期/签到/目录——都走同一代理；留空 = 直连（仍读 `HTTP(S)_PROXY` 环境变量）。代理地址非法时请求直接失败，**不会绕过代理直连**
 - 候选 = 该名字的所有模型条目，剔除「当前时间处于静音时段」「今日 token 用量已达上限」「并行请求数已达上限」的，按优先级从大到小依次尝试
 - **协议匹配**：`/v1/responses` 只选择能处理 Responses 的模型——标准 Provider 两种协议都透传；WorkBuddy 上游仅支持 chat，默认跳过。若请求的模型名只挂在这类仅 chat 的模型上，会自动改用其他支持 Responses 的可用模型（不跨协议硬发）。在设置页开启 **Responses 协议转换** 后，WorkBuddy 才以「responses → chat」翻译方式参与 responses 路由
 - 上游返回**任何 4xx/5xx**（含 400/404/429 等）或网络错误时自动换下一个候选；全部失败时返回 502，并附上最后一个上游的状态码与错误详情。其中 **429 额外触发该模型静音 5 小时**（见下）

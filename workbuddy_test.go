@@ -1134,7 +1134,7 @@ func TestWBCatalogCLIScope(t *testing.T) {
 				fmt.Fprint(w, c.body)
 			}))
 			defer up.Close()
-			cat, err := wbFetchCatalog(up.URL, &wbCN, &WorkBuddyCred{UID: "u", AccessToken: "a"})
+			cat, err := wbFetchCatalog(&http.Client{Timeout: 5 * time.Second}, up.URL, &wbCN, &WorkBuddyCred{UID: "u", AccessToken: "a"})
 			if c.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 					t.Fatalf("应报错含 %q: %v", c.wantErr, err)

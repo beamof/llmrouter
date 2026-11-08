@@ -138,6 +138,12 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "base_url 不能为空")
 		return
 	}
+	proxyURL, err := normalizeProxy(p.Proxy)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "proxy 非法: "+err.Error())
+		return
+	}
+	p.Proxy = proxyURL // 存规范化后的地址（无 scheme 时补 http://）
 	s.store.UpsertProvider(&p)
 	s.replyState(w, r)
 }
@@ -313,7 +319,12 @@ func (s *Server) handleUpstreamModels(w http.ResponseWriter, r *http.Request) {
 	if p.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	}
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	cli, cerr := s.upstreamClient(p, 15*time.Second)
+	if cerr != nil {
+		writeErr(w, http.StatusBadRequest, cerr.Error())
+		return
+	}
+	resp, err := cli.Do(req)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "拉取上游模型列表失败: "+err.Error())
 		return
@@ -414,7 +425,12 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	}
 	start := time.Now()
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	cli, cerr := s.upstreamClient(p, 15*time.Second)
+	if cerr != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"level": "fail", "message": cerr.Error()})
+		return
+	}
+	resp, err := cli.Do(req)
 	res := map[string]any{"latency_ms": time.Since(start).Milliseconds()}
 	if err != nil {
 		res["level"] = "fail"
@@ -509,8 +525,10 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
 	}
 	b := &Balance{At: time.Now()}
-	client := &http.Client{Timeout: 15 * time.Second}
-	if resp, err := client.Do(req); err != nil {
+	cli, cerr := s.upstreamClient(p, 15*time.Second)
+	if cerr != nil {
+		b.Raw = cerr.Error()
+	} else if resp, err := cli.Do(req); err != nil {
 		b.Raw = err.Error()
 	} else {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -701,7 +719,7 @@ func (s *Server) handleWBImport(w http.ResponseWriter, r *http.Request) {
 	}
 	p := &Provider{Kind: req.Kind, BaseURL: e.endpoint + "/v2", WB: cred}
 	if old, ok := s.store.ProviderByWBUID(req.Kind, cred.UID); ok {
-		p.ID, p.Name = old.ID, old.Name // 原地更新（基址始终由地区端点派生）
+		p.ID, p.Name, p.Proxy = old.ID, old.Name, old.Proxy // 原地更新（基址始终由地区端点派生，代理配置沿用）
 	} else {
 		p.Name = strings.TrimSpace(req.Name)
 		if p.Name == "" {
@@ -815,7 +833,12 @@ func (s *Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 // 核对模型名是否在目录中，顺带把目录写进缓存
 func (s *Server) wbModelTest(w http.ResponseWriter, m Model, p Provider, e *wbEdition, cred *WorkBuddyCred) {
 	start := time.Now()
-	cat, err := wbFetchCatalog(wbEndpoint(p), e, cred)
+	cli, cerr := s.upstreamClient(p, 20*time.Second)
+	if cerr != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"level": "fail", "message": cerr.Error()})
+		return
+	}
+	cat, err := wbFetchCatalog(cli, wbEndpoint(p), e, cred)
 	res := map[string]any{"latency_ms": time.Since(start).Milliseconds()}
 	if err != nil {
 		res["level"] = "warn"
