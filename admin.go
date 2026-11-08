@@ -700,6 +700,74 @@ func (s *Server) handleWBRefresh(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleWBCheckin 手动签到（仅国内版；企业账号不做个人签到，改为刷新企业积分），
+// 无论哪条路径都顺带刷新一次余额快照。
+func (s *Server) handleWBCheckin(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.store.Provider(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "provider 不存在")
+		return
+	}
+	e, cred := wbOf(p)
+	if e == nil || cred == nil {
+		writeErr(w, http.StatusBadRequest, "该 provider 不是 WorkBuddy 类型")
+		return
+	}
+	if e.intl {
+		writeErr(w, http.StatusBadRequest, "国际版不支持签到")
+		return
+	}
+	res := map[string]any{}
+	if cred.EnterpriseID != "" {
+		res["message"] = "企业账号不支持个人签到，已刷新企业积分"
+	} else {
+		already, err := s.wbCheckin(p)
+		if err != nil {
+			s.logFail(LogEntry{Level: "warn", Kind: kindCheckin, ProviderID: p.ID,
+				Message: "WorkBuddy 手动签到失败", Detail: err.Error()})
+			writeErr(w, http.StatusBadGateway, "签到失败: "+err.Error())
+			return
+		}
+		res["already_checked_in"] = already
+		if already {
+			res["message"] = "今天已签到，请明天再来"
+		} else {
+			res["message"] = "签到成功"
+		}
+	}
+	if u, err := s.wbUserResource(p); err == nil {
+		res["usage"] = u
+	} else {
+		res["usage_error"] = err.Error()
+	}
+	s.logFail(LogEntry{Level: "info", Kind: kindCheckin, ProviderID: p.ID, Message: "WorkBuddy 手动签到：" + res["message"].(string)})
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleWBUsage 手动刷新 WorkBuddy 余额快照（个人资源包 / 企业积分）
+func (s *Server) handleWBUsage(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.store.Provider(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "provider 不存在")
+		return
+	}
+	if e, _ := wbOf(p); e == nil {
+		writeErr(w, http.StatusBadRequest, "该 provider 不是 WorkBuddy 类型")
+		return
+	}
+	u, err := s.wbUserResource(p)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "余额查询失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"usage": u})
+}
+
+// handleSessions 当前活跃的粘性会话列表（带 X-Session-ID 的客户端绑定；仅内存，重启即清）
+func (s *Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": s.activeSessions()})
+}
+
 // wbModelTest WorkBuddy 模型探测：GET /v3/config（daemon UA + 凭证），
 // 核对模型名是否在目录中，顺带把目录写进缓存
 func (s *Server) wbModelTest(w http.ResponseWriter, m Model, p Provider, e *wbEdition, cred *WorkBuddyCred) {

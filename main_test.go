@@ -940,7 +940,7 @@ func TestSessionExpiry(t *testing.T) {
 	if _, ok := s.getSession("k"); ok {
 		t.Error("过期会话应失效")
 	}
-	s.setSession("k", "m2")
+	s.setSession("k", "m2", "key-1", "glm")
 	if id, ok := s.getSession("k"); !ok || id != "m2" {
 		t.Error("会话应写入并可读取")
 	}

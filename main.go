@@ -62,11 +62,14 @@ func (s *Server) routes() *http.ServeMux {
 
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/state", s.replyState)
+	api.HandleFunc("GET /api/sessions", s.handleSessions)
 	api.HandleFunc("POST /api/providers", s.handleProviderUpsert)
 	api.HandleFunc("PUT /api/providers/{id}", s.handleProviderUpsert)
 	api.HandleFunc("DELETE /api/providers/{id}", s.handleProviderDelete)
 	api.HandleFunc("POST /api/providers/{id}/balance", s.handleBalance)
 	api.HandleFunc("POST /api/providers/{id}/wb-refresh", s.handleWBRefresh)
+	api.HandleFunc("POST /api/providers/{id}/wb-checkin", s.handleWBCheckin)
+	api.HandleFunc("POST /api/providers/{id}/wb-usage", s.handleWBUsage)
 	api.HandleFunc("GET /api/providers/{id}/models", s.handleUpstreamModels)
 	api.HandleFunc("POST /api/workbuddy/scan", s.handleWBScan)
 	api.HandleFunc("POST /api/workbuddy/import", s.handleWBImport)
@@ -274,6 +277,7 @@ func main() {
 	if !store.HasAPIKeys() && s.apiToken == "" {
 		log.Println("提示：未配置任何 API Key，代理入口不鉴权；可在后台 Keys 页生成")
 	}
+	go s.wbCheckinLoop() // WorkBuddy 国内版个人账号：每天 09:00/21:00 自动签到 + 余额快照
 	log.Printf("LLM Router 已启动：管理后台 http://%s | 代理入口 /v1/chat/completions /v1/responses /v1/models", *addr)
 	log.Fatal(http.ListenAndServe(*addr, s.routes()))
 }

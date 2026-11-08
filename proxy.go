@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,8 +32,13 @@ func (f flushWriter) Write(p []byte) (int, error) {
 // 会话粘性：客户端带 X-Session-ID 头时，同一会话绑定同一上游，
 // 仅当绑定上游失败（fallback）才按规则重新选择并重新绑定。仅存内存，重启即清。
 type session struct {
-	modelID string
-	expires time.Time
+	modelID   string    // 绑定的模型路由 ID
+	keyID     string    // 命中的客户端 Key（"env" = 环境变量令牌，空 = 免鉴权）
+	requested string    // 客户端请求的 model 名（auto 虚拟模型时与绑定值不同）
+	firstAt   time.Time // 首次绑定时刻
+	lastAt    time.Time // 最近一次成功请求时刻
+	count     int       // 会话内成功请求数
+	expires   time.Time
 }
 
 const sessionTTL = time.Hour
@@ -51,7 +57,7 @@ func (s *Server) getSession(key string) (string, bool) {
 	return sess.modelID, true
 }
 
-func (s *Server) setSession(key, modelID string) {
+func (s *Server) setSession(key, modelID, keyID, requested string) {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 	if s.sessions == nil {
@@ -65,13 +71,59 @@ func (s *Server) setSession(key, modelID string) {
 			}
 		}
 	}
-	s.sessions[key] = session{modelID: modelID, expires: time.Now().Add(sessionTTL)}
+	now := time.Now()
+	old := s.sessions[key]
+	sess := session{
+		modelID: modelID, keyID: keyID, requested: requested,
+		firstAt: old.firstAt, count: old.count + 1,
+		lastAt: now, expires: now.Add(sessionTTL),
+	}
+	if sess.firstAt.IsZero() {
+		sess.firstAt = now
+	}
+	s.sessions[key] = sess
 }
 
 func (s *Server) clearSession(key string) {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 	delete(s.sessions, key)
+}
+
+// sessionInfo 活跃会话的对外展示形状（GET /api/sessions）
+type sessionInfo struct {
+	ID        string    `json:"id"`
+	KeyID     string    `json:"key_id,omitempty"`
+	ModelID   string    `json:"model_id"`
+	Requested string    `json:"requested,omitempty"`
+	Count     int       `json:"count"`
+	FirstAt   time.Time `json:"first_at"`
+	LastAt    time.Time `json:"last_at"`
+	Expires   time.Time `json:"expires"`
+}
+
+// activeSessions 当前活跃（未过期）的会话绑定，按最近活跃倒序
+func (s *Server) activeSessions() []sessionInfo {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	now := time.Now()
+	out := make([]sessionInfo, 0, len(s.sessions))
+	for k, v := range s.sessions {
+		if now.After(v.expires) {
+			delete(s.sessions, k)
+			continue
+		}
+		id := k // 粘性键 = 会话ID\x00请求模型；展示用纯会话 ID（模型名单独在 requested）
+		if i := strings.IndexByte(k, 0x00); i >= 0 {
+			id = k[:i]
+		}
+		out = append(out, sessionInfo{
+			ID: id, KeyID: v.keyID, ModelID: v.modelID, Requested: v.requested,
+			Count: v.count, FirstAt: v.firstAt, LastAt: v.lastAt, Expires: v.expires,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LastAt.After(out[j].LastAt) })
+	return out
 }
 
 // handleProxy 生成 /chat/completions 与 /responses 共用的透传 handler。
@@ -161,7 +213,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			if sessKey == "" {
 				return
 			}
-			s.setSession(sessKey, c.Model.ID) // 成功即绑定/续期
+			s.setSession(sessKey, c.Model.ID, keyID, req.Model) // 成功即绑定/续期
 			// 只在「新建会话」或「会话内换模型」时记日志；同一会话复用绑定不重复记录
 			if boundID != c.Model.ID {
 				s.logSession(s.buildSessionLog(LogEntry{

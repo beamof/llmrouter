@@ -45,6 +45,7 @@ const (
 	kindAdminLocked = "admin_locked" // 后台令牌因连续错误被锁定
 	kindSession     = "session"      // 会话建立/切换绑定
 	kindMuted       = "muted"        // 上游 429，模型被自动静音
+	kindCheckin     = "checkin"      // WorkBuddy 签到/余额刷新结果
 )
 
 // logFail 记一条异常日志。detail 会截断，避免把大段上游响应塞进状态文件。

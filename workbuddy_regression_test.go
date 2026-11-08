@@ -146,8 +146,13 @@ func TestWBRefreshUsesNewTokenForCatalog(t *testing.T) {
 		fmt.Fprint(w, wbCatalogBody)
 	})
 	mux.HandleFunc("POST /v2/plugin/auth/token/refresh", func(w http.ResponseWriter, r *http.Request) {
+		// 续期专属头：refresh token 只出现在这里，且声明来源 plugin
+		if r.Header.Get("X-Refresh-Token") != "rt-old" || r.Header.Get("X-Auth-Refresh-Source") != "plugin" {
+			t.Errorf("续期请求头不对: X-Refresh-Token=%q X-Auth-Refresh-Source=%q",
+				r.Header.Get("X-Refresh-Token"), r.Header.Get("X-Auth-Refresh-Source"))
+		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"code":0,"data":{"accessToken":"at-new","refreshToken":"rt-new","expiresIn":3600}}`)
+		fmt.Fprint(w, `{"code":0,"data":{"accessToken":"at-new","refreshToken":"rt-new","expiresIn":3600,"domain":"www.codebuddy.cn"}}`)
 	})
 	up := httptest.NewServer(mux)
 	defer up.Close()
@@ -164,6 +169,10 @@ func TestWBRefreshUsesNewTokenForCatalog(t *testing.T) {
 	}
 	if len(catalogAuth) == 0 || catalogAuth[0] != "Bearer at-new" {
 		t.Fatalf("目录请求应使用新 token: %v", catalogAuth)
+	}
+	// 续期响应回写的 domain 应跟随更新
+	if np, ok := s.store.Provider(p.ID); !ok || np.WB == nil || np.WB.Domain != "www.codebuddy.cn" {
+		t.Fatalf("续期后 domain 应回写: %#v", np.WB)
 	}
 }
 
@@ -314,7 +323,7 @@ func TestWBProviderBaseURLForced(t *testing.T) {
 		t.Fatalf("创建失败: %d %s", resp.StatusCode, body)
 	}
 	p, _ := s.store.ProviderByWBUID("workbuddy", "u")
-	if p.BaseURL != "https://www.workbuddy.cn/v2" {
+	if p.BaseURL != "https://copilot.tencent.com/v2" {
 		t.Fatalf("基址应被强制为官方端点，实际 %q", p.BaseURL)
 	}
 }

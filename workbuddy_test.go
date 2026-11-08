@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -299,6 +300,28 @@ func TestWBReasoningNormalize(t *testing.T) {
 	msgs = m["messages"].([]any)
 	if _, ok := msgs[0].(map[string]any)["reasoning"]; ok {
 		t.Fatal("off 透传时不应回填")
+	}
+
+	// deepseek 无目录默认 → 官方 CLI 行为兜底 high + thinking.type=enabled
+	m = mk(`{"model":"deepseek-v4-pro","messages":[]}`)
+	wbReasoningNormalize(m, nil, "deepseek-v4-pro")
+	if m["reasoning_effort"] != "high" {
+		t.Fatalf("deepseek 无目录默认应兜底 high: %#v", m["reasoning_effort"])
+	}
+	if th, ok := m["thinking"].(map[string]any); !ok || th["type"] != "enabled" {
+		t.Fatalf("deepseek 兜底应补 thinking.type=enabled: %#v", m["thinking"])
+	}
+	// 非 deepseek 无目录默认 → 不注入档位
+	m = mk(`{"model":"glm-5.0","messages":[]}`)
+	wbReasoningNormalize(m, nil, "glm-5.0")
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatalf("非 deepseek 不应兜底档位: %#v", m["reasoning_effort"])
+	}
+	// deepseek 显式 off → 兜底不得覆盖
+	m = mk(`{"model":"deepseek-v4-pro","reasoning_effort":"off","messages":[]}`)
+	wbReasoningNormalize(m, nil, "deepseek-v4-pro")
+	if m["reasoning_effort"] != "off" {
+		t.Fatalf("显式 off 不应被兜底覆盖: %#v", m["reasoning_effort"])
 	}
 }
 
@@ -629,12 +652,16 @@ func TestWBParseInfoBytes(t *testing.T) {
 
 // ── 转发链路（伪造上游） ──────────────────────────────────────────────────
 
-const wbCatalogBody = `{"code":0,"data":{"models":[
+const wbCatalogBody = `{"code":0,"data":{
+	"agents":[{"name":"desktop","models":["completion-legacy"]},{"name":"cli","models":["GLM-5.0","deepseek-v4-flash","blocked-model","ghost-model"]}],
+	"availableModels":["GLM-5.0","deepseek-v4-flash","blocked-model","future-x"],
+	"models":[
 	{"id":"GLM-5.0","reasoning":{"supportedEfforts":["low","medium","high"],"defaultEffort":"medium"},"maxOutputTokens":48000},
 	{"id":"deepseek-v4-flash","reasoning":{"supportedEfforts":["low","high"],"defaultEffort":"high"},"maxOutputTokens":50000},
 	{"id":"completion-legacy","maxOutputTokens":48000},
 	{"id":"tiny-model","maxOutputTokens":8000},
-	{"id":"extra-model","maxOutputTokens":48000,"supportsExtra":true}
+	{"id":"extra-model","maxOutputTokens":48000,"supportsExtra":true},
+	{"id":"blocked-model","maxOutputTokens":48000,"disabled":true}
 ]}}`
 
 // wbFakeUpstream 起一个 WorkBuddy 形状的伪造上游；chat 决定 /v2/chat/completions 的行为
@@ -687,24 +714,40 @@ func TestWBChatHeadersAndBody(t *testing.T) {
 		t.Fatal("token 未临期不应刷新")
 	}
 
-	// 请求头形状
+	// 请求头形状（官方 CLI 指纹）
 	h := gotHeaders
 	for k, want := range map[string]string{
-		"Authorization":    "Bearer at-1",
-		"X-User-Id":        "uid-123456789",
-		"User-Agent":       wbCN.chatUA,
-		"X-IDE-Type":       "WorkBuddy",
-		"X-IDE-Version":    wbCN.chatIDEVersion,
-		"X-Product":        "SaaS",
-		"X-Agent-Runtime":  "local-agent",
-		"X-Private-Data":   "true",
-		"X-Requested-With": "XMLHttpRequest",
-		"Accept":           "text/event-stream",
-		"Content-Type":     "application/json",
-		"Accept-Encoding":  "identity",
+		"Authorization":       "Bearer at-1",
+		"X-User-Id":           "uid-123456789",
+		"User-Agent":          wbCLIUserAgent(),
+		"X-IDE-Type":          "CLI",
+		"X-IDE-Name":          "CLI",
+		"X-IDE-Version":       wbCLIVersion,
+		"X-CodeBuddy-Request": "1",
+		"X-Agent-Intent":      "craft",
+		"X-Product":           "SaaS",
+		"X-Requested-With":    "XMLHttpRequest",
+		"Accept":              "text/event-stream, application/json",
+		"Accept-Language":     "zh-CN",
+		"Content-Type":        "application/json",
+		"Accept-Encoding":     "identity",
 	} {
 		if h.Get(k) != want {
 			t.Fatalf("头 %s = %q, want %q", k, h.Get(k), want)
+		}
+	}
+	// Origin/Referer/X-Domain 跟随实际请求端点；refresh token 绝不上 chat
+	upu, _ := url.Parse(up.URL)
+	if h.Get("Origin") != up.URL || h.Get("Referer") != up.URL+"/" || h.Get("X-Domain") != upu.Hostname() {
+		t.Fatalf("Origin/Referer/X-Domain 应跟随端点 %s: %q %q %q",
+			up.URL, h.Get("Origin"), h.Get("Referer"), h.Get("X-Domain"))
+	}
+	if h.Get("X-Refresh-Token") != "" {
+		t.Fatal("chat 请求不应携带 X-Refresh-Token")
+	}
+	for _, k := range []string{"X-Agent-Purpose", "X-Agent-Type", "X-Private-Data", "X-Agent-Runtime"} {
+		if h.Get(k) != "" {
+			t.Fatalf("CLI 指纹不应携带桌面端头 %s", k)
 		}
 	}
 	if !regexp.MustCompile(`^00-[0-9a-f]{32}-[0-9a-f]{16}-01$`).MatchString(h.Get("traceparent")) {
@@ -1030,6 +1073,84 @@ func TestWBUpstreamModelsAndCatalogFallback(t *testing.T) {
 	}
 }
 
+// 目录算法对齐官方 cli 清单（agents.name=cli 驱动，非固定排除名单）
+func TestWBCatalogCLIScope(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		want    string // 逗号分隔的目录 ID；空 = 应报错
+		wantErr string // 期望的错误关键词
+	}{
+		{
+			name: "cli 渠道清单过滤 + 去重",
+			body: `{"code":0,"data":{"agents":[{"name":"other","models":["chat-model"]},{"name":"cli","models":["new-model","new-model","ghost"]}],
+				"models":[{"id":"glm-4.6"},{"id":"new-model"},{"id":"chat-model"}]}}`,
+			want: "new-model",
+		},
+		{
+			name: "availableModels 非空时取交集",
+			body: `{"code":0,"data":{"agents":[{"name":"cli","models":["new-model","canonical"]}],
+				"availableModels":["canonical","chat-model"],
+				"models":[{"id":"new-model"},{"id":"canonical"}]}}`,
+			want: "canonical",
+		},
+		{
+			name: "availableModels 为空不过滤",
+			body: `{"code":0,"data":{"agents":[{"name":"cli","models":["new-model"]}],
+				"availableModels":[],"models":[{"id":"new-model"}]}}`,
+			want: "new-model",
+		},
+		{
+			name:    "无 cli 渠道清单报错",
+			body:    `{"code":0,"data":{"agents":[{"name":"other","models":["new-model"]}],"models":[{"id":"new-model"}]}}`,
+			wantErr: "cli",
+		},
+		{
+			name:    "缺 agents 报错",
+			body:    `{"code":0,"data":{"models":[{"id":"new-model"}]}}`,
+			wantErr: "cli",
+		},
+		{
+			name: "历史嵌套形态 data.agent.agents 兼容",
+			body: `{"code":0,"data":{"agent":{"agents":[{"name":"cli","models":["new-model"]}]},"models":[{"id":"new-model"}]}}`,
+			want: "new-model",
+		},
+		{
+			name: "disabled 剔除，筛后为空报错",
+			body: `{"code":0,"data":{"agents":[{"name":"cli","models":["blocked"]}],
+				"models":[{"id":"blocked","disabled":true}]}}`,
+			wantErr: "没有可用模型",
+		},
+		{
+			name: "清单里没有定义的模型（无服务配置）不进目录",
+			body: `{"code":0,"data":{"agents":[{"name":"cli","models":["ghost"]}],
+				"models":[{"id":"new-model"}]}}`,
+			wantErr: "没有可用模型",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, c.body)
+			}))
+			defer up.Close()
+			cat, err := wbFetchCatalog(up.URL, &wbCN, &WorkBuddyCred{UID: "u", AccessToken: "a"})
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("应报错含 %q: %v", c.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("不应报错: %v", err)
+			}
+			if got := strings.Join(cat.IDs, ","); got != c.want {
+				t.Fatalf("目录 = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestWBImportEndpoint(t *testing.T) {
 	s, app := newTestServer(t)
 	// 导入：粘贴 raw JSON
@@ -1042,7 +1163,7 @@ func TestWBImportEndpoint(t *testing.T) {
 		t.Fatalf("应创建 1 个 provider: %d", len(s.store.Providers))
 	}
 	p := s.store.Providers[0]
-	if p.Kind != "workbuddy" || p.BaseURL != "https://www.workbuddy.cn/v2" || p.Name != "我的WB" ||
+	if p.Kind != "workbuddy" || p.BaseURL != "https://copilot.tencent.com/v2" || p.Name != "我的WB" ||
 		p.WB == nil || p.WB.AccessToken != "at-1" || p.WB.ExpiresAt == nil || !p.WB.ExpiresAt.Equal(time.UnixMilli(1893456000000)) {
 		t.Fatalf("导入的 provider 字段不对: %#v", p)
 	}
@@ -1054,7 +1175,7 @@ func TestWBImportEndpoint(t *testing.T) {
 	// 国际版端点
 	postJSON(t, app, "/api/workbuddy/import", `{"kind":"workbuddy-intl","cred":{"uid":"u2","access_token":"a2"}}`)
 	p2, _ := s.store.ProviderByWBUID("workbuddy-intl", "u2")
-	if p2.BaseURL != "https://www.workbuddy.ai/v2" {
+	if p2.BaseURL != "https://www.codebuddy.ai/v2" {
 		t.Fatalf("国际版端点不对: %s", p2.BaseURL)
 	}
 	// 非法 kind / 缺凭证

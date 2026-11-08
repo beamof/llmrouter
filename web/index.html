@@ -378,6 +378,19 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
         <div class="panel">
           <div class="panel-head">
+            <h3>活跃会话</h3>
+            <span class="hint" id="sess-sub"></span>
+          </div>
+          <div class="tbl-wrap">
+            <table>
+              <thead id="sess-head"></thead>
+              <tbody id="sess-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
             <h3>用量明细</h3>
             <div class="seg sm" id="detail-seg">
               <button data-detail="model" class="on">按模型</button>
@@ -780,14 +793,18 @@ async function clearToken() {
 
 async function load() {
   try {
-    const s = await api('GET', '/api/state');
-    S = s || {};
+    const [st, sess] = await Promise.all([
+      api('GET', '/api/state'),
+      api('GET', '/api/sessions').catch(() => ({})), // 会话列表失败不阻塞主状态
+    ]);
+    S = st || {};
     S.providers ||= [];
     S.models ||= [];
     S.usage ||= [];
     S.balances ||= {};
     S.api_keys ||= [];
     S.logs ||= [];
+    S.sessions = sess.sessions || [];
     needAuth = false;
     authorized = true; // 成功取到状态，说明当前令牌（或无需令牌）是有效的
     authMessage = '';
@@ -1039,7 +1056,53 @@ function renderHome() {
   renderStats(tot, ri.label, rows, byModel);
   renderChart(rows, ri);
   renderRanks(byProv, byKey, tot);
+  renderSessions();
   renderDetail(rows);
+}
+
+// 活跃会话面板：带 X-Session-ID 的粘性绑定，1 小时无请求自动解绑（仅内存，重启即清）
+function renderSessions() {
+  const head = $('sess-head'), body = $('sess-body');
+  head.innerHTML = `<tr><th>会话 ID</th><th>Key</th><th>请求模型</th><th>绑定模型</th><th>Provider</th>
+    <th class="num">请求</th><th>最近活跃</th><th>剩余</th></tr>`;
+  const list = S.sessions || [];
+  $('sess-sub').textContent = list.length
+    ? `${list.length} 个会话 · 1 小时无请求自动解绑 · 重启即清`
+    : '客户端带 X-Session-ID 头的粘性会话 · 仅内存，重启即清';
+  if (!list.length) {
+    body.innerHTML = `<tr><td colspan="8" class="empty">暂无活跃会话：客户端带 X-Session-ID 头请求成功后在此显示</td></tr>`;
+    return;
+  }
+  body.innerHTML = list.map(x => {
+    const m = S.models.find(mm => mm.id === x.model_id);
+    const bound = m ? m.name : x.model_id;
+    const prov = m ? pname(m.provider_id) : '—';
+    const short = x.id.length > 20 ? x.id.slice(0, 10) + '…' + x.id.slice(-6) : x.id;
+    const switched = x.requested && x.requested !== bound;
+    return `<tr>
+      <td class="mono" title="${esc(x.id)}">${esc(short)}</td>
+      <td>${esc(keyName(x.key_id))}</td>
+      <td class="mono">${x.requested ? esc(x.requested) : '<span class="hint">—</span>'}</td>
+      <td class="mono"><b>${esc(bound)}</b>${switched ? ' <span class="hint">(auto)</span>' : ''}</td>
+      <td>${esc(prov)}</td>
+      <td class="num">${fmtN(x.count)}</td>
+      <td title="${new Date(x.last_at).toLocaleString()}">${agoText(x.last_at)}</td>
+      <td>${untilText(x.expires)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function agoText(t) {
+  const s = Math.max(0, (Date.now() - new Date(t).getTime()) / 1000);
+  if (s < 60) return '刚刚';
+  if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
+  return Math.floor(s / 3600) + ' 小时前';
+}
+
+function untilText(t) {
+  const s = Math.max(0, (new Date(t).getTime() - Date.now()) / 1000);
+  if (s < 60) return Math.floor(s) + ' 秒';
+  return Math.floor(s / 60) + ' 分钟';
 }
 
 function renderStats(tot, label, rows, byModel) {
@@ -1443,7 +1506,8 @@ function renderProviders() {
       keyCell = esc(maskKey(p.api_key));
     }
     const balCell = isWB
-      ? '<span class="hint">按 token 计费，用量见「用量」页</span>'
+      ? `${wbBalanceHTML(p)}<button class="btn mini" onclick="wbUsageNow('${p.id}')" style="margin-top:4px">查余额</button>` +
+        (p.kind === 'workbuddy' && !p.wb?.enterprise_id ? ` <button class="btn mini" onclick="wbCheckinNow('${p.id}')">签到</button>` : '')
       : `${balanceHTML(p)}<button class="btn mini" onclick="queryBalance('${p.id}')" style="margin-top:4px">查询余额</button>`;
     return `<tr>
       <td><b>${esc(p.name)}</b>${isWB ? `<div class="cell-sub">WorkBuddy ${esc(p.kind === 'workbuddy' ? '国内版' : '国际版')}</div>` : ''}</td>
@@ -1459,7 +1523,7 @@ function renderProviders() {
 }
 
 /* ---------- WorkBuddy 凭证 ---------- */
-const WB_ENDPOINTS = {'workbuddy': 'https://www.workbuddy.cn/v2', 'workbuddy-intl': 'https://www.workbuddy.ai/v2'};
+const WB_ENDPOINTS = {'workbuddy': 'https://copilot.tencent.com/v2', 'workbuddy-intl': 'https://www.codebuddy.ai/v2'};
 let wbCred = null; // 当前弹窗持有的凭证（编辑时来自 provider，重新导入后覆盖）
 let wbHits = [];
 
@@ -1476,8 +1540,30 @@ function wbRenderStatus() {
   const el = $('p-wbstatus');
   if (!wbCred) { el.innerHTML = '尚未持有凭证——扫描或粘贴导入后自动创建/更新 Provider（保存按钮只改名称等基本信息）'; return; }
   const exp = wbCred.expires_at ? new Date(wbCred.expires_at) : null;
-  el.innerHTML = `已持有凭证：<b>${esc(wbCred.nickname || wbCred.uid)}</b> · ${exp ? 'token 到期 ' + exp.toLocaleString() : 'token 到期未知'}` +
-    (editingProvider ? ` <button class="btn mini" onclick="wbRefreshNow('${editingProvider.id}')">立即续期</button>` : '');
+  let html = `已持有凭证：<b>${esc(wbCred.nickname || wbCred.uid)}</b> · ${exp ? 'token 到期 ' + exp.toLocaleString() : 'token 到期未知'}`;
+  if (wbCred.usage) html += ' · ' + wbUsageInline(wbCred.usage);
+  if (editingProvider) {
+    html += ` <button class="btn mini" onclick="wbRefreshNow('${editingProvider.id}')">立即续期</button>`;
+    if ($('p-kind').value === 'workbuddy' && !wbCred.enterprise_id)
+      html += ` <button class="btn mini" onclick="wbCheckinNow('${editingProvider.id}')">签到</button>`;
+    html += ` <button class="btn mini" onclick="wbUsageNow('${editingProvider.id}')">查余额</button>`;
+  }
+  el.innerHTML = html;
+}
+
+// WorkBuddy 余额快照的一行文案（不限量 / 缺总额 / 正常三态）
+function wbUsageInline(u) {
+  if (!u) return '';
+  if (u.unlimited) return `企业积分已用 ${Number(u.used || 0).toLocaleString()}（不限量）`;
+  if (u.total == null) return `剩余 ${Number(u.remain || 0).toLocaleString()}（总额未知）`;
+  return `剩余 ${Number(u.remain || 0).toLocaleString()} / ${Number(u.total).toLocaleString()}`;
+}
+
+function wbBalanceHTML(p) {
+  const u = p.wb && p.wb.usage;
+  if (!u) return '<span class="hint">按 token 计费，余额未查询</span>';
+  const t = u.checked_at ? new Date(u.checked_at).toLocaleString() : '';
+  return `<div>${esc(wbUsageInline(u))}</div><div class="cell-sub">${t} 查询</div>`;
 }
 
 async function wbScanRun() {
@@ -1522,6 +1608,26 @@ async function wbRefreshNow(id) {
   try {
     const res = await api('POST', `/api/providers/${id}/wb-refresh`);
     toast(`已续期，token 到期 ${res.expires_at ? new Date(res.expires_at).toLocaleString() : '未知'}；目录 ${res.models} 个模型${res.remote ? '' : '（内置兜底）'}`);
+    await load();
+    wbCred = (S.providers.find(p => p.id === id) || {}).wb || wbCred;
+    wbRenderStatus();
+  } catch (e) { alert(e.message); }
+}
+
+async function wbCheckinNow(id) {
+  try {
+    const res = await api('POST', `/api/providers/${id}/wb-checkin`);
+    toast(res.message || '已完成');
+    await load();
+    wbCred = (S.providers.find(p => p.id === id) || {}).wb || wbCred;
+    wbRenderStatus();
+  } catch (e) { alert(e.message); }
+}
+
+async function wbUsageNow(id) {
+  try {
+    await api('POST', `/api/providers/${id}/wb-usage`);
+    toast('余额已刷新');
     await load();
     wbCred = (S.providers.find(p => p.id === id) || {}).wb || wbCred;
     wbRenderStatus();
@@ -1656,6 +1762,16 @@ renderStabAction();
 renderAuthState();
 go('home');
 load();
+
+// 用量页可见时的轻量自动刷新：只拉会话列表，不动整页状态
+setInterval(async () => {
+  if (page !== 'home' || document.hidden) return;
+  try {
+    const r = await api('GET', '/api/sessions');
+    S.sessions = r.sessions || [];
+    renderSessions();
+  } catch (e) { /* 静默：鉴权问题由 load()/api() 统一处理 */ }
+}, 30000);
 </script>
 </body>
 </html>

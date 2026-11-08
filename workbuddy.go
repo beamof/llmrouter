@@ -2,12 +2,15 @@ package main
 
 // ─────────────────────────── WorkBuddy 上游适配 ───────────────────────────
 //
-// 移植自 Agent2Providers（AGPL-3.0）的 workbuddy 适配器：请求头、出站归一化、推理档位、
-// 模型目录、token 续期与错误分类的行为与其对齐。两个与透传不同的要点：
+// 最初移植自 Agent2Providers（AGPL-3.0）的 workbuddy 适配器，出站归一化、推理档位、
+// token 续期与错误分类沿用其行为；请求头族、模型目录算法与默认系统提示词已对齐
+// 官方 CLI（@tencent-ai/codebuddy-code）契约，参照 ccLoad internal/codebuddyauth
+// 的实现与 UPSTREAM.md 协议说明。三个与透传不同的要点：
 //   · 上游 /v2/chat/completions 只支持流式（stream:false 返回 code 11101），出站一律
 //     强制 stream:true，非流式客户端由本网关把 SSE 聚合成 chat.completion；
 //   · 上游会在正文分片之间插入「整片只有换行」的节拍分片（实测约占三分之一），
-//     透传时按帧过滤，聚合时同样先过滤再聚合。
+//     透传时按帧过滤，聚合时同样先过滤再聚合；
+//   · 对话接口要求 messages[0].role 为 system，缺失时注入官方 CLI 默认提示词。
 
 import (
 	"bytes"
@@ -20,37 +23,43 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// wbEdition WorkBuddy 的地区身份：两端协议一致，差别只有端点与客户端身份字符串
+// wbCLIVersion 对齐官方 @tencent-ai/codebuddy-code 的版本（ccLoad 同步使用）。
+// UA 与 X-IDE-Version 共用同一值，避免指纹内部漂移。
+const wbCLIVersion = "2.162.0"
+
+// wbCLIUserAgent 官方 CLI 形态的 User-Agent。上游据 UA 的 CLI 段识别 CLI 渠道：
+// 目录接口不带时只返回旧版模型清单。
+func wbCLIUserAgent() string { return "CLI/" + wbCLIVersion + " CodeBuddy/" + wbCLIVersion }
+
+// wbEdition WorkBuddy/CodeBuddy 的地区身份：两端协议一致，差别只有端点与语言。
+// 产品已由 WorkBuddy 更名 CodeBuddy：国内版控制面端点为 copilot.tencent.com
+// （历史 www.workbuddy.cn 仍在线，存量 provider 的基址不动、继续可用），
+// 国际版为 www.codebuddy.ai（历史 www.workbuddy.ai 同站，仍可服务）。
 type wbEdition struct {
-	id             string // "cn" / "intl"
-	label          string
-	endpoint       string
-	platform       string // auth/state?platform= 的取值
-	chatUA         string // /v2/chat/completions 的 User-Agent
-	daemonUA       string // 目录/续期等框架请求的 User-Agent（daemon 形态，产品段在前）
-	chatIDEVersion string // X-IDE-Version
-	intl           bool
+	id        string // "cn" / "intl"
+	label     string
+	endpoint  string
+	webOrigin string // 目录/续期等控制面请求的 Origin/Referer（官方 web 控制台域名）
+	lang      string // Accept-Language
+	intl      bool
 }
 
 var (
 	wbCN = wbEdition{
-		id: "cn", label: "国内版", endpoint: "https://www.workbuddy.cn", platform: "workbuddy",
-		chatUA:         "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0",
-		daemonUA:       "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0",
-		chatIDEVersion: "5.9.3",
+		id: "cn", label: "国内版", endpoint: "https://copilot.tencent.com",
+		webOrigin: "https://www.codebuddy.cn", lang: "zh-CN",
 	}
 	wbIntl = wbEdition{
-		id: "intl", label: "国际版", endpoint: "https://www.workbuddy.ai", platform: "workbuddy-ai",
-		chatUA:         "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0",
-		daemonUA:       "workbuddy-ai/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0",
-		chatIDEVersion: "5.8.4",
-		intl:           true,
+		id: "intl", label: "国际版", endpoint: "https://www.codebuddy.ai",
+		webOrigin: "https://www.codebuddy.ai", lang: "en-US",
+		intl: true,
 	}
 )
 
@@ -126,63 +135,75 @@ func wbAuthHeaders(h http.Header, cred *WorkBuddyCred) {
 	}
 }
 
-// wbChatHeader 构造 POST /v2/chat/completions 的完整请求头：客户端身份（静态）+
-// 追踪（每请求随机）+ 鉴权。不转发客户端任何头。
-func wbChatHeader(e *wbEdition, cred *WorkBuddyCred) http.Header {
+// wbChatHeader 构造 POST /v2/chat/completions 的完整请求头，对齐官方 CLI 的会话
+// 指纹（参照 ccLoad EnsureChatFingerprint）。要点：Origin/Referer/X-Domain 跟随
+// 实际请求端点，X-Domain 不取凭证 domain（凭证 domain 只用于控制面请求）。
+// 不转发客户端任何头。
+func wbChatHeader(e *wbEdition, cred *WorkBuddyCred, endpoint string) http.Header {
 	reqID, msgID := wbMessageID(), wbMessageID()
 	traceID, spanID := wbMessageID(), wbSpanID()
+	origin, host := endpoint, ""
+	if u, err := url.Parse(strings.TrimRight(endpoint, "/")); err == nil && u.Host != "" {
+		origin, host = u.Scheme+"://"+u.Host, u.Hostname()
+	}
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
-	h.Set("User-Agent", e.chatUA)
-	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Name", "WorkBuddy")
-	h.Set("X-IDE-Version", e.chatIDEVersion)
-	h.Set("X-Product", "SaaS")
+	h.Set("Accept", "text/event-stream, application/json")
+	h.Set("Accept-Language", e.lang)
+	h.Set("Accept-Encoding", "identity") // 不让 transport 透明加 gzip，SSE 过滤按明文字节处理
+	h.Set("User-Agent", wbCLIUserAgent())
+	h.Set("X-CodeBuddy-Request", "1")
 	h.Set("X-Agent-Intent", "craft")
-	h.Set("X-Agent-Purpose", "conversation")
-	h.Set("X-Agent-Type", "main")
-	h.Set("X-Private-Data", "true")
+	h.Set("X-IDE-Type", "CLI")
+	h.Set("X-IDE-Name", "CLI")
+	h.Set("X-IDE-Version", wbCLIVersion)
+	h.Set("X-Product", "SaaS")
+	h.Set("X-Requested-With", "XMLHttpRequest")
+	h.Set("Origin", origin)
+	h.Set("Referer", origin+"/")
 	h.Set("X-Conversation-ID", wbConversationID())
 	h.Set("X-Conversation-Request-ID", reqID)
 	h.Set("X-Root-Request-ID", reqID)
 	h.Set("X-Conversation-Message-ID", msgID)
 	h.Set("X-Request-ID", msgID)
+	// 追踪族（W3C traceparent / b3）：官方客户端亦携带，保持每请求随机
 	h.Set("X-Trace-ID", traceID)
 	h.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
 	h.Set("b3", traceID+"-"+spanID+"-1")
 	h.Set("X-B3-TraceId", traceID)
 	h.Set("X-B3-SpanId", spanID)
 	h.Set("X-B3-Sampled", "1")
-	h.Set("X-Requested-With", "XMLHttpRequest")
-	if !e.intl {
-		h.Set("X-Agent-Runtime", "local-agent")
-	}
 	wbAuthHeaders(h, cred)
-	if e.intl {
-		h.Set("X-Domain", "www.workbuddy.ai") // 国际版固定本站域名
+	if host != "" {
+		h.Set("X-Domain", host)
 	}
-	h.Set("Accept", "text/event-stream")
-	h.Set("Accept-Encoding", "identity") // 不让 transport 透明加 gzip，SSE 过滤按明文字节处理
 	return h
 }
 
-// wbFrameworkHeader 续期/目录等框架请求的头。UA 必须带 CLI 段：上游据它识别桌面-CLI
-// 渠道，不带时 /v3/config 只返回旧版模型清单。
+// wbFrameworkHeader 续期/目录等控制面请求的头，对齐官方 CLI 的来源指纹：
+// UA 带 CLI 段（上游据它识别 CLI 渠道，不带时 /v3/config 只返回旧版模型清单），
+// Origin/Referer 用官方 web 控制台域名（国内版 codebuddy.cn，国际版跟随端点）。
 func wbFrameworkHeader(e *wbEdition, cred *WorkBuddyCred) http.Header {
 	h := http.Header{}
 	h.Set("Accept", "application/json, text/plain, */*")
+	h.Set("Accept-Language", e.lang)
+	h.Set("Content-Type", "application/json")
 	h.Set("X-Requested-With", "XMLHttpRequest")
 	h.Set("X-Request-ID", wbMessageID())
 	h.Set("X-Product", "SaaS")
-	h.Set("User-Agent", e.daemonUA)
+	h.Set("X-CodeBuddy-Request", "1")
+	h.Set("User-Agent", wbCLIUserAgent())
+	h.Set("Origin", e.webOrigin)
+	h.Set("Referer", e.webOrigin+"/")
 	wbAuthHeaders(h, cred)
 	return h
 }
 
 // ── 出站归一化 ────────────────────────────────────────────────────────────
 
-// wbDefaultSystemPrompt 上游要求首条消息是 system，缺失时注入的兜底提示词
-const wbDefaultSystemPrompt = "你是一个得力助手"
+// wbDefaultSystemPrompt 上游要求首条消息是 system，缺失时注入的官方 CLI 默认提示词
+// （@tencent-ai/codebuddy-code 出站最终化阶段补入的原句，照抄含原始排版）
+const wbDefaultSystemPrompt = "You are CodeBuddy Code.You are an interactive CLI tool that helps users with software engineering tasks."
 
 func wbMessages(body map[string]any) []any {
 	msgs, _ := body["messages"].([]any)
@@ -533,6 +554,13 @@ func wbReasoningNormalize(body map[string]any, m *wbModelMeta, modelID string) {
 			m.Default != "" && !wbIsOff(m.Default) {
 			body["reasoning_effort"] = m.Default
 		}
+		// deepseek 系无目录默认时按官方 CLI 行为落 high（客户端未声明 thinking
+		// 即开启思考）；显式 off/已有档位不受影响
+		if isDeepSeek {
+			if s, _ := body["reasoning_effort"].(string); s == "" {
+				body["reasoning_effort"] = "high"
+			}
+		}
 	}
 	final, _ := body["reasoning_effort"].(string)
 	if final != "" && !wbIsOff(final) {
@@ -635,13 +663,14 @@ var wbBuiltinIDs = []string{
 	"default-1.1", "default-1.2",
 }
 
-// wbExcludedPrefixes 目录准入过滤：这些前缀的模型不对外提供
+// wbExcludedPrefixes 内置兜底清单的准入过滤：这些前缀的模型不对外提供。
+// （仅用于内置清单；远端目录改由 data.agents 的 cli 清单驱动，见 wbFetchCatalog）
 var wbExcludedPrefixes = []string{
 	"completion-", "codewise-", "hunyuan-image", "hunyuan-3b", "hunyuan-7b",
 	"deepseek-r1-0528", "deepseek-v3-0324", "kimi-k2-instruct", "default-1.",
 }
 
-// wbAdmitModel 远端目录的准入过滤（适配器 is_chat_model 的移植）：
+// wbAdmitModel 内置兜底清单的准入过滤（适配器 is_chat_model 的移植）：
 // 排除前缀、supportsExtra 为 JS 真值、maxOutputTokens 缺失或 <16000 的都不要。
 func wbAdmitModel(id string, m map[string]any) bool {
 	for _, p := range wbExcludedPrefixes {
@@ -675,7 +704,13 @@ func wbJSTruthy(v any) bool {
 	}
 }
 
-// wbFetchCatalog 拉取远端目录：GET {endpoint}/v3/config
+// wbFetchCatalog 拉取远端目录：GET {endpoint}/v3/config。目录算法对齐官方 CLI
+// （CloudProductManagerImpl 契约，参照 ccLoad FetchModels）：data.models 只是模型
+// 定义总目录，可调用清单以 data.agents 里 name=="cli" 的 models 为准——与定义按
+// 完整 ID 匹配，disabled:true 剔除，非空 availableModels 取交集，去重。不维护固定
+// 排除名单。CLI 清单缺失或筛后为空视为目录无效（调用方退回内置兜底清单）。
+// 注意目录筛过不等于账号余额/权限/服务实时健康（上游 11102 = service info not
+// found 表示模型无服务配置，由错误分类按换候选处理）。
 func wbFetchCatalog(endpoint string, e *wbEdition, cred *WorkBuddyCred) (*wbCatalog, error) {
 	req, err := http.NewRequest(http.MethodGet, endpoint+"/v3/config", nil)
 	if err != nil {
@@ -702,6 +737,15 @@ func wbFetchCatalog(endpoint string, e *wbEdition, cred *WorkBuddyCred) (*wbCata
 	if v.Code != nil && *v.Code != 0 {
 		return nil, fmt.Errorf("目录接口返回 code %v: %s", *v.Code, v.Message)
 	}
+	cliList := wbCLIModelSet(v.Data)
+	if len(cliList) == 0 {
+		return nil, fmt.Errorf("目录缺少 cli 渠道模型清单（agents.name=cli），可能是账号未授权 CLI 渠道")
+	}
+	cli := make(map[string]bool, len(cliList))
+	for _, id := range cliList {
+		cli[id] = true
+	}
+	avail := wbStringSet(v.Data["availableModels"])
 	cat := &wbCatalog{Meta: map[string]*wbModelMeta{}, Remote: true, At: time.Now()}
 	models, _ := v.Data["models"].([]any)
 	for _, mm := range models {
@@ -710,21 +754,91 @@ func wbFetchCatalog(endpoint string, e *wbEdition, cred *WorkBuddyCred) (*wbCata
 			continue
 		}
 		id, _ := m["id"].(string)
-		id = strings.ToLower(strings.TrimSpace(id))
-		if id == "" || !wbAdmitModel(id, m) {
+		id = strings.TrimSpace(id)
+		if id == "" {
 			continue
 		}
-		if _, dup := cat.Meta[id]; dup {
+		key := strings.ToLower(id)
+		if !cli[key] {
+			continue // 不在 cli 可调用清单
+		}
+		if b, ok := m["disabled"].(bool); ok && b {
 			continue
 		}
-		cat.Meta[id] = wbMetaFromModel(m)
-		cat.IDs = append(cat.IDs, id)
+		if len(avail) > 0 && !avail[key] {
+			continue // 账号 availableModels 未开放
+		}
+		if _, dup := cat.Meta[key]; dup {
+			continue
+		}
+		cat.Meta[key] = wbMetaFromModel(m)
+		cat.IDs = append(cat.IDs, key)
+	}
+	if len(cat.IDs) == 0 {
+		return nil, fmt.Errorf("目录筛后没有可用模型（cli 清单 %d 个），可能是账号未授权", len(cli))
 	}
 	return cat, nil
 }
 
+// wbAgentCLIModels 从 agents 数组里取 name=="cli" 条目的 models（去空白、小写）
+func wbAgentCLIModels(agents []any) []string {
+	for _, a := range agents {
+		am, ok := a.(map[string]any)
+		if !ok {
+			continue
+		}
+		if n, _ := am["name"].(string); !strings.EqualFold(strings.TrimSpace(n), "cli") {
+			continue
+		}
+		ms, _ := am["models"].([]any)
+		out := make([]string, 0, len(ms))
+		for _, m := range ms {
+			if s, ok := m.(string); ok {
+				if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// wbCLIModelSet 目录数据里的 CLI 可调用模型清单：data.agents[].name=="cli" 的
+// models；兼容历史嵌套形态 data.agent.agents（未认证响应里出现过）。
+func wbCLIModelSet(data map[string]any) []string {
+	if agents, ok := data["agents"].([]any); ok {
+		if l := wbAgentCLIModels(agents); len(l) > 0 {
+			return l
+		}
+	}
+	if agent, ok := data["agent"].(map[string]any); ok {
+		if agents, ok := agent["agents"].([]any); ok {
+			return wbAgentCLIModels(agents)
+		}
+	}
+	return nil
+}
+
+// wbStringSet 任意 JSON 数组转小写字符串集合（availableModels 用）
+func wbStringSet(v any) map[string]bool {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	set := make(map[string]bool, len(arr))
+	for _, x := range arr {
+		if s, ok := x.(string); ok {
+			if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+				set[s] = true
+			}
+		}
+	}
+	return set
+}
+
 // wbBuiltinCatalog 内置兜底目录（无推理元数据，档位字段将原样透传）。
-// 内置清单与远端目录走同一套准入过滤。
+// 内置清单自带准入过滤（wbAdmitModel）；远端目录不走该过滤，由 cli 清单驱动。
 func wbBuiltinCatalog() *wbCatalog {
 	cat := &wbCatalog{Meta: map[string]*wbModelMeta{}, At: time.Now()}
 	for _, id := range wbBuiltinIDs {
@@ -859,8 +973,8 @@ func (s *Server) wbRefreshToken(p Provider, force bool) (*WorkBuddyCred, error) 
 		return nil, err
 	}
 	req.Header = wbFrameworkHeader(e, cred)
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Refresh-Token", cred.RefreshToken)
+	req.Header.Set("X-Auth-Refresh-Source", "plugin")
 	timeout := 30 * time.Second
 	if !e.intl {
 		timeout = 8 * time.Second
@@ -896,6 +1010,9 @@ func (s *Server) wbRefreshToken(p Provider, force bool) (*WorkBuddyCred, error) 
 	}
 	if rt, _ := v.Data["refreshToken"].(string); rt != "" {
 		nc.RefreshToken = rt
+	}
+	if d, _ := v.Data["domain"].(string); d != "" {
+		nc.Domain = d // 官方续期响应会回 domain，跟随更新（仅控制面请求使用）
 	}
 	nc.ExpiresAt = wbTimePtr(wbExpiryOf(v.Data, cred.expires(), "expiresAt", "expiresIn"))
 	nc.RefreshExpiresAt = wbTimePtr(wbExpiryOf(v.Data, cred.refreshExpires(), "refreshExpiresAt", "refreshExpiresIn"))
@@ -1187,21 +1304,22 @@ func wbIsSpaceByte(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b
 // ── SSE 节拍过滤与非流式聚合 ──────────────────────────────────────────────
 
 // wbSSEFilter 上游 SSE 的流式整形，按帧（空行分隔）处理：
-//   · 「整片只有换行」的 content 分片是上游插在正文之间的节拍，整帧丢弃——
-//     模型真实输出的纯换行分片与节拍无法区分，也会被丢，与适配器行为一致；
-//   · 思考流被上游拆成「一个分片一个 token」、中间夹纯空白的节拍分片，直接
-//     透传会让按分片渲染思考的客户端（ZCode 等）一词一行刷屏——纯 reasoning
-//     增量帧全部进缓冲，等思考结束（首个带 data 载荷的非 reasoning 帧：正文/
-//     工具调用/收尾/用量，或流结束）再合成一个分片一次性放行，保证同一段思考
-//     在客户端只出现一个思考条目。持有期间定期发 SSE 注释行（: keepalive）保活
-//     连接——注释行不产生事件，客户端渲染不受影响。上游中途的心跳注释帧同样
-//     透传、不打断持有。其余字节原样放行。
+//
+//	· 「整片只有换行」的 content 分片是上游插在正文之间的节拍，整帧丢弃——
+//	  模型真实输出的纯换行分片与节拍无法区分，也会被丢，与适配器行为一致；
+//	· 思考流被上游拆成「一个分片一个 token」、中间夹纯空白的节拍分片，直接
+//	  透传会让按分片渲染思考的客户端（ZCode 等）一词一行刷屏——纯 reasoning
+//	  增量帧全部进缓冲，等思考结束（首个带 data 载荷的非 reasoning 帧：正文/
+//	  工具调用/收尾/用量，或流结束）再合成一个分片一次性放行，保证同一段思考
+//	  在客户端只出现一个思考条目。持有期间定期发 SSE 注释行（: keepalive）保活
+//	  连接——注释行不产生事件，客户端渲染不受影响。上游中途的心跳注释帧同样
+//	  透传、不打断持有。其余字节原样放行。
 type wbSSEFilter struct {
-	r    io.Reader
-	buf  []byte // 已读入、待切帧
-	out  []byte // 已放行、待交付
-	eof  bool
-	err  error // 底层读错误：残余帧交付完后返回，避免中途断流被当成正常结束
+	r   io.Reader
+	buf []byte // 已读入、待切帧
+	out []byte // 已放行、待交付
+	eof bool
+	err error // 底层读错误：残余帧交付完后返回，避免中途断流被当成正常结束
 
 	rsBuf  []byte    // 合并中的 reasoning 增量文本
 	rsTmpl []byte    // 合成帧的 data 载荷模板（沿用首个 reasoning 帧的其余字段）
@@ -1669,7 +1787,7 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 		if err != nil {
 			return nil, err
 		}
-		req.Header = wbChatHeader(e, cred)
+		req.Header = wbChatHeader(e, cred, wbEndpoint(c.Provider))
 		return s.client.Do(req)
 	}
 	// 懒续期：临期自动刷新，失败不阻断（沿用现有 token，上游报失效时再强制刷新）

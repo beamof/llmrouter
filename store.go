@@ -38,6 +38,7 @@ type WorkBuddyCred struct {
 	RefreshToken     string     `json:"refresh_token,omitempty"`
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`         // accessToken 过期时刻，nil = 未知
 	RefreshExpiresAt *time.Time `json:"refresh_expires_at,omitempty"` // refreshToken 过期时刻，nil = 未知
+	Usage            *WBUsage   `json:"usage,omitempty"`              // 最近一次余额快照（签到/查询时更新）
 }
 
 // expires 取 accessToken 过期时刻（nil 安全）
@@ -221,6 +222,33 @@ func (s *Store) UpdateWBAuth(providerID string, c *WorkBuddyCred) bool {
 	p.WB = &cp
 	s.save()
 	return true
+}
+
+// UpdateWBUsage 回写 WorkBuddy 余额快照。与 UpdateWBAuth 同样走换指针拷贝：
+// 从当前凭证复制后仅改 Usage，不覆盖并发写入的新 token。
+func (s *Store) UpdateWBUsage(providerID string, u *WBUsage) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.WB == nil {
+		return false
+	}
+	cp := *p.WB
+	cp.Usage = u
+	p.WB = &cp
+	s.save()
+	return true
+}
+
+// AllProviders 全量 Provider 浅拷贝（后台任务遍历用，元素只读）
+func (s *Store) AllProviders() []Provider {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Provider, 0, len(s.Providers))
+	for _, p := range s.Providers {
+		out = append(out, *p)
+	}
+	return out
 }
 
 // ProviderByWBUID 按 Kind + WorkBuddy 账号 uid 找 provider（凭证重复导入时原地更新）
