@@ -144,21 +144,23 @@ func zedMintLLMToken(ctx context.Context, cli *http.Client, base string, cred *Z
 	if cred == nil || len(cred.NativeCredential) == 0 {
 		return nil, errors.New("zed 凭证缺少原生凭据")
 	}
-	// 端点要求 body 为 {"organization_id": null}（个人账号；organization_id 传 UUID
-	// 时代表组织账号）。实测空 body 与 "{}" 都会被上游以
-	// "Failed to read request body: Invalid JSON" 400 拒绝（对齐 zed-free 抓包）。
-	body, status, err := zedAPICall(ctx, cli, http.MethodPost, strings.TrimRight(base, "/")+"/client/llm_tokens",
-		cred.nativeAuthorization(), cred.SystemID, []byte(`{"organization_id":null}`))
+	// 端点要求 organization_id 是字符串（Zed CreateLlmTokenBody 的 OrganizationId 是
+	// Arc<str>，原生客户端恒发组织 UUID，个人账号 = 个人组织）。null / 缺字段 / 空 body /
+	// "{}" 都会被上游以 "Failed to read request body: Invalid JSON" 400 拒绝——
+	// 对齐 Zed 1.23.2 cloud_api_client 与 magpie 插件的实测行为。
+	body, _ := json.Marshal(map[string]string{"organization_id": cred.OrganizationID})
+	respBody, status, err := zedAPICall(ctx, cli, http.MethodPost, strings.TrimRight(base, "/")+"/client/llm_tokens",
+		cred.nativeAuthorization(), cred.SystemID, body)
 	if err != nil {
 		return nil, fmt.Errorf("重铸请求失败: %v", err)
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("重铸返回 HTTP %d: %s", status, errSnippet(body))
+		return nil, fmt.Errorf("重铸返回 HTTP %d: %s", status, errSnippet(respBody))
 	}
 	var v struct {
 		Token string `json:"token"`
 	}
-	if err := json.Unmarshal(body, &v); err != nil || strings.TrimSpace(v.Token) == "" {
+	if err := json.Unmarshal(respBody, &v); err != nil || strings.TrimSpace(v.Token) == "" {
 		return nil, fmt.Errorf("重铸响应缺少 token（HTTP %d）", status)
 	}
 	expiry, err := zedJWTExpiry(v.Token)
@@ -228,12 +230,14 @@ func zedFetchModels(ctx context.Context, cli *http.Client, base string, cred *Ze
 
 // zedAccount /client/users/me 的账号与套餐摘要
 type zedAccount struct {
-	Username     string
-	GitHubLogin  string
-	PlanType     string
-	Used         *int64
-	Limit        *int64
-	Subscription string
+	Username        string
+	GitHubLogin     string
+	PlanType        string
+	Used            *int64
+	Limit           *int64
+	Subscription    string
+	OrganizationID  string // 选定的 llm_tokens 铸造组织（见 zedPickOrganization）
+	HasOrganization bool   // 账号是否披露了任何组织（空组织账号选组织逻辑直接跳过）
 }
 
 // zedFetchAccount 读取账号身份与套餐用量（登录与手动刷新时调用）
@@ -251,7 +255,11 @@ func zedFetchAccount(ctx context.Context, cli *http.Client, base string, cred *Z
 			Username    string `json:"username"`
 			GitHubLogin string `json:"github_login"`
 		} `json:"user"`
-		Plan struct {
+		DefaultOrganizationID string                  `json:"default_organization_id"`
+		Organizations         []zedOrg                `json:"organizations"`
+		PlansByOrganization   map[string]string       `json:"plans_by_organization"`
+		ConfigurationByOrg    map[string]zedOrgConfig `json:"configuration_by_organization"`
+		Plan                  struct {
 			PlanV3             string `json:"plan_v3"`
 			PlanV2             string `json:"plan_v2"`
 			Plan               string `json:"plan"`
@@ -277,13 +285,81 @@ func zedFetchAccount(ctx context.Context, cli *http.Client, base string, cred *Z
 		plan = v.Plan.Plan
 	}
 	return &zedAccount{
-		Username:     strings.TrimSpace(v.User.Username),
-		GitHubLogin:  strings.TrimSpace(v.User.GitHubLogin),
-		PlanType:     plan,
-		Used:         v.Plan.Usage.ModelRequests.Used,
-		Limit:        zedUsageLimit(v.Plan.Usage.ModelRequests.Limit),
-		Subscription: strings.TrimSpace(v.Plan.SubscriptionPeriod.EndedAt),
+		Username:        strings.TrimSpace(v.User.Username),
+		GitHubLogin:     strings.TrimSpace(v.User.GitHubLogin),
+		PlanType:        plan,
+		Used:            v.Plan.Usage.ModelRequests.Used,
+		Limit:           zedUsageLimit(v.Plan.Usage.ModelRequests.Limit),
+		Subscription:    strings.TrimSpace(v.Plan.SubscriptionPeriod.EndedAt),
+		OrganizationID:  zedPickOrganization(v.DefaultOrganizationID, v.Organizations, v.PlansByOrganization, v.ConfigurationByOrg),
+		HasOrganization: len(v.Organizations) > 0,
 	}, nil
+}
+
+// zedOrg /client/users/me 披露的组织条目
+type zedOrg struct {
+	ID         string `json:"id"`
+	IsPersonal bool   `json:"is_personal"`
+}
+
+// zedOrgConfig 组织级策略（is_zed_model_provider_enabled = false 表示组织关闭了 Zed 托管模型）
+type zedOrgConfig struct {
+	IsZedModelProviderEnabled *bool `json:"is_zed_model_provider_enabled"`
+}
+
+// zedPickOrganization 选 llm_tokens 的铸造组织，镜像 magpie 插件 orgOf 的选法：
+// 默认组织是 Zed 编辑器的起点；若它没有可用的套餐（或被组织策略关掉了 Zed 模型），
+// 则挑一个有套餐且未关闭模型的组织，个人组织优先；全都不可用时回落默认组织 → 首个组织。
+// 任何组织都没有时返回 ""（上游对空字符串组织宽容，magpie 实测可用）。
+func zedPickOrganization(defaultID string, orgs []zedOrg, plans map[string]string, config map[string]zedOrgConfig) string {
+	defaultID = strings.TrimSpace(defaultID)
+	usable := func(id string) bool {
+		if plan, ok := plans[id]; !ok || plan == "" || plan == "zed_free" {
+			return false
+		}
+		if c, ok := config[id]; ok && c.IsZedModelProviderEnabled != nil && !*c.IsZedModelProviderEnabled {
+			return false
+		}
+		return true
+	}
+	byID := func(id string) *zedOrg {
+		for i := range orgs {
+			if strings.TrimSpace(orgs[i].ID) == id {
+				return &orgs[i]
+			}
+		}
+		return nil
+	}
+	var firstAny *zedOrg
+	for i := range orgs {
+		o := &orgs[i]
+		if o.ID == "" {
+			continue
+		}
+		if firstAny == nil {
+			firstAny = o
+		}
+	}
+	if def := byID(defaultID); def != nil && usable(def.ID) {
+		return def.ID // 默认组织可用：与 Zed 编辑器一致
+	}
+	for i := range orgs { // 有套餐的组织：个人优先
+		if orgs[i].ID != "" && orgs[i].IsPersonal && usable(orgs[i].ID) {
+			return orgs[i].ID
+		}
+	}
+	for i := range orgs {
+		if orgs[i].ID != "" && usable(orgs[i].ID) {
+			return orgs[i].ID
+		}
+	}
+	if def := byID(defaultID); def != nil {
+		return def.ID
+	}
+	if firstAny != nil {
+		return firstAny.ID
+	}
+	return ""
 }
 
 // zedUsageLimit 兼容 limit 的三种形态：数字 / {limited:n} / null
@@ -366,6 +442,14 @@ func (s *Server) zedRefreshToken(p Provider, force bool) (*ZedCred, error) {
 	cli, err := s.upstreamClient(cur, 20*time.Second)
 	if err != nil {
 		return nil, err
+	}
+	// 旧凭证没有组织 ID：先拉账号补齐（上游要求 organization_id 为字符串 UUID）
+	if strings.TrimSpace(cred.OrganizationID) == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if account, aerr := zedFetchAccount(ctx, cli, s.zedCloud(), cred); aerr == nil && account.HasOrganization {
+			cred.OrganizationID = account.OrganizationID
+		}
+		cancel()
 	}
 	nc, err := zedMintLLMToken(context.Background(), cli, s.zedCloud(), cred)
 	if err != nil {

@@ -168,14 +168,16 @@ func (s *Server) zedCompleteLogin(state, callbackURL string) (*zedLoginSession, 
 		s.zedLoginCloseListener(sess)
 		return sess, err
 	}
-	// 同账号已绑过：沿用其 system_id（安装标识绑定真实安装，不该随本次表单漂移）
-	systemID := sess.systemID
+	// 同账号已绑过：沿用其 system_id 与已选组织（安装标识绑定真实安装，不该随本次表单漂移）
+	systemID, orgID := sess.systemID, ""
 	proxy := ""
-	if old, ok := s.store.ProviderByZedUser(userID); ok && old.Zed != nil && old.Zed.SystemID != "" {
-		systemID = old.Zed.SystemID
-		proxy = old.Proxy
+	if old, ok := s.store.ProviderByZedUser(userID); ok && old.Zed != nil {
+		if old.Zed.SystemID != "" {
+			systemID = old.Zed.SystemID
+		}
+		orgID = old.Zed.OrganizationID
 	}
-	cred := &ZedCred{UserID: userID, SystemID: systemID, NativeCredential: native}
+	cred := &ZedCred{UserID: userID, SystemID: systemID, OrganizationID: orgID, NativeCredential: native}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cli, err := s.upstreamClient(Provider{Proxy: proxy}, 20*time.Second)
@@ -183,6 +185,17 @@ func (s *Server) zedCompleteLogin(state, callbackURL string) (*zedLoginSession, 
 		sess.status, sess.err = "failed", err.Error()
 		s.zedLoginCloseListener(sess)
 		return sess, err
+	}
+	// 先拉账号：llm_tokens 要求 organization_id 为字符串 UUID（个人账号 = 个人组织），
+	// 组织 ID 就来自 users/me；同时拿到身份与套餐快照
+	account, err := zedFetchAccount(ctx, cli, s.zedCloud(), cred)
+	if err != nil {
+		sess.status, sess.err = "failed", "拉取账号信息失败: "+err.Error()
+		s.zedLoginCloseListener(sess)
+		return sess, err
+	}
+	if account.HasOrganization {
+		cred.OrganizationID = account.OrganizationID
 	}
 	minted, err := zedMintLLMToken(ctx, cli, s.zedCloud(), cred)
 	if err != nil {
@@ -193,12 +206,6 @@ func (s *Server) zedCompleteLogin(state, callbackURL string) (*zedLoginSession, 
 	models, err := zedFetchModels(ctx, cli, s.zedCloud(), minted)
 	if err != nil {
 		sess.status, sess.err = "failed", "拉取模型目录失败: "+err.Error()
-		s.zedLoginCloseListener(sess)
-		return sess, err
-	}
-	account, err := zedFetchAccount(ctx, cli, s.zedCloud(), minted)
-	if err != nil {
-		sess.status, sess.err = "failed", "拉取账号信息失败: "+err.Error()
 		s.zedLoginCloseListener(sess)
 		return sess, err
 	}

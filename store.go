@@ -65,6 +65,7 @@ func (c *WorkBuddyCred) refreshExpires() time.Time {
 type ZedCred struct {
 	UserID           string          `json:"user_id"`
 	SystemID         string          `json:"system_id,omitempty"`         // 本机 Zed 安装标识（可选；试用额度绑定真实安装，空 = 不带该头，由上游决定）
+	OrganizationID   string          `json:"organization_id,omitempty"`   // 铸 llm_tokens 的组织 UUID（个人账号 = 个人组织，登录时从 users/me 选定）
 	NativeCredential json.RawMessage `json:"native_credential,omitempty"` // 长期原生凭据 JSON 原文
 	AccessToken      string          `json:"access_token,omitempty"`      // 短期推理 JWT
 	ExpiresAt        *time.Time      `json:"expires_at,omitempty"`        // JWT 过期时刻，nil = 未知

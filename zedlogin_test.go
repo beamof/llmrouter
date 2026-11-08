@@ -98,6 +98,9 @@ func zedStartFakeCloud(t *testing.T) (*zedFakeCloud, *Server, *httptest.Server) 
 		{"id":"claude-opus-4.6","provider":"anthropic","is_disabled":true},
 		{"id":"o4-mini","provider":"open_ai"}]}`
 	fc.account = `{"user":{"username":"alice","github_login":"alice-gh"},
+		"default_organization_id":"org-1",
+		"organizations":[{"id":"org-1","is_personal":true},{"id":"org-2","is_personal":false}],
+		"plans_by_organization":{"org-1":"free"},
 		"plan":{"plan_v3":"free","usage":{"model_requests":{"used":3,"limit":{"limited":500}}},
 		"subscription_period":{"ended_at":"2026-12-31T00:00:00Z"}}}`
 	return fc, s, app
@@ -165,6 +168,9 @@ func TestZedLoginFlow(t *testing.T) {
 	}
 	if p.Zed.Username != "alice" || p.Zed.GitHubLogin != "alice-gh" || p.Zed.Plan == nil || p.Zed.Plan.PlanType != "free" {
 		t.Fatalf("账号快照未写入: %+v", p.Zed)
+	}
+	if p.Zed.OrganizationID != "org-1" {
+		t.Fatalf("铸造组织未写入: %q", p.Zed.OrganizationID)
 	}
 	if p.Zed.AccessToken != fc.jwt {
 		t.Fatal("应换得短期 JWT")
@@ -322,7 +328,7 @@ func TestZedAuthorizationURL(t *testing.T) {
 func TestZedMintAndExpiry(t *testing.T) {
 	fc, _, _ := zedStartFakeCloud(t)
 	cli := &http.Client{}
-	cred := &ZedCred{UserID: "user-1", NativeCredential: json.RawMessage(`{"k":1}`)}
+	cred := &ZedCred{UserID: "user-1", OrganizationID: "org-1", NativeCredential: json.RawMessage(`{"k":1}`)}
 	minted, err := zedMintLLMToken(t.Context(), cli, fc.base, cred)
 	if err != nil {
 		t.Fatalf("重铸失败: %v", err)
@@ -333,17 +339,55 @@ func TestZedMintAndExpiry(t *testing.T) {
 	if !minted.expires().After(time.Now()) {
 		t.Fatal("过期时刻应在未来")
 	}
-	// 契约：llm_tokens body 必须是 {"organization_id":null}
-	// （真实上游对空 body / "{}" 都报 400 Invalid JSON）
+	// 契约：llm_tokens body 必须是 {"organization_id":"<uuid>"}（字符串，不能是 null；
+	// 真实上游对 null / 空 body / "{}" 都报 400 Invalid JSON）
 	fc.mintMu.Lock()
 	bodies := append([]string(nil), fc.mintBodies...)
 	fc.mintMu.Unlock()
-	if len(bodies) != 1 || bodies[0] != `{"organization_id":null}` {
+	if len(bodies) != 1 || bodies[0] != `{"organization_id":"org-1"}` {
 		t.Fatalf("llm_tokens 请求 body 不符: %q", bodies)
 	}
 	// 无效原生凭据 → 401
-	if _, err := zedMintLLMToken(t.Context(), cli, fc.base, &ZedCred{UserID: "bad", NativeCredential: json.RawMessage(`{}`)}); err == nil {
+	if _, err := zedMintLLMToken(t.Context(), cli, fc.base, &ZedCred{UserID: "bad", OrganizationID: "org-1", NativeCredential: json.RawMessage(`{}`)}); err == nil {
 		t.Fatal("无效凭据应失败")
+	}
+}
+
+// TestZedPickOrganization 铸造组织的选择：默认组织可用优先，否则有套餐的组织
+// （个人优先），组织策略关闭模型或免费套餐不算可用，全不可用回落默认 → 首个。
+func TestZedPickOrganization(t *testing.T) {
+	tr := true
+	fl := false
+	orgs := []zedOrg{{ID: "personal", IsPersonal: true}, {ID: "biz"}}
+	// 默认组织有付费套餐 → 直接用它
+	if got := zedPickOrganization("personal", orgs, map[string]string{"personal": "zed_pro"}, nil); got != "personal" {
+		t.Fatalf("默认组织可用应选默认: %q", got)
+	}
+	// 默认组织免费、另一个有付费 → 选有套餐的
+	if got := zedPickOrganization("personal", orgs, map[string]string{"personal": "zed_free", "biz": "zed_pro"}, nil); got != "biz" {
+		t.Fatalf("应选有套餐的组织: %q", got)
+	}
+	// 默认组织有套餐但被组织策略关闭模型 → 无可用组织，回落默认组织（与 magpie 一致）
+	if got := zedPickOrganization("personal", orgs, map[string]string{"personal": "zed_pro"},
+		map[string]zedOrgConfig{"personal": {IsZedModelProviderEnabled: &fl}}); got != "personal" {
+		t.Fatalf("唯一组织被策略关闭时应回落默认组织: %q", got)
+	}
+	// 多个可用组织：个人优先于顺序上的首个
+	mixed := []zedOrg{{ID: "biz1"}, {ID: "personal", IsPersonal: true}}
+	if got := zedPickOrganization("", mixed, map[string]string{"biz1": "zed_pro", "personal": "zed_pro"},
+		map[string]zedOrgConfig{"biz1": {IsZedModelProviderEnabled: &tr}}); got != "personal" {
+		t.Fatalf("可用组织里个人优先: %q", got)
+	}
+	// 全都不可用 → 回落默认组织，再退首个组织
+	if got := zedPickOrganization("biz", orgs, map[string]string{"personal": "", "biz": "zed_free"}, nil); got != "biz" {
+		t.Fatalf("全不可用应回落默认组织: %q", got)
+	}
+	if got := zedPickOrganization("", orgs, nil, nil); got != "personal" {
+		t.Fatalf("无默认时退首个组织: %q", got)
+	}
+	// 没有任何组织 → 空字符串（上游对空组织宽容）
+	if got := zedPickOrganization("", nil, nil, nil); got != "" {
+		t.Fatalf("无组织应为空: %q", got)
 	}
 }
 
