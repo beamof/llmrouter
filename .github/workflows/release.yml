@@ -41,9 +41,11 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
+          # 注入版本号供后台「检测更新」比对（源码构建时为 dev）
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           out="llmrouter-${{ matrix.suffix }}"
-          go build -trimpath -ldflags "-s -w" -o "$out" .
+          go build -trimpath -ldflags "-s -w -X main.appVersion=$VERSION" -o "$out" .
           ls -lh "$out"
 
       - uses: actions/upload-artifact@v4

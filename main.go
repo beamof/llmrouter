@@ -57,6 +57,12 @@ type Server struct {
 
 	failMu sync.Mutex
 	fails  map[string]*adminFail // 管理令牌失败计数，按来源 IP，仅内存
+
+	updMu      sync.Mutex
+	upd        *updateInfo // 最近一次版本检测结果（缓存），nil = 未检测
+	updAt      time.Time   // 缓存写入时间
+	updRunning bool        // 升级任务是否已启动（替换文件后进程会退出）
+	ghAPI      string      // GitHub API 基址覆盖（测试注入，空 = 官方端点）
 }
 
 func (s *Server) routes() *http.ServeMux {
@@ -99,6 +105,9 @@ func (s *Server) routes() *http.ServeMux {
 	api.HandleFunc("DELETE /api/keys/{id}", s.handleKeyDelete)
 	api.HandleFunc("PUT /api/settings", s.handleSettings)
 	api.HandleFunc("DELETE /api/logs", s.handleLogsClear)
+	api.HandleFunc("GET /api/version", s.handleVersion)
+	api.HandleFunc("GET /api/update/check", s.handleUpdateCheck)
+	api.HandleFunc("POST /api/update/apply", s.handleUpdateApply)
 	mux.Handle("/api/", s.adminAuth(api))
 	return mux
 }
@@ -268,12 +277,25 @@ func getenv(k, def string) string {
 }
 
 func main() {
+	// 自动升级的助手入口，必须先于 flag.Parse 拦截（参数布局见 runUpdateHelper）
+	if len(os.Args) > 1 && os.Args[1] == updateHelperArg {
+		runUpdateHelper(os.Args[2:])
+		return
+	}
+
 	addr := flag.String("addr", getenv("LLMROUTER_ADDR", "127.0.0.1:8080"), "监听地址")
 	data := flag.String("data", getenv("LLMROUTER_DATA", "data.json"), "状态文件路径")
 	adminToken := flag.String("admin-token", os.Getenv("LLMROUTER_ADMIN_TOKEN"), "管理后台令牌（空 = 不鉴权）")
 	apiToken := flag.String("api-token", os.Getenv("LLMROUTER_API_TOKEN"), "代理入口令牌（空 = 不鉴权）")
 	trustProxy := flag.Bool("trust-proxy", os.Getenv("LLMROUTER_TRUST_PROXY") != "", "部署在反向代理后时开启：按 X-Forwarded-For 判定来源 IP（默认取 TCP 对端）")
+	showVersion := flag.Bool("version", false, "打印版本号后退出")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(appVersion)
+		return
+	}
+
+	cleanupUpdateLeftovers() // 清掉上次升级留下的旧二进制与临时文件
 
 	store, err := LoadStore(*data)
 	if err != nil {
@@ -293,6 +315,6 @@ func main() {
 		log.Println("提示：未配置任何 API Key，代理入口不鉴权；可在后台 Keys 页生成")
 	}
 	go s.wbCheckinLoop() // WorkBuddy 国内版个人账号：每天 09:00/21:00 自动签到 + 余额快照
-	log.Printf("LLM Router 已启动：管理后台 http://%s | 代理入口 /v1/chat/completions /v1/responses /v1/models", *addr)
+	log.Printf("LLM Router %s 已启动：管理后台 http://%s | 代理入口 /v1/chat/completions /v1/responses /v1/models", appVersion, *addr)
 	log.Fatal(http.ListenAndServe(*addr, s.routes()))
 }

@@ -46,6 +46,7 @@ const (
 	kindSession     = "session"      // 会话建立/切换绑定
 	kindMuted       = "muted"        // 上游 429，模型被自动静音
 	kindCheckin     = "checkin"      // WorkBuddy 签到/余额刷新结果
+	kindUpdate      = "update"       // 版本检测/自动升级结果
 )
 
 // logFail 记一条异常日志。detail 会截断，避免把大段上游响应塞进状态文件。

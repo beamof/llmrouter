@@ -12,6 +12,7 @@
 - **Zed 适配**：复用 Zed 编辑器账号的模型额度（`gpt-*`、`claude-*`），原生登录 + JWT 自动重铸 + 双向协议转换，chat 与 responses 两种接入协议直接承接（详见下文）
 - **第三方供应商接入框架**：WorkBuddy 与 Zed 共用同一套适配器骨架（Kind + 凭证 + `xxAttempt` 分流），新增私有协议上游按固定清单接入（详见下文）
 - **网页后台**（中文，单文件，无前端依赖）：Provider / 模型增删改、优先级排序、用量统计（按 token 计）、每日 token 上限、并行上限、按时段静音（mute）、上游余额查询、会话与异常日志
+- **在线升级**：后台比对 GitHub Release 最新版本，一键下载当前平台安装包、校验 SHA256、替换二进制并自动重启（见下文「版本检测与自动升级」）
 - 状态落盘为单个 JSON 文件（默认 `data.json`），零外部依赖，单二进制
 
 ## 快速开始
@@ -46,6 +47,19 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `-admin-token` | `LLMROUTER_ADMIN_TOKEN` | 空 | 后台令牌；空则后台不鉴权（仅建议本机使用） |
 | `-api-token` | `LLMROUTER_API_TOKEN` | 空 | 额外的固定代理令牌（始终有效，与 Keys 页互不影响） |
 | `-trust-proxy` | `LLMROUTER_TRUST_PROXY` | 关 | 部署在反向代理之后时开启：按 `X-Forwarded-For` 判定来源 IP。默认只取 TCP 对端，避免客户端伪造头绕过失败计数 |
+| `-version` | — | — | 打印当前版本号后退出（发布版为 tag，如 `v0.18.0`；源码构建为 `dev`） |
+
+## 版本检测与自动升级
+
+发布流水线用 `-X main.appVersion=vX.Y.Z` 把 tag 注入二进制；后台「设置 → 常规 → 版本与更新」据此比对 GitHub 最新 Release：
+
+- **检测更新**：读取 [GitHub Release](https://github.com/beamof/llmrouter/releases) 的最新版本与发布说明。未认证的 GitHub API 有 60 次/小时限制，检测结果缓存 5 分钟，点按钮可强制刷新
+- **立即升级**：下载与当前平台匹配的发布资产（`llmrouter-{windows,linux}-{x86_64,arm64}`），用 Release 附带的 `SHA256SUMS.txt` 校验 SHA256，通过后替换当前可执行文件并按**原命令行参数**重启
+- 替换由复制到临时目录的「升级助手」完成：等旧进程退出 → 旧文件改名为 `<exe>.old`（下次启动自动清理）→ 放入新文件 → 拉起新进程。Windows 下运行中的 exe 无法直接覆盖或改名，因此必须由独立副本执行
+- 要求程序所在目录可写；源码构建（`dev`）也可安装发布版。升级失败时会回滚旧二进制，结果写入异常日志（kind = `update`）
+- macOS 不在发布矩阵中，该平台只能手动编译运行，不支持自动升级
+
+> 升级会重启服务，进行中的请求会中断，建议避开高负载时段。检测为手动触发，不做后台轮询。
 
 ## 管理令牌防爆破
 

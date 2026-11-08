@@ -575,6 +575,17 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
           </div>
 
           <div class="panel">
+            <div class="panel-head"><h3>版本与更新</h3><span class="hint" id="ver-current">正在读取版本…</span></div>
+            <p class="hint" style="margin:0 0 12px">「检测更新」会读取 GitHub Release 的最新版本；有新版本时可一键下载对应平台的安装包，校验 SHA256 后替换当前可执行文件，服务会自动重启（重启期间短暂不可用）。</p>
+            <div class="row-inline">
+              <button class="btn pri" id="btn-upd-check" onclick="checkUpdate(true)">检测更新</button>
+              <button class="btn" id="btn-upd-apply" onclick="applyUpdate()" hidden>立即升级</button>
+              <span class="hint" id="ver-status"></span>
+            </div>
+            <div id="ver-notes" class="hint" style="margin-top:10px;white-space:pre-wrap"></div>
+          </div>
+
+          <div class="panel">
             <div class="panel-head"><h3>运行说明</h3></div>
             <ul class="notes">
               <li>请求体原样透传（messages / tools / stream 等全部字段不做改动），响应字节级回传。</li>
@@ -948,6 +959,7 @@ const LOG_KIND_LABEL = {
   all_failed: ['bad', '全部失败'],
   admin_auth: ['warn', '后台令牌'],
   admin_locked: ['bad', '已锁定'],
+  update: ['ok', '版本更新'],
 };
 
 function filteredLogs() {
@@ -2002,6 +2014,112 @@ function renderGeneral() {
   if (document.activeElement !== $('sess-ttl')) $('sess-ttl').value = Math.round((S.session_ttl_seconds || 3600) / 60);
   $('resp-convert').checked = !!S.responses_convert;
   renderAuthState();
+  loadVersion();
+}
+
+/* ---------- 版本与更新 ---------- */
+let VER = null, UPD = null, verLoading = false;
+
+// 只取本地版本信息，不访问网络；失败也不打扰用户
+async function loadVersion() {
+  if (VER || verLoading) return;
+  verLoading = true;
+  try { VER = await api('GET', '/api/version'); }
+  catch (e) { VER = {version: '未知', os: '', arch: '', installable: false}; }
+  verLoading = false;
+  renderVersion();
+}
+
+function renderVersion() {
+  if (!VER) return;
+  const plat = [VER.os, VER.arch].filter(Boolean).join('/');
+  const ver = VER.version === 'dev' ? 'dev 源码构建' : 'v' + VER.version;
+  $('ver-current').textContent = '当前 ' + ver + (plat ? ' · ' + plat : '') +
+    (VER.installable ? '' : ' · 该平台不支持自动升级');
+}
+
+function fmtBytes(n) {
+  if (!n) return '大小未知';
+  const mb = n / 1048576;
+  return mb >= 1 ? mb.toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+}
+
+// 读取 GitHub 最新 Release 并与当前版本比对
+async function checkUpdate(force) {
+  const btn = $('btn-upd-check'), st = $('ver-status');
+  btn.disabled = true;
+  st.textContent = '正在读取 GitHub Release…';
+  $('ver-notes').textContent = '';
+  $('btn-upd-apply').hidden = true;
+  try {
+    UPD = await api('GET', '/api/update/check' + (force ? '?force=1' : ''));
+    renderUpdate();
+  } catch (e) {
+    st.textContent = '检测失败：' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderUpdate() {
+  if (!UPD) return;
+  const st = $('ver-status'), apply = $('btn-upd-apply');
+  if (UPD.has_update) {
+    st.innerHTML = `<b style="color:var(--acc)">发现新版本 v${esc(UPD.latest)}</b>` +
+      (UPD.asset ? `<span class="hint"> · ${esc(UPD.asset)} · ${fmtBytes(UPD.asset_size)}</span>` : '');
+    apply.hidden = !VER?.installable;
+    apply.textContent = '升级到 v' + UPD.latest;
+  } else {
+    st.innerHTML = `已是最新版本 <b>v${esc(UPD.latest || UPD.current)}</b>`;
+    apply.hidden = true;
+  }
+  $('ver-notes').textContent = [UPD.notes, UPD.release_notes].filter(Boolean).join('\n\n');
+}
+
+// 下载 → 校验 SHA256 → 替换二进制 → 自动重启
+async function applyUpdate() {
+  if (!UPD?.has_update) return;
+  const apply = $('btn-upd-apply'), check = $('btn-upd-check'), st = $('ver-status');
+  if (!confirm(`下载并安装 v${UPD.latest}？安装后服务会自动重启，进行中的请求会中断。`)) return;
+  apply.disabled = true;
+  check.disabled = true;
+  st.textContent = `正在下载并校验安装包（${fmtBytes(UPD.asset_size)}），请勿关闭页面…`;
+  const current = UPD.current;
+  try {
+    const r = await api('POST', '/api/update/apply');
+    st.innerHTML = `<b>${esc(r.message || '正在安装')}</b>`;
+    $('ver-notes').textContent = '服务重启后本页会自动重新连接。';
+    await waitRestart(current);
+  } catch (e) {
+    st.textContent = '升级失败：' + e.message;
+    apply.disabled = false;
+    check.disabled = false;
+  }
+}
+
+// 升级后轮询版本接口，等服务重新上线并确认版本已变化
+async function waitRestart(current) {
+  const st = $('ver-status');
+  for (let i = 0; i < 60; i++) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const v = await api('GET', '/api/version');
+      if (v.version !== current) {
+        st.innerHTML = `<b>升级完成，当前 v${esc(v.version)}</b>，页面即将刷新`;
+        setTimeout(() => location.reload(), 1200);
+        return;
+      }
+    } catch (e) {
+      // 新版本可能还没有 /api/version（如降级到旧发布版），退一步看服务是否已响应
+      try {
+        await api('GET', '/api/state');
+        st.innerHTML = '<b>服务已重新上线</b>，页面即将刷新';
+        setTimeout(() => location.reload(), 1200);
+        return;
+      } catch (e2) { /* 服务仍在重启，继续等 */ }
+    }
+  }
+  st.textContent = '等待服务重新上线超时，请确认进程已启动后手动刷新页面。';
 }
 
 async function copyEp(id) {
