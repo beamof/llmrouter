@@ -21,8 +21,9 @@ type Provider struct {
 	APIKey       string         `json:"api_key,omitempty"`       // 上游密钥
 	BalanceURL   string         `json:"balance_url,omitempty"`   // 可选的余额查询地址（GET + 本密钥）
 	Proxy        string         `json:"proxy,omitempty"`         // 可选代理地址，支持 http(s):// 与 socks5(h)://；空 = 不代理（仍读环境变量）
-	Kind         string         `json:"kind,omitempty"`          // 上游类型：空 = 标准 OpenAI 兼容；"workbuddy" / "workbuddy-intl" = 复用 WorkBuddy 客户端登录态
+	Kind         string         `json:"kind,omitempty"`          // 上游类型：空 = 标准 OpenAI 兼容；"workbuddy" / "workbuddy-intl" = 复用 WorkBuddy 客户端登录态；"zed" = Zed 账号
 	WB           *WorkBuddyCred `json:"wb,omitempty"`            // WorkBuddy 凭证（Kind 为 workbuddy 系时使用，凭证明文存于状态文件）
+	Zed          *ZedCred       `json:"zed,omitempty"`           // Zed 凭证（Kind 为 zed 时使用，凭证明文存于状态文件）
 }
 
 // WorkBuddyCred WorkBuddy 上游的账号凭证（本机客户端扫描导入或后台粘贴）。
@@ -56,6 +57,37 @@ func (c *WorkBuddyCred) refreshExpires() time.Time {
 		return time.Time{}
 	}
 	return *c.RefreshExpiresAt
+}
+
+// ZedCred Zed 上游的账号凭证（后台原生登录获得）。NativeCredential 是 zed.dev
+// 回调解密出的长期原生凭据（JSON 对象原文，作为整体参与鉴权）；AccessToken 是
+// 用它换取的短期推理 JWT，临期由 zedRefreshToken 用原生凭据重铸，无需刷新令牌。
+type ZedCred struct {
+	UserID           string          `json:"user_id"`
+	SystemID         string          `json:"system_id,omitempty"`         // 本机 Zed 安装标识（可选；试用额度绑定真实安装，空 = 不带该头，由上游决定）
+	NativeCredential json.RawMessage `json:"native_credential,omitempty"` // 长期原生凭据 JSON 原文
+	AccessToken      string          `json:"access_token,omitempty"`      // 短期推理 JWT
+	ExpiresAt        *time.Time      `json:"expires_at,omitempty"`        // JWT 过期时刻，nil = 未知
+	Username         string          `json:"username,omitempty"`
+	GitHubLogin      string          `json:"github_login,omitempty"`
+	Plan             *ZedPlan        `json:"plan,omitempty"` // 最近一次账号/套餐快照（刷新账号信息时更新）
+}
+
+// ZedPlan Zed 账号套餐与模型请求用量快照
+type ZedPlan struct {
+	PlanType        string    `json:"plan_type,omitempty"`
+	Used            *int64    `json:"used,omitempty"`  // 周期内已用模型请求数
+	Limit           *int64    `json:"limit,omitempty"` // 周期上限，nil = 不限/未知
+	SubscriptionEnd string    `json:"subscription_end,omitempty"`
+	CheckedAt       time.Time `json:"checked_at"`
+}
+
+// expires 取 JWT 过期时刻（nil 安全）
+func (c *ZedCred) expires() time.Time {
+	if c == nil || c.ExpiresAt == nil {
+		return time.Time{}
+	}
+	return *c.ExpiresAt
 }
 
 // MuteWindow 每天重复的静音时段，支持跨零点（如 22:00~06:00）
@@ -280,6 +312,37 @@ func (s *Store) UpdateWBUsage(providerID string, u *WBUsage) bool {
 	return true
 }
 
+// UpdateZedAuth 回写 Zed 重铸后的凭证（换指针拷贝，理由同 UpdateWBAuth：
+// Candidate 里的 Provider 是浅拷贝，并发请求各自持有不可变旧快照）。
+func (s *Store) UpdateZedAuth(providerID string, c *ZedCred) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.Zed == nil {
+		return false
+	}
+	cp := *c
+	p.Zed = &cp
+	s.save()
+	return true
+}
+
+// UpdateZedPlan 回写 Zed 账号/套餐快照。从当前凭证复制后仅改 Plan，
+// 不覆盖并发写入的新 token。
+func (s *Store) UpdateZedPlan(providerID string, plan *ZedPlan) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.Zed == nil {
+		return false
+	}
+	cp := *p.Zed
+	cp.Plan = plan
+	p.Zed = &cp
+	s.save()
+	return true
+}
+
 // AllProviders 全量 Provider 浅拷贝（后台任务遍历用，元素只读）
 func (s *Store) AllProviders() []Provider {
 	s.mu.Lock()
@@ -301,6 +364,43 @@ func (s *Store) ProviderByWBUID(kind, uid string) (Provider, bool) {
 		}
 	}
 	return Provider{}, false
+}
+
+// ProviderByZedUser 按 Zed 账号 user_id 找 provider（重复登录时原地更新）
+func (s *Store) ProviderByZedUser(userID string) (Provider, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.Providers {
+		if p.Kind == "zed" && p.Zed != nil && p.Zed.UserID == userID {
+			return *p, true
+		}
+	}
+	return Provider{}, false
+}
+
+// HasZedModel 判断某 provider 下是否已有同名模型条目（登录同步模型时去重）
+func (s *Store) HasZedModel(providerID, name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.Models {
+		if m.ProviderID == providerID && m.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ProviderModelCount 某 provider 名下的模型条目数（后台展示用）
+func (s *Store) ProviderModelCount(providerID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, m := range s.Models {
+		if m.ProviderID == providerID {
+			n++
+		}
+	}
+	return n
 }
 
 // DeleteProvider 连同其模型、用量、余额记录一起删
@@ -755,6 +855,12 @@ func mutedUntil(m *Model, now time.Time) bool {
 // MuteOn429 上游返回 429 时把该模型条目自动静音一段时间。
 // 已在静音期内则延长到更晚的时刻，不缩短。返回静音截止时间。
 func (s *Store) MuteOn429(modelID string, d time.Duration, reason string) (time.Time, bool) {
+	return s.MuteModel(modelID, d, reason)
+}
+
+// MuteModel 通用自动静音（429 限流、Zed 套餐不含该模型等场景共用）。
+// 语义与 MuteOn429 一致：已在静音期内则延长到更晚的时刻，不缩短。
+func (s *Store) MuteModel(modelID string, d time.Duration, reason string) (time.Time, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, m := range s.Models {

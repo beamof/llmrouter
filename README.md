@@ -1,6 +1,6 @@
 # 🚦 llmrouter
 
-一个用 Go 写的大模型代理路由：统一入口 + 网页后台管理。标准上游请求体与响应一律透传，不改动任何内容；WorkBuddy 类型上游由内置适配器按其私有协议转发。
+一个用 Go 写的大模型代理路由：统一入口 + 网页后台管理。标准上游请求体与响应一律透传，不改动任何内容；WorkBuddy 与 Zed 类型上游由内置适配器按其私有协议转发。
 
 ## 特性
 
@@ -108,6 +108,23 @@ Provider「类型」选 **WorkBuddy 国内版 / 国际版** 后，可复用腾�
 - 该类型的基址固定为由地区端点派生的官方地址，不能自定义（避免把凭证发往其他主机）
 
 > WorkBuddy 适配移植自 [Agent2Providers](https://github.com/ProvidersPlugin/Agent2Providers)（AGPL-3.0）；本仓库中该部分为衍生作品，适用 AGPL-3.0。请求头族、模型目录算法与默认系统提示词另参照 [ccLoad](https://github.com/caidaoli/ccload) 的 `internal/codebuddyauth` 实现及其 [UPSTREAM.md](https://github.com/caidaoli/ccload/blob/main/internal/codebuddyauth/UPSTREAM.md) 协议说明（其对官方 CLI 契约的整理）。
+
+## Zed 上游
+
+Provider「类型」选 **Zed 账号** 后，可复用 Zed 编辑器账号自带的模型额度（`gpt-*`、`claude-*`），与标准 Provider 混挂、共用全部路由规则。
+
+**登录**（后台 Provider 弹窗）：点击「登录 Zed」会在浏览器打开 zed.dev 的原生应用授权页，完成后自动创建/更新 Provider 并同步模型条目（优先级 0、默认暴露，可自行调整；重复登录原地更新，用户调整过的条目不动）。服务器上没有浏览器时，把授权后浏览器地址栏的完整回调 URL 粘贴进弹窗兜底完成。
+
+- 登录不是 OAuth code/PKCE：每次登录生成临时 RSA-2048 密钥，公钥随授权 URL 交给 zed.dev，返回的原生凭据经 RSA-OAEP/SHA-256 加密回传到本机回环端口，私钥用完即弃不落盘
+- **system_id**（可选）：Zed 试用额度绑定真实安装。取值链：弹窗表单 → 环境变量 `LLMROUTER_ZED_SYSTEM_ID` → 本机 Zed 安装数据库（`db/0-global/db.sqlite`，内置只读解析器，零依赖）。全部缺失时省略该头，由上游决定账号是否有试用权限；不要手填别机器的值
+- 原生凭据长期有效，用它换取的**推理 JWT 短期有效**：临期 2 分钟懒重铸 + 请求被拒（401 / 非 plan 的 403）强制重铸重试一次，单飞并发保护；上游 403 且含 "plan" 表示套餐不含该模型，只把该模型静音 1 小时（渠道内其他模型继续可用）
+- 请求按 Zed 线协议封装：`thread_id/prompt_id/intent/provider/model/provider_request` 信封 + 原生客户端请求头（`User-Agent: Zed/…`、`x-zed-version` 等）。`gpt-*` 走 Responses 线协议（`/v1/responses` 客户端请求保真透传归一化，chat 客户端先转换），`claude-*` 走 Anthropic Messages 线协议（chat 中间形态转换，`max_tokens` 默认 8192、thinking 预算与输出上限的约束对齐上游校验）
+- 上游**恒为流式**（`{status,event}` 自有 SSE 帧）：非流式客户端由网关聚合；usage 从 `response.completed` / Anthropic `message_delta` 提取记账
+- 两种接入协议（`/v1/chat/completions`、`/v1/responses`）都直接承接，不需要开 Responses 协议转换
+- 数据面基址固定为官方 `https://cloud.zed.dev/completions`，不能自定义（避免把凭证发往其他主机）；需代理时在「网络代理」栏配置
+- 套餐用量（`plan` / 已用请求数）随登录与「重铸 / 刷新账号」按钮更新，展示在 Provider 列表
+
+> Zed 线协议为逆向实现，参照 [ccLoad](https://github.com/caidaoli/ccload)（MIT）的 `internal/zedauth` 与 `zed_wire.go`。上游协议变化时可能需要同步更新（如 `Zed/1.23.2` 版本号常量）。使用他人账号或违反 Zed 服务条款的风险请自行评估。
 
 ## 模型测试按钮
 

@@ -598,6 +598,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
         <option value="">标准 OpenAI 兼容</option>
         <option value="workbuddy">WorkBuddy 国内版</option>
         <option value="workbuddy-intl">WorkBuddy 国际版</option>
+        <option value="zed">Zed 账号</option>
       </select>
     </div>
     <div class="field"><label>名称</label><input id="p-name" placeholder="deepseek"></div>
@@ -621,6 +622,22 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
       </div>
       <div id="p-wbstatus" class="hint" style="margin:4px 0"></div>
       <p class="hint" style="margin:6px 0 0">复用 WorkBuddy / CodeBuddy 客户端登录态：扫描本机客户端目录（Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth）或粘贴凭证 JSON 导入；导入后 llmrouter 用 refreshToken 自动续期，与客户端互不影响。上游仅支持 chat completions 协议。访问上游需要代理时（如国际版）填写上方「网络代理」。</p>
+    </div>
+    <div id="p-zed" hidden style="margin-top:8px">
+      <div class="field"><label>system_id</label>
+        <div class="inline" style="flex:1">
+          <input id="p-zedsysid" class="mono" placeholder="可选；留空自动读本机 Zed 安装" style="flex:1">
+          <button class="btn mini pri" onclick="zedLoginStart()">登录 Zed</button>
+        </div>
+      </div>
+      <div id="p-zedstatus" class="hint" style="margin:4px 0 8px"></div>
+      <div class="field" style="align-items:flex-start"><label>粘贴回调 URL</label>
+        <div style="flex:1;min-width:0">
+          <textarea id="p-zedcb" class="mono" rows="2" placeholder='http://127.0.0.1:随机端口/?user_id=…&access_token=… （浏览器无法访问本机时，复制授权后地址栏的完整 URL 粘贴到这里）' style="width:100%;box-sizing:border-box"></textarea>
+          <button class="btn mini" onclick="zedLoginPaste()" style="margin-top:4px">用粘贴的 URL 完成登录</button>
+        </div>
+      </div>
+      <p class="hint" style="margin:6px 0 0">用 Zed 账号（编辑器自带的模型额度）作为上游：点击「登录 Zed」后在浏览器完成授权，自动创建 Provider 并同步 gpt-*/claude-* 模型（优先级 0，可自行调整）。服务器上没有浏览器时用下方粘贴回调兜底。上游访问需代理时填上方「网络代理」。支持 chat 与 responses 两种接入协议。</p>
     </div>
   </div>
   <div class="dlg-foot">
@@ -1605,7 +1622,8 @@ function renderProviders() {
   }
   tb.innerHTML = S.providers.map(p => {
     const isWB = p.kind === 'workbuddy' || p.kind === 'workbuddy-intl';
-    const resp = !isWB && p.responses_url && p.responses_url !== p.base_url
+    const isZed = p.kind === 'zed';
+    const resp = !isWB && !isZed && p.responses_url && p.responses_url !== p.base_url
       ? `<div class="cell-sub mono">responses: ${esc(p.responses_url)}</div>` : '';
     const px = p.proxy ? `<div class="cell-sub mono">proxy: ${esc(p.proxy)}</div>` : '';
     let keyCell;
@@ -1614,15 +1632,22 @@ function renderProviders() {
       keyCell = `<div>${esc(p.wb?.nickname || p.wb?.uid || '未导入凭证')}</div>` +
         (exp ? `<div class="cell-sub">token 到期 ${exp.toLocaleString()}</div>` : '') +
         `<button class="btn mini" onclick="wbRefreshNow('${p.id}')" style="margin-top:4px">续期</button>`;
+    } else if (isZed) {
+      const exp = p.zed?.expires_at ? new Date(p.zed.expires_at) : null;
+      keyCell = `<div>${esc(p.zed?.username || p.zed?.github_login || p.zed?.user_id || '未登录')}</div>` +
+        (exp ? `<div class="cell-sub">JWT 到期 ${exp.toLocaleString()}</div>` : '') +
+        `<button class="btn mini" onclick="zedRefreshNow('${p.id}')" style="margin-top:4px">重铸</button>`;
     } else {
       keyCell = esc(maskKey(p.api_key));
     }
     const balCell = isWB
       ? `${wbBalanceHTML(p)}<button class="btn mini" onclick="wbUsageNow('${p.id}')" style="margin-top:4px">查余额</button>` +
         (p.kind === 'workbuddy' && !p.wb?.enterprise_id ? ` <button class="btn mini" onclick="wbCheckinNow('${p.id}')">签到</button>` : '')
+      : isZed
+      ? `${zedBalanceHTML(p)}<button class="btn mini" onclick="zedRefreshNow('${p.id}')" style="margin-top:4px">刷新账号</button>`
       : `${balanceHTML(p)}<button class="btn mini" onclick="queryBalance('${p.id}')" style="margin-top:4px">查询余额</button>`;
     return `<tr>
-      <td><b>${esc(p.name)}</b>${isWB ? `<div class="cell-sub">WorkBuddy ${esc(p.kind === 'workbuddy' ? '国内版' : '国际版')}</div>` : ''}</td>
+      <td><b>${esc(p.name)}</b>${isWB ? `<div class="cell-sub">WorkBuddy ${esc(p.kind === 'workbuddy' ? '国内版' : '国际版')}</div>` : ''}${isZed ? `<div class="cell-sub">Zed 账号</div>` : ''}</td>
       <td class="mono" style="max-width:320px;word-break:break-all">${esc(p.base_url)}${resp}${px}</td>
       <td class="mono">${keyCell}</td>
       <td style="min-width:200px">${balCell}</td>
@@ -1634,18 +1659,121 @@ function renderProviders() {
   }).join('');
 }
 
+// Zed 套餐/用量快照单元格
+function zedBalanceHTML(p) {
+  const plan = p.zed && p.zed.plan;
+  if (!plan) return '<span class="hint">套餐信息未刷新</span>';
+  const t = plan.checked_at ? new Date(plan.checked_at).toLocaleString() : '';
+  return `<div>${zedPlanInline(plan)}</div><div class="cell-sub">${t} 查询</div>`;
+}
+
+/* ---------- Zed 账号登录 ---------- */
+let zedLoginState = ''; // 进行中的登录会话 state
+
+// 编辑已有 Zed provider 时取其凭证（保存时原样带回，登录成功后由服务端更新）
+function zedCredOf(editing) {
+  return (editing && editing.kind === 'zed' && editing.zed) ? editing.zed : null;
+}
+
+function zedPlanInline(plan) {
+  if (!plan) return '';
+  let s = esc(plan.plan_type || '未知套餐');
+  if (plan.used != null) s += ` · 已用 ${Number(plan.used).toLocaleString()}` + (plan.limit != null ? ` / ${Number(plan.limit).toLocaleString()}` : '') + ' 次请求';
+  if (plan.subscription_end) s += ` · 周期至 ${esc(plan.subscription_end.slice(0, 10))}`;
+  return s;
+}
+
+function zedRenderStatus() {
+  const el = $('p-zedstatus');
+  if ($('p-kind').value !== 'zed') return;
+  const cred = zedCredOf(editingProvider);
+  if (!cred) { el.innerHTML = '尚未登录——点击「登录 Zed」在浏览器完成授权后自动创建 Provider'; return; }
+  const exp = cred.expires_at ? new Date(cred.expires_at) : null;
+  let html = `已登录：<b>${esc(cred.username || cred.github_login || cred.user_id)}</b>` +
+    (exp ? ` · JWT 到期 ${exp.toLocaleString()}` : '') + (cred.plan ? ' · ' + zedPlanInline(cred.plan) : '');
+  html += ` <button class="btn mini" onclick="zedRefreshNow('${editingProvider.id}')">重铸 JWT / 刷新账号</button>`;
+  el.innerHTML = html;
+}
+
+// 发起登录：拿到授权 URL 后新开浏览器页，本页轮询会话状态
+async function zedLoginStart() {
+  try {
+    const res = await api('POST', '/api/zed/login', {
+      system_id: $('p-zedsysid').value.trim(),
+      name: $('p-name').value.trim(),
+    });
+    zedLoginState = res.state;
+    $('p-zedstatus').innerHTML = '已打开授权页，完成登录后这里会自动更新…（10 分钟内有效）';
+    window.open(res.url, '_blank', 'noopener');
+    zedPoll();
+  } catch (e) { alert('发起登录失败: ' + e.message); }
+}
+
+function zedPoll() {
+  if (!zedLoginState) return;
+  setTimeout(async () => {
+    let res;
+    try { res = await api('GET', '/api/zed/login/status?state=' + encodeURIComponent(zedLoginState)); }
+    catch (e) { return; /* 会话过期等：停止轮询 */ }
+    if (res.status === 'pending') { zedPoll(); return; }
+    zedLoginState = '';
+    if (res.status === 'success') {
+      await load();
+      editingProvider = S.providers.find(p => p.id === res.provider) || null;
+      $('p-name').value = editingProvider?.name || $('p-name').value;
+      zedRenderStatus();
+      toast(`Zed 登录成功，已同步 ${res.models} 个模型（优先级 0，可在模型页调整）`);
+    } else {
+      $('p-zedstatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}，可重试`;
+    }
+  }, 1500);
+}
+
+// 无浏览器环境兜底：粘贴浏览器地址栏里的回调 URL
+async function zedLoginPaste() {
+  const url = $('p-zedcb').value.trim();
+  if (!url) { alert('请先粘贴回调 URL'); return; }
+  if (!zedLoginState) { alert('请先点击「登录 Zed」发起会话，再把浏览器里的回调 URL 粘贴到这里'); return; }
+  try {
+    const res = await api('POST', '/api/zed/login/paste', {state: zedLoginState, url});
+    zedLoginState = '';
+    if (res.status === 'success') {
+      await load();
+      editingProvider = S.providers.find(p => p.id === res.provider) || null;
+      $('p-name').value = editingProvider?.name || $('p-name').value;
+      zedRenderStatus();
+      toast(`Zed 登录成功，已同步 ${res.models} 个模型`);
+    } else {
+      $('p-zedstatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}`;
+    }
+  } catch (e) { alert(e.message); }
+}
+
+async function zedRefreshNow(id) {
+  try {
+    const res = await api('POST', `/api/providers/${id}/zed-refresh`);
+    toast(`已重铸，JWT 到期 ${res.expires_at ? new Date(res.expires_at).toLocaleString() : '未知'}`);
+    await load();
+    editingProvider = S.providers.find(p => p.id === id) || editingProvider;
+    zedRenderStatus();
+  } catch (e) { alert(e.message); }
+}
+
 /* ---------- WorkBuddy 凭证 ---------- */
 const WB_ENDPOINTS = {'workbuddy': 'https://copilot.tencent.com/v2', 'workbuddy-intl': 'https://www.codebuddy.ai/v2'};
 let wbCred = null; // 当前弹窗持有的凭证（编辑时来自 provider，重新导入后覆盖）
 let wbHits = [];
 
 function onKindChange() {
-  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind];
-  for (const id of ['row-base', 'row-key', 'row-resp', 'row-bal']) $(id).style.display = wb ? 'none' : '';
-  $('hint-normal').style.display = wb ? 'none' : '';
+  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', special = wb || zed;
+  for (const id of ['row-base', 'row-key', 'row-resp', 'row-bal']) $(id).style.display = special ? 'none' : '';
+  $('hint-normal').style.display = special ? 'none' : '';
   $('p-wb').hidden = !wb;
+  $('p-zed').hidden = !zed;
   if (wb) $('p-base').value = WB_ENDPOINTS[kind];
+  if (zed) $('p-base').value = 'https://cloud.zed.dev/completions';
   wbRenderStatus();
+  zedRenderStatus();
 }
 
 function wbRenderStatus() {
@@ -1761,25 +1889,33 @@ function editProvider(id) {
   $('p-wbscan').innerHTML = '';
   wbHits = [];
   wbCred = editingProvider?.wb || null;
+  $('p-zedsysid').value = editingProvider?.zed?.system_id || '';
+  $('p-zedcb').value = '';
+  zedLoginState = '';
   onKindChange();
   dlgProvider.showModal();
 }
 
 async function saveProvider() {
-  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind];
+  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed';
   const body = {
     name: $('p-name').value.trim() || 'provider',
     kind,
     base_url: $('p-base').value.trim(),
-    responses_url: wb ? '' : $('p-resp').value.trim(),
-    api_key: wb ? '' : $('p-key').value.trim(),
-    balance_url: wb ? '' : $('p-bal').value.trim(),
+    responses_url: (wb || zed) ? '' : $('p-resp').value.trim(),
+    api_key: (wb || zed) ? '' : $('p-key').value.trim(),
+    balance_url: (wb || zed) ? '' : $('p-bal').value.trim(),
     proxy: $('p-proxy').value.trim(),
   };
   if (wb) {
     body.wb = wbCred;
     if (!body.base_url) body.base_url = WB_ENDPOINTS[kind];
     if (!body.wb || !body.wb.access_token) { alert('WorkBuddy 类型需要先导入凭证（扫描或粘贴导入）'); return; }
+  }
+  if (zed) {
+    body.zed = zedCredOf(editingProvider);
+    if (!body.base_url) body.base_url = 'https://cloud.zed.dev/completions';
+    if (!body.zed || !body.zed.user_id) { alert('Zed 类型需要先完成「登录 Zed」'); return; }
   }
   if (!body.base_url) { alert('Chat 基址必填'); return; }
   try {

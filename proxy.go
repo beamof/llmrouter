@@ -400,6 +400,29 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				s.addSessionUsage(sessKey, sm)
 				return
 			}
+			// Zed 候选走原生客户端适配分支：信封装配、JWT 懒重铸/强制重铸、
+			// 上游事件流翻译回客户端协议都在 zedAttempt 里完成（chat 与 responses
+			// 两种接入协议均承接，内部按模型前缀选 Zed 线协议）
+			if zedOf(c.Provider) != nil {
+				sendBody := body
+				if isAuto {
+					sendBody = withModel(body, c.Model.Name)
+				}
+				var sm usageSample
+				if err := s.zedAttempt(w, r, c, sendBody, keyID, suffix == "/responses", tm, &sm); err != nil {
+					lastErr = err.Error()
+					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
+					attemptSkips = append(attemptSkips, SkipReason{
+						ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+						Reason: "尝试失败：" + truncateRunes(lastErr, 160),
+					})
+					continue // 名额释放与失败日志由 zedAttempt 处理
+				}
+				bind(c, http.StatusOK)
+				s.store.AddCallUsage(sid, req.Model, &c.Model, keyID, sm)
+				s.addSessionUsage(sessKey, sm)
+				return
+			}
 			sendBody := body
 			if isAuto {
 				sendBody = withModel(body, c.Model.Name) // 仅替换顶层 model 字段的值
@@ -504,7 +527,8 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 
 // candidateSupportsProtocol 判断候选能否处理该接入协议。标准 OpenAI 兼容 Provider
 // 两种协议都原样透传；WorkBuddy 上游只有 chat completions，仅在开启 responses
-// 协议转换时才由适配层翻译承接 /v1/responses。
+// 协议转换时才由适配层翻译承接 /v1/responses；Zed 适配层两种协议恒可承接
+// （chat 直接转换，responses 在 gpt 线路保真透传、claude 线路经 chat 中转）。
 func candidateSupportsProtocol(c Candidate, protocol string, responsesConvert bool) bool {
 	if protocol != "responses" {
 		return true

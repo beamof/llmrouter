@@ -46,6 +46,12 @@ type Server struct {
 	wbLocks map[string]*sync.Mutex // WorkBuddy 续期单飞锁（键 = provider ID），仅内存
 	wbCats  map[string]*wbCatalog  // WorkBuddy 模型目录缓存（键 = provider ID），仅内存
 
+	zedMu      sync.Mutex
+	zedLocks   map[string]*sync.Mutex // Zed JWT 重铸单飞锁（键 = provider ID），仅内存
+	zedLoginMu sync.Mutex
+	zedLogins  map[string]*zedLoginSession // Zed 原生登录会话（键 = state），仅内存
+	zedBase    string                      // Zed 云端基址覆盖（测试注入用，空 = 官方端点）
+
 	pxMu   sync.Mutex
 	pxTpts map[string]*http.Transport // 按代理地址缓存的 Transport（连接池共享），仅内存
 
@@ -77,6 +83,11 @@ func (s *Server) routes() *http.ServeMux {
 	api.HandleFunc("GET /api/providers/{id}/models", s.handleUpstreamModels)
 	api.HandleFunc("POST /api/workbuddy/scan", s.handleWBScan)
 	api.HandleFunc("POST /api/workbuddy/import", s.handleWBImport)
+	api.HandleFunc("POST /api/zed/login", s.handleZedLoginStart)
+	api.HandleFunc("GET /api/zed/login/status", s.handleZedLoginStatus)
+	api.HandleFunc("POST /api/zed/login/paste", s.handleZedLoginPaste)
+	api.HandleFunc("POST /api/zed/login/cancel", s.handleZedLoginCancel)
+	api.HandleFunc("POST /api/providers/{id}/zed-refresh", s.handleZedRefresh)
 	api.HandleFunc("POST /api/models", s.handleModelUpsert)
 	api.HandleFunc("PUT /api/models/{id}", s.handleModelUpsert)
 	api.HandleFunc("DELETE /api/models/{id}", s.handleModelDelete)

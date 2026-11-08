@@ -130,8 +130,16 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "WorkBuddy 类型的 provider 必须携带凭证（wb.access_token），编辑时请勿丢弃 wb 字段")
 			return
 		}
+	case "zed":
+		// Zed 类型：数据面基址固定官方端点，不接受自定义（理由同 WorkBuddy：
+		// JWT 凭证随请求发出，改写基址等于允许把凭证发往任意主机）
+		if p.Zed == nil || strings.TrimSpace(p.Zed.UserID) == "" {
+			writeErr(w, http.StatusBadRequest, "Zed 类型的 provider 必须携带凭证（zed.user_id），编辑时请勿丢弃 zed 字段")
+			return
+		}
+		p.BaseURL = s.zedCloud() + "/completions"
 	default:
-		writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy 或 workbuddy-intl")
+		writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy、workbuddy-intl 或 zed")
 		return
 	}
 	if p.BaseURL == "" {
@@ -155,6 +163,7 @@ func (s *Server) handleProviderDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.wbForgetProvider(id)
+	s.zedForgetProvider(id)
 	s.replyState(w, r)
 }
 
