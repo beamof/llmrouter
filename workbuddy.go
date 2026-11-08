@@ -1684,33 +1684,9 @@ func (a *wbAgg) result(model string) ([]byte, Usage) {
 	return b, wbUsageOf(a.usageRaw)
 }
 
-// wbUsageOf 解析 usage 对象为记账用量（兼容 chat/responses 两套字段名）
+// wbUsageOf 解析 usage 对象为记账用量（兼容 chat/responses 两套字段名及缓存分项）
 func wbUsageOf(raw json.RawMessage) Usage {
-	var u struct {
-		PromptTokens     int64 `json:"prompt_tokens"`
-		CompletionTokens int64 `json:"completion_tokens"`
-		PromptDetails    *struct {
-			CachedTokens int64 `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-		InputTokens  int64 `json:"input_tokens"`
-		OutputTokens int64 `json:"output_tokens"`
-		InputDetails *struct {
-			CachedTokens int64 `json:"cached_tokens"`
-		} `json:"input_tokens_details"`
-	}
-	if json.Unmarshal(raw, &u) != nil {
-		return Usage{}
-	}
-	out := Usage{Prompt: u.PromptTokens, Completion: u.CompletionTokens}
-	if out.Prompt == 0 && out.Completion == 0 {
-		out.Prompt, out.Completion = u.InputTokens, u.OutputTokens
-	}
-	if u.PromptDetails != nil {
-		out.Cached = u.PromptDetails.CachedTokens
-	} else if u.InputDetails != nil {
-		out.Cached = u.InputDetails.CachedTokens
-	}
-	return out
+	return parseUsageObject(raw)
 }
 
 // ── 候选处理入口（由代理循环调用） ────────────────────────────────────────

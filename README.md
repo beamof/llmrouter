@@ -80,7 +80,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - **并行上限**：每个模型条目可设「并行上限」（`max_concurrent`，0 = 不限）。某条路由的在途请求数达到上限后，新请求**不再排队**，而是自动落到该模型名的下一个候选；全部候选都满时返回 404。计数按模型条目独立，同一模型名挂在多个 Provider 上互不影响；仅存内存，重启归零。后台模型列表的「并行」列实时显示 `在途 / 上限`
 - **模型列表暴露**：`/v1/models` 默认只返回 auto 虚拟模型。模型路由页每条路由的「暴露」开关可单独控制其模型名是否出现在列表中（同名路由任一开启即出现）；关闭只影响列表展示，直接指定 `model` 名或走 auto 路由仍可正常调用
 - 非流式响应会顺带读取 `usage` 字段记账 token（兼容 `prompt_tokens/completion_tokens` 与 `input_tokens/output_tokens`）；流式响应透传时保留 8KB 滚动尾部副本（不改任何字节），从末尾 `usage` 事件提取 token，同样计入统计与每日上限
-- 缓存命中单独统计：读取 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`（含在输入 token 内），用量页展示缓存量与命中率
+- 缓存命中单独统计：优先读取 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`，缺失时回落 `prompt_cache_hit_tokens`（DeepSeek）、`cache_read_input_tokens`、顶层 `cached_tokens`（含在输入 token 内）；流式按 SSE 事件解析 usage，不会把正文里的 `"usage"` 文本误当用量，用量页展示缓存量与命中率
 - Provider 的 API Key 为空时，客户端的 Authorization 头会原样转发（自带 Key 模式）
 
 ## WorkBuddy 上游

@@ -991,7 +991,7 @@ func TestExtractStreamUsage(t *testing.T) {
 		t.Errorf("responses 风格提取错误: %d/%d", u.Prompt, u.Completion)
 	}
 	// chat 风格
-	chatStyle := []byte(`...data: {"usage":{"prompt_tokens":5,"completion_tokens":6}}`)
+	chatStyle := []byte(`data: {"usage":{"prompt_tokens":5,"completion_tokens":6}}`)
 	if u := extractStreamUsage(chatStyle); u.Prompt != 5 || u.Completion != 6 {
 		t.Errorf("chat 风格提取错误: %d/%d", u.Prompt, u.Completion)
 	}
@@ -1937,4 +1937,139 @@ func TestMuteOn429LogsAndSkips(t *testing.T) {
 		t.Fatalf("剔除原因应说明 429: %+v", skips)
 	}
 	_ = m
+}
+
+// 上游 usage 中 completion_tokens_details.cached_tokens 可能排在 prompt 分项之前
+// （WorkBuddy/DeepSeek 网关的实测形状），解析必须只认 prompt/input 的缓存分项。
+func TestCachedTokensPreferPromptDetails(t *testing.T) {
+	tail := []byte("data: " + `{"choices":[{"delta":{"content":""},"finish_reason":"length"}],` +
+		`"usage":{"prompt_tokens":3008,"completion_tokens":1,"total_tokens":3009,` +
+		`"completion_tokens_details":{"reasoning_tokens":0,"cached_tokens":0},` +
+		`"prompt_tokens_details":{"reasoning_tokens":0,"cached_tokens":2816},` +
+		`"prompt_cache_hit_tokens":2816,"prompt_cache_miss_tokens":192,` +
+		`"cache_read_input_tokens":0,"cached_tokens":0}}` + "\n\n")
+	u := extractStreamUsage(tail)
+	if u.Prompt != 3008 || u.Completion != 1 || u.Cached != 2816 {
+		t.Fatalf("流式缓存优先取 prompt 分项失败: %+v", u)
+	}
+}
+
+// usage 缓存字段的回落顺序：prompt/input 分项 → DeepSeek → Anthropic → 顶层；
+// completion_tokens_details.cached_tokens 永远不当作提示缓存。
+func TestParseUsageObjectCacheFallbacks(t *testing.T) {
+	cases := []struct {
+		name, raw string
+		want      Usage
+	}{
+		{"prompt_details", `{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":80}}`,
+			Usage{Prompt: 100, Completion: 10, Cached: 80}},
+		{"input_details", `{"input_tokens":107,"output_tokens":36,"input_tokens_details":{"cached_tokens":64}}`,
+			Usage{Prompt: 107, Completion: 36, Cached: 64}},
+		{"deepseek", `{"prompt_tokens":50,"completion_tokens":5,"prompt_cache_hit_tokens":40}`,
+			Usage{Prompt: 50, Completion: 5, Cached: 40}},
+		{"anthropic", `{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":70}`,
+			Usage{Prompt: 20, Completion: 5, Cached: 70}},
+		{"top_level", `{"prompt_tokens":30,"completion_tokens":5,"cached_tokens":12}`,
+			Usage{Prompt: 30, Completion: 5, Cached: 12}},
+		{"completion_details_only", `{"prompt_tokens":30,"completion_tokens":5,"completion_tokens_details":{"cached_tokens":9}}`,
+			Usage{Prompt: 30, Completion: 5, Cached: 0}},
+		{"explicit_zero_no_fallback", `{"prompt_tokens":30,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0},"prompt_cache_hit_tokens":9}`,
+			Usage{Prompt: 30, Completion: 5, Cached: 0}},
+	}
+	for _, tc := range cases {
+		if got := parseUsageObject([]byte(tc.raw)); got != tc.want {
+			t.Errorf("%s: got %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+	// 非流式透传同样按新解析器记账
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"choices":[],"usage":{"completion_tokens":1,"completion_tokens_details":{"cached_tokens":0},`+
+			`"prompt_tokens":3008,"prompt_tokens_details":{"cached_tokens":2816}}}`)
+	}))
+	defer up.Close()
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "m", nil)
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+		t.Fatal("请求失败")
+	}
+	var st struct {
+		Usage []*UsageStat `json:"usage"`
+	}
+	json.Unmarshal(s.store.SnapshotJSON(), &st)
+	if len(st.Usage) != 1 || st.Usage[0].CachedTokens != 2816 || st.Usage[0].PromptTokens != 3008 {
+		t.Fatalf("非流式缓存记账错误: %+v", st.Usage)
+	}
+}
+
+// usage:null 或尾部被截断时不应把正文里的 "usage" 文本误当用量。
+func TestStreamUsageIgnoresContentAndTruncatedJSON(t *testing.T) {
+	if u := extractStreamUsage([]byte(`..."usage":null`)); u != (Usage{}) {
+		t.Fatalf("usage:null 应记 0: %+v", u)
+	}
+	truncated := []byte(`..."usage":{"prompt_tokens":12,"completion`) // usage 对象未闭合
+	if u := extractStreamUsage(truncated); u != (Usage{}) {
+		t.Fatalf("截断的 usage 应记 0: %+v", u)
+	}
+}
+
+// 逆序扫描应跳过 usage:null 的帧与正文里的 "usage" 文本；尾部截断时仍能取到完整 usage 对象。
+func TestStreamUsageReverseScan(t *testing.T) {
+	tail := []byte("data: " + `{"choices":[{"delta":{"content":"example usage: {\"cached_tokens\":999}"}}]}` + "\n\n" +
+		"data: " + `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":7}}}` + "\n\n" +
+		"data: " + `{"choices":[],"usage":{}}` + "\n\n" +
+		"data: " + `{"choices":[],"usage":null}` + "\n\n" +
+		"data: [DONE]\n\n")
+	if u := extractStreamUsage(tail); u != (Usage{Prompt: 10, Completion: 1, Cached: 7}) {
+		t.Fatalf("逆序扫描取 usage 错误: %+v", u)
+	}
+
+	truncated := []byte(`data: {"type":"response.completed","response":{"id":"x","output":[{"type":"message"}],"usage":{"input_tokens":107,"input_tokens_details":{"cached_tokens":64},"output_tokens":36}}`)
+	if u := extractStreamUsage(truncated); u != (Usage{Prompt: 107, Completion: 36, Cached: 64}) {
+		t.Fatalf("截断事件的 usage 解析错误: %+v", u)
+	}
+}
+
+// 流式 chat completions 经代理后，缓存命中应记 prompt 分项而不是 completion 分项。
+func TestStreamCachedTokensThroughProxy(t *testing.T) {
+	sse := "data: " + `{"choices":[{"delta":{"content":"hi"}}]}` + "\n\n" +
+		"data: " + `{"choices":[],"usage":{"prompt_tokens":3008,"completion_tokens":1,"total_tokens":3009,` +
+		`"completion_tokens_details":{"reasoning_tokens":0,"cached_tokens":0},` +
+		`"prompt_tokens_details":{"reasoning_tokens":0,"cached_tokens":2816},` +
+		`"prompt_cache_hit_tokens":2816,"cached_tokens":0}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, sse)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "m", nil)
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m","stream":true}`)
+	if resp.StatusCode != 200 || body != sse {
+		t.Fatalf("SSE 应原样透传: %d %q", resp.StatusCode, body)
+	}
+	var st struct {
+		Usage []*UsageStat `json:"usage"`
+	}
+	for i := 0; i < 50; i++ {
+		json.Unmarshal(s.store.SnapshotJSON(), &st)
+		if len(st.Usage) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(st.Usage) != 1 || st.Usage[0].CachedTokens != 2816 ||
+		st.Usage[0].PromptTokens != 3008 || st.Usage[0].CompletionTokens != 1 {
+		t.Fatalf("流式缓存记账错误: %+v", st.Usage)
+	}
+}
+
+// response.completed 事件超过 8KB 尾部窗口时，残片没有 data: 前缀也要能取出 usage。
+func TestStreamUsageTruncatedEventWithoutPrefix(t *testing.T) {
+	fragment := []byte(`"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],` +
+		`"usage":{"input_tokens":107,"input_tokens_details":{"cached_tokens":64},"output_tokens":36},"status":"completed"}}`)
+	if u := extractStreamUsage(fragment); u != (Usage{Prompt: 107, Completion: 36, Cached: 64}) {
+		t.Fatalf("无 data: 前缀的残片解析错误: %+v", u)
+	}
 }

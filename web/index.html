@@ -579,7 +579,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
               <li>请求体原样透传（messages / tools / stream 等全部字段不做改动），响应字节级回传。</li>
               <li>客户端带 <code>X-Session-ID</code> 头可开启会话粘性：同一会话固定走同一上游，仅在上游失败时才切换；默认 1 小时无活动过期（可在上方调整），也可在活跃会话面板手动结束。</li>
               <li>每日上限与静音时段按服务器本地时间计算；静音时段支持跨零点，如 22:00~06:00。</li>
-              <li>缓存命中读取 <code>prompt_tokens_details.cached_tokens</code>，含在输入 token 内，首页单独展示。</li>
+              <li>缓存命中优先读取 <code>prompt_tokens_details.cached_tokens</code> / <code>input_tokens_details.cached_tokens</code>，缺失时回落 DeepSeek 的 <code>prompt_cache_hit_tokens</code> 等字段（含在输入 token 内），首页单独展示。</li>
             </ul>
           </div>
         </section>
