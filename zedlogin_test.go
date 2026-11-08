@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,12 +20,14 @@ import (
 
 // zedFakeCloud 伪造 cloud.zed.dev：llm_tokens / models / users/me / completions
 type zedFakeCloud struct {
-	base    string
-	jwt     string // 换发的 JWT（zedTestJWT 生成）
-	models  string
-	account string
-	native  atomic.Value     // 收到的原生凭据（llm_tokens 校验后的留档）
-	handler http.HandlerFunc // completions 覆盖（可选）
+	base       string
+	jwt        string // 换发的 JWT（zedTestJWT 生成）
+	models     string
+	account    string
+	native     atomic.Value // 收到的原生凭据（llm_tokens 校验后的留档）
+	mintMu     sync.Mutex
+	mintBodies []string         // 每次 llm_tokens 收到的请求 body（锁定空 body 契约）
+	handler    http.HandlerFunc // completions 覆盖（可选）
 }
 
 func zedTestJWT(t *testing.T, ttl time.Duration) string {
@@ -40,6 +43,10 @@ func zedStartFakeCloud(t *testing.T) (*zedFakeCloud, *Server, *httptest.Server) 
 	fc := &zedFakeCloud{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /client/llm_tokens", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		fc.mintMu.Lock()
+		fc.mintBodies = append(fc.mintBodies, string(b))
+		fc.mintMu.Unlock()
 		auth := r.Header.Get("Authorization")
 		parts := strings.SplitN(auth, " ", 2)
 		if len(parts) != 2 || parts[0] != "user-1" || !json.Valid([]byte(parts[1])) {
@@ -257,8 +264,12 @@ func TestZedMintAndExpiry(t *testing.T) {
 	if !minted.expires().After(time.Now()) {
 		t.Fatal("过期时刻应在未来")
 	}
-	if !minted.tokenExpiring() && false {
-		t.Fatal("unreachable")
+	// 契约：llm_tokens 必须空 body（真实上游对 "{}" 报 400 Invalid JSON）
+	fc.mintMu.Lock()
+	bodies := append([]string(nil), fc.mintBodies...)
+	fc.mintMu.Unlock()
+	if len(bodies) != 1 || bodies[0] != "" {
+		t.Fatalf("llm_tokens 请求必须带空 body: %q", bodies)
 	}
 	// 无效原生凭据 → 401
 	if _, err := zedMintLLMToken(t.Context(), cli, fc.base, &ZedCred{UserID: "bad", NativeCredential: json.RawMessage(`{}`)}); err == nil {
