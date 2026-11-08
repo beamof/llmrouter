@@ -262,29 +262,53 @@ func TestModelsList(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "zzz", nil)
 	addProviderModel(t, s, up.URL, "zzz", nil) // 同名去重
-	addProviderModel(t, s, up.URL, "aaa", nil)
+	mA := addProviderModel(t, s, up.URL, "aaa", nil)
 
-	resp, _ := postJSON(t, app, "/v1/models", "") // POST 应 405，换 GET
-	if resp.StatusCode != 405 {
+	if resp, _ := postJSON(t, app, "/v1/models", ""); resp.StatusCode != 405 { // POST 应 405，换 GET
 		t.Fatalf("POST /v1/models 应 405, got %d", resp.StatusCode)
 	}
-	r2, err := app.Client().Get(app.URL + "/v1/models")
-	if err != nil {
-		t.Fatal(err)
+	ids := func() []string {
+		t.Helper()
+		r, err := app.Client().Get(app.URL + "/v1/models")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		var v struct {
+			Data []struct {
+				ID string
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(b, &v); err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, len(v.Data))
+		for i, d := range v.Data {
+			out[i] = d.ID
+		}
+		return out
 	}
-	b, _ := io.ReadAll(r2.Body)
-	r2.Body.Close()
-	var v struct {
-		Data []struct {
-			ID string
-		} `json:"data"`
+
+	// 默认只有 auto 虚拟模型对外暴露，真实模型需逐条打开开关
+	if got := ids(); len(got) != 1 || got[0] != "auto" {
+		t.Errorf("默认应只暴露 auto，got %v", got)
 	}
-	if err := json.Unmarshal(b, &v); err != nil {
-		t.Fatal(err)
+
+	// 打开 aaa 的暴露开关后，auto 之后出现 aaa（去重排序）
+	if resp, body := postJSON(t, app, "/api/models/"+mA.ID+"/expose", `{"expose":true}`); resp.StatusCode != 200 {
+		t.Fatalf("设置 expose 失败: %d %s", resp.StatusCode, body)
 	}
-	// 第一个恒为 auto 虚拟模型，其后为真实模型名去重排序
-	if len(v.Data) != 3 || v.Data[0].ID != "auto" || v.Data[1].ID != "aaa" || v.Data[2].ID != "zzz" {
-		t.Errorf("模型列表不正确: %s", b)
+	if got := ids(); len(got) != 2 || got[0] != "auto" || got[1] != "aaa" {
+		t.Errorf("开启暴露后模型列表不正确: %v", got)
+	}
+
+	// 关闭后重新隐藏
+	if resp, body := postJSON(t, app, "/api/models/"+mA.ID+"/expose", `{"expose":false}`); resp.StatusCode != 200 {
+		t.Fatalf("关闭 expose 失败: %d %s", resp.StatusCode, body)
+	}
+	if got := ids(); len(got) != 1 || got[0] != "auto" {
+		t.Errorf("关闭暴露后应只剩 auto，got %v", got)
 	}
 }
 
@@ -1595,8 +1619,43 @@ func TestSessionLogAutoModel(t *testing.T) {
 	if sess.Model != "real-model" || sess.Requested != "auto" {
 		t.Errorf("应记录实际模型与原始请求名: %+v", sess)
 	}
+	if sess.Protocol != "chat" {
+		t.Errorf("chat 入口应记录 protocol=chat: %+v", sess)
+	}
 	if !strings.Contains(sess.Reason, "auto") {
 		t.Errorf("理由应提到 auto: %q", sess.Reason)
+	}
+}
+
+// 会话日志要记录接入协议，区分 chat completions 与 responses
+func TestSessionLogProtocol(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"id":"x1","usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "m", nil)
+
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		"X-Session-ID", "sess-chat"); resp.StatusCode != 200 {
+		t.Fatalf("chat 应 200, got %d %s", resp.StatusCode, body)
+	}
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/responses", `{"model":"m"}`,
+		"X-Session-ID", "sess-resp"); resp.StatusCode != 200 {
+		t.Fatalf("responses 应 200, got %d %s", resp.StatusCode, body)
+	}
+
+	got := map[string]string{}
+	s.store.mu.Lock()
+	for _, l := range s.store.Logs {
+		if l.Kind == kindSession {
+			got[l.SessionID] = l.Protocol
+		}
+	}
+	s.store.mu.Unlock()
+	if got["sess-chat"] != "chat" || got["sess-resp"] != "responses" {
+		t.Errorf("会话日志协议记录不正确: %+v", got)
 	}
 }
 

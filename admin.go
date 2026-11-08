@@ -164,6 +164,21 @@ func (s *Server) handleModelDelete(w http.ResponseWriter, r *http.Request) {
 	s.replyState(w, r)
 }
 
+// handleModelExpose 切换该模型名是否出现在 /v1/models 列表里（不影响指定 model 名直接调用）
+func (s *Server) handleModelExpose(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Expose bool `json:"expose"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if !s.store.SetModelExpose(r.PathValue("id"), req.Expose) {
+		writeErr(w, http.StatusNotFound, "model 不存在")
+		return
+	}
+	s.replyState(w, r)
+}
+
 func (s *Server) handleReorder(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IDs []string `json:"ids"`

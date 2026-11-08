@@ -112,6 +112,10 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 		// auto 虚拟模型：对外统一声明一个名字，按全局优先级自动挑选实际模型
 		autoName := s.store.AutoModelName()
 		isAuto := req.Model == autoName
+		protocol := "chat"
+		if suffix == "/responses" {
+			protocol = "responses"
+		}
 
 		// 会话绑定的候选排最前（不套用静音/上限规则），规则候选作为 fallback 池
 		sessKey := ""
@@ -165,6 +169,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 					ProviderID: c.Provider.ID,
 					Model:      c.Model.Name,
 					SessionID:  sid,
+					Protocol:   protocol,
 					Requested:  req.Model,
 					Switched:   boundID != "",
 					Status:     status,
@@ -514,8 +519,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	names := s.store.ModelNames()
-	data := []map[string]any{{"id": s.store.AutoModelName(), "object": "model", "owned_by": "llmrouter"}}
+	auto := s.store.AutoModelName()
+	data := []map[string]any{{"id": auto, "object": "model", "owned_by": "llmrouter"}}
 	for _, n := range names {
+		if n == auto { // 已有同名模型路由时避免重复
+			continue
+		}
 		data = append(data, map[string]any{"id": n, "object": "model", "owned_by": "llmrouter"})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})

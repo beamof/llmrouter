@@ -72,6 +72,11 @@ type Model struct {
 	MaxConcurrent int          `json:"max_concurrent"` // 最大并行请求数，0 = 不限；超出后新请求改走后续候选
 	Mutes         []MuteWindow `json:"mutes,omitempty"`
 
+	// Expose 该模型名是否出现在 /v1/models 列表里。默认 false：只有 auto 虚拟模型始终可见，
+	// 想让客户端下拉出现真实模型名时再按路由单独打开。同一模型名任一路由开启即暴露；
+	// 关闭只影响列表展示，直接指定 model 名或走 auto 路由都不受影响。
+	Expose bool `json:"expose,omitempty"`
+
 	// MutedUntil 上游返回 429 后自动静音到的时刻（绝对时间），零值 = 未静音。
 	// 与 Mutes（每天重复的时段）不同，这是临时的、一次性的，到点自动恢复。
 	MutedUntil time.Time `json:"muted_until,omitempty"`
@@ -491,6 +496,23 @@ func (s *Store) SetAutoModel(name string) {
 	s.save()
 }
 
+// SetModelExpose 切换某条模型路由是否在 /v1/models 中暴露
+func (s *Store) SetModelExpose(id string, expose bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.Models {
+		if m.ID != id {
+			continue
+		}
+		if m.Expose != expose {
+			m.Expose = expose
+			s.save()
+		}
+		return true
+	}
+	return false
+}
+
 // CandidateByID 按模型条目 ID 取候选。会话绑定直连时不套用静音时段/每日上限/并行上限
 // （绑定即优先），但上游 429 触发的自动静音仍然生效——那代表上游明确限流了，继续打过去没有意义。
 func (s *Store) CandidateByID(modelID string) (Candidate, bool) {
@@ -665,13 +687,15 @@ func mutedNow(ws []MuteWindow, now time.Time) bool {
 	return false
 }
 
-// ModelNames 去重后的对外模型名列表
+// ModelNames 去重后的对外模型名列表（仅统计开启了 Expose 的路由）
 func (s *Store) ModelNames() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	set := map[string]bool{}
 	for _, m := range s.Models {
-		set[m.Name] = true
+		if m.Expose {
+			set[m.Name] = true
+		}
 	}
 	out := make([]string, 0, len(set))
 	for n := range set {

@@ -23,6 +23,7 @@ type LogEntry struct {
 	// 会话建立相关（kind = session）
 	// 只在新会话首次选路、或会话中途重新选模型时记录；同一会话复用绑定不重复记。
 	SessionID  string       `json:"session_id,omitempty"` // 客户端 X-Session-ID 原文
+	Protocol   string       `json:"protocol,omitempty"`   // 接入协议：chat = /v1/chat/completions，responses = /v1/responses
 	Requested  string       `json:"requested,omitempty"`  // 请求体里的 model 字段
 	Switched   bool         `json:"switched,omitempty"`   // true = 会话中途换了模型，false = 新会话建立
 	Reason     string       `json:"reason,omitempty"`     // 选择该模型的理由（一句话）

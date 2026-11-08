@@ -176,6 +176,14 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .pill.ok{color:var(--ok);background:var(--ok-bg)}
 .pill.warn{color:var(--warn);background:var(--warn-bg)}
 .pill.bad{color:var(--bad);background:var(--bad-bg)}
+/* 开关：表格与弹窗共用 */
+.switch{position:relative;display:inline-block;width:34px;height:19px;flex:none;vertical-align:middle}
+.switch input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:1}
+.switch i{position:absolute;inset:0;border-radius:999px;background:#cbd5e1;transition:background .15s}
+.switch i::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(16,24,40,.25);transition:transform .15s}
+.switch input:checked+i{background:var(--acc)}
+.switch input:checked+i::after{transform:translateX(15px)}
+.switch input:focus-visible+i{box-shadow:0 0 0 3px var(--acc-l)}
 
 .mini-bar{height:5px;min-width:96px;border-radius:3px;background:#eef1f7;overflow:hidden}
 .usage-cell{display:flex;flex-direction:column;align-items:stretch;gap:5px;min-width:112px}
@@ -442,12 +450,12 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
           <div class="panel">
             <div class="panel-head">
               <h3>模型路由</h3>
-              <div class="hint">优先级数值越大越优先，可用 ▲▼ 调整顺序；同一模型名可挂多个 Provider 自动故障转移</div>
+              <div class="hint">优先级数值越大越优先，可用 ▲▼ 调整顺序；同一模型名可挂多个 Provider 自动故障转移。「暴露」开关控制模型名是否出现在 /v1/models 列表</div>
             </div>
             <div class="tbl-wrap">
               <table>
                 <thead><tr>
-                  <th style="width:88px">优先级</th><th>模型</th><th>Provider</th><th>状态</th>
+                  <th style="width:88px">优先级</th><th>模型</th><th>Provider</th><th style="width:72px">暴露</th><th>状态</th>
                   <th class="num">今日用量</th><th class="num">并行</th><th>静音时段</th><th>连通性</th><th style="width:150px">操作</th>
                 </tr></thead>
                 <tbody id="models-body"></tbody>
@@ -605,6 +613,12 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
     </div>
     <div class="field"><label>并行上限</label>
       <div class="inline"><input id="m-concurrent" type="number" min="0" step="1" value="0" style="max-width:110px"><span class="hint">同时处理的最大请求数，0 = 不限；满了新请求自动走后续候选</span></div>
+    </div>
+    <div class="field"><label>暴露</label>
+      <div class="inline">
+        <label class="switch"><input id="m-expose" type="checkbox"><i></i></label>
+        <span class="hint">在 /v1/models 列表中暴露该模型名；关闭只影响列表，直接指定 model 或走 auto 仍可用</span>
+      </div>
     </div>
     <div class="field" style="align-items:flex-start"><label>静音时段</label>
       <div style="flex:1;min-width:0">
@@ -923,11 +937,15 @@ function renderLogs() {
       ? (l.switched ? '<span class="pill warn" style="margin-left:4px">会话换模型</span>'
                     : '<span class="pill ok" style="margin-left:4px">新会话</span>')
       : '';
+    // 会话日志附接入协议，方便区分 chat 与 responses 两套入口
+    const protoTag = isSession && l.protocol
+      ? `<span class="pill" style="margin-left:4px;color:var(--acc);background:var(--acc-l)">${l.protocol === 'responses' ? 'Responses' : 'Chat'}</span>`
+      : '';
     return `<tr>
       <td class="log-time">${t.toLocaleDateString()} <small>${t.toLocaleTimeString()}</small></td>
       <td><span class="pill ${cls}">${esc(label)}</span></td>
       <td>
-        <div class="log-msg">${esc(l.message)}${bindTag}</div>
+        <div class="log-msg">${esc(l.message)}${bindTag}${protoTag}</div>
         ${isSession && l.reason ? `<div class="cell-sub" style="margin-top:3px">理由：${esc(l.reason)}</div>` : ''}
         ${isSession && l.session_id ? `<div class="cell-sub mono" style="margin-top:2px">会话 ${esc(l.session_id)} · 请求 ${esc(l.requested || '')}</div>` : ''}
         ${!isSession && l.detail && open ? `<div class="log-detail">${esc(l.detail)}</div>` : ''}
@@ -1190,7 +1208,7 @@ function isMuted(ws) {
 function renderModels() {
   const tb = $('models-body');
   if (!S.models.length) {
-    tb.innerHTML = `<tr><td colspan="9" class="empty">还没有模型，点右上角「添加模型」开始</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="10" class="empty">还没有模型，点右上角「添加模型」开始</td></tr>`;
     return;
   }
   tb.innerHTML = sortedModels().map((m, i) => {
@@ -1224,6 +1242,7 @@ function renderModels() {
       </td>
       <td class="mono"><b>${esc(m.name)}</b></td>
       <td>${esc(pname(m.provider_id))}</td>
+      <td><label class="switch" title="${m.expose ? '已出现在 /v1/models 列表中，点击隐藏' : '未出现在 /v1/models 列表中，点击暴露'}"><input type="checkbox" ${m.expose ? 'checked' : ''} onchange="toggleExpose('${m.id}', this.checked)"><i></i></label></td>
       <td>${status}${muteNote}</td>
       <td class="num">
         <div class="usage-cell" style="align-items:flex-end">
@@ -1260,6 +1279,18 @@ async function unmuteModel(id) {
     renderAll();
     toast('已解除静音');
   } catch (e) { alert(e.message); }
+}
+
+// 切换该模型名是否出现在 /v1/models 列表里
+async function toggleExpose(id, expose) {
+  try {
+    S = await api('POST', '/api/models/' + id + '/expose', {expose});
+    renderAll();
+    toast(expose ? '已暴露到模型列表' : '已从模型列表隐藏');
+  } catch (e) {
+    alert(e.message);
+    renderAll(); // 失败时回滚开关状态
+  }
 }
 
 async function testModel(id) {
@@ -1308,6 +1339,7 @@ function editModel(id) {
   $('m-priority').value = editingModel?.priority ?? ((sortedModels()[0]?.priority || 0) + 1);
   $('m-limit').value = editingModel?.daily_limit ? editingModel.daily_limit / 10000 : 0;
   $('m-concurrent').value = editingModel?.max_concurrent || 0;
+  $('m-expose').checked = !!editingModel?.expose;
   $('mutes').innerHTML = '';
   (editingModel?.mutes || []).forEach(w => addMuteRow(w.from, w.to));
   dlgModel.showModal();
@@ -1353,6 +1385,7 @@ async function saveModel() {
     priority: parseInt($('m-priority').value) || 0,
     daily_limit: Math.round((parseFloat($('m-limit').value) || 0) * 10000), // 界面单位：万 tokens
     max_concurrent: Math.max(0, parseInt($('m-concurrent').value) || 0),
+    expose: $('m-expose').checked,
     mutes,
   };
   if (!body.name) { alert('模型名必填'); return; }
