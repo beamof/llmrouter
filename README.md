@@ -9,6 +9,8 @@
 - **字节级透传**：请求体只读取 `model` 字段用于路由，其余不解析、不改写、不注入；流式（SSE）响应边收边发，非流式响应原样回传
 - **Responses 协议转换（默认关闭）**：`/v1/responses` 只路由到原生支持 Responses 的模型；仅支持 chat 的上游（WorkBuddy）默认被跳过并自动改用其他模型。设置页开启转换后，这类上游才以「responses → chat」翻译方式承接请求
 - **WorkBuddy/CodeBuddy 适配**：国内版（copilot.tencent.com，历史 workbuddy.cn 域名仍可服务）/ 国际版（codebuddy.ai，历史 workbuddy.ai 同站）两种内置 Provider 类型，复用官方客户端登录态调用其模型额度（详见下文）
+- **Zed 适配**：复用 Zed 编辑器账号的模型额度（`gpt-*`、`claude-*`），原生登录 + JWT 自动重铸 + 双向协议转换，chat 与 responses 两种接入协议直接承接（详见下文）
+- **第三方供应商接入框架**：WorkBuddy 与 Zed 共用同一套适配器骨架（Kind + 凭证 + `xxAttempt` 分流），新增私有协议上游按固定清单接入（详见下文）
 - **网页后台**（中文，单文件，无前端依赖）：Provider / 模型增删改、优先级排序、用量统计（按 token 计）、每日 token 上限、并行上限、按时段静音（mute）、上游余额查询、会话与异常日志
 - 状态落盘为单个 JSON 文件（默认 `data.json`），零外部依赖，单二进制
 
@@ -125,6 +127,71 @@ Provider「类型」选 **Zed 账号** 后，可复用 Zed 编辑器账号自带
 - 套餐用量（`plan` / 已用请求数）随登录与「重铸 / 刷新账号」按钮更新，展示在 Provider 列表
 
 > Zed 线协议为逆向实现，参照 [ccLoad](https://github.com/caidaoli/ccload)（MIT）的 `internal/zedauth` 与 `zed_wire.go`。上游协议变化时可能需要同步更新（如 `Zed/1.23.2` 版本号常量）。使用他人账号或违反 Zed 服务条款的风险请自行评估。
+
+## 第三方供应商接入框架
+
+WorkBuddy 与 Zed 两个适配器遵循同一套骨架：**Provider 挂 `Kind` 与凭证 → 代理候选循环分流到 `xxAttempt` → 适配器内完成鉴权、出站转换与回程翻译**。新增一类私有协议上游（官方客户端登录态、自有信封/线协议）时按下面的清单接入；标准 OpenAI 兼容上游不需要任何代码，直接加 Provider 即可。
+
+### 总体约定
+
+- **单包平铺、零外部依赖**：所有代码在 `package main`，新适配器做成 `xxx.go` 前缀的平铺文件（参照 `workbuddy*.go` / `zed*.go`），不建子包
+- **内部中间形态是 chat/completions**：两种客户端协议（chat / responses）与任意上游线协议之间的转换都经过 chat 中间形态，转换器按「chat ↔ 上游线协议」成对编写，避免 N×M 组合爆炸。已有可复用资产：`wbResponsesToChat`（responses 请求 → chat）、`wbRespStream`（chat 分片 → responses 事件流）、`wbAgg`（chat 分片 → 聚合对象）、`zedconv.go` 的四个转换器（chat ↔ Responses 线协议、chat ↔ Anthropic 线协议）
+- **会话粘性、优先级、故障转移、每日/并行上限、用量记账对适配器免费**：这些都作用在模型条目层，适配器只需按契约（见下）处理单个候选
+
+### 接入清单（七步）
+
+| # | 改动 | 位置 | 参照 |
+|---|---|---|---|
+| 1 | `Provider` 增加 `Kind` 值与凭证字段（如 `Zed *ZedCred`），过期时刻用 `*time.Time`（`omitempty` 对零值 time 不生效） | `store.go` | `WorkBuddyCred` / `ZedCred` |
+| 2 | 凭证读写方法：`UpdateXxxAuth`（**换指针拷贝**回写，绝不原地改字段——`Candidate` 里的 Provider 是浅拷贝，共享指针会产生数据竞争）与 `ProviderByXxx`（按账号唯一键去重，重复导入/登录原地更新） | `store.go` | `UpdateWBAuth` / `ProviderByZedUser` |
+| 3 | Kind 校验：`handleProviderUpsert` 的 switch 加分支；**基址固定为官方端点、不接受自定义**（凭证随请求发出，允许改基址等于允许把凭证发往任意主机）；校验凭证字段存在（编辑时勿丢） | `admin.go` | workbuddy / zed 分支 |
+| 4 | `Server` 增加该类型的单飞锁表（`xxMu` + `xxLocks map[string]*sync.Mutex`，键 = provider ID）与登录会话表（浏览器授权流程才需要），`main.go` 注册 `/api/...` 路由与 admin handler；`handleProviderDelete` 里调用 `xxForgetProvider` 清锁 | `main.go` / `admin.go` / 适配器文件 | `zedMu` / `zedLogins` / `zedForgetProvider` |
+| 5 | 凭证获取入口：登录（浏览器授权/回环回调/粘贴兜底）、扫描本机客户端、或粘贴导入；成功后 `UpsertProvider` + 同步模型条目（**只增不删**，不覆盖用户调整过的优先级/上限） | 适配器文件 | `zedlogin.go` / `workbuddyscan.go` |
+| 6 | 代理候选循环加分流分支（紧跟 `wbOf` / `zedOf` 判定处）：命中即调用 `s.xxAttempt(...)`，签名对齐 `wbAttempt`；`candidateSupportsProtocol` 声明该类型能否承接 `/v1/responses` | `proxy.go` | zed 分支 |
+| 7 | 适配器本体 `xxAttempt`：按下面的契约实现 | 适配器文件 | `workbuddy.go` / `zedwire.go` |
+
+### `xxAttempt` 契约
+
+```
+func (s *Server) xxAttempt(w http.ResponseWriter, r *http.Request,
+	c Candidate, sendBody []byte, keyID string,
+	responsesMode bool, tm *requestTiming, sm *usageSample) error
+```
+
+1. **名额与日志**：入口 `defer s.store.Release(c.Model.ID)`（名额在 `TryAcquire` 已占）；失败路径用 `s.logFail(LogEntry{...})` 记日志后返回 `error`，候选循环会换下一候选并汇总失败原因——不要自己写响应给客户端（返回错误即可）
+2. **凭证生命周期**：
+   - 懒刷新：距过期不足窗口（WorkBuddy 5 分钟 / Zed 2 分钟）时刷新一次，**失败不阻断**，沿用旧 token 继续发请求
+   - 强制刷新：请求被上游判定凭据失效（如 401）时强制刷新并**原候选重试一次**，用 `refreshed` 标志防循环；刷新也失败则报「请重新登录/导入」
+   - 单飞：per-provider 互斥锁包住刷新，**等锁的请求拿到锁后先复查 store 里的凭证**（可能已被别人刷新），refresh token 一次性轮换的场景必须这样避免浪费旧值
+   - 回写走第 2 步的换指针方法
+3. **出站构造**：请求归一化 / 线协议转换 / 请求头对齐官方客户端指纹，全部不透传客户端原始头（私有协议上游按官方客户端契约发送）
+4. **错误分类**（决定路由行为）：
+   - 凭据级 → 强制刷新重试一次（见上）
+   - 模型级（如 Zed 套餐不含该模型）→ `s.store.MuteModel(modelID, 时长, 原因)` 只静音该条目，渠道内其他模型继续可用
+   - 上游限流 → `MuteOn429`（静音到恢复时刻或默认时长）
+   - 其他 → 记日志返回 error，换下一候选
+5. **回程语义**（对齐 `wbAttempt`）：
+   - 上游恒为流式而客户端要流式：首字节经 `firstByteReader` 打点（TTFT），翻译后直写客户端（`flushWriter`）；**响应头惰性写**——首个事件前仍可换候选，已写字节后中断只能 `warn` 记日志并返回 `nil`（不能换候选）
+   - 客户端要非流式：先聚合（`wbAgg` 或等价物）再写响应头与 body，**中途断流不提交 200**、返回 error 交给候选循环换下一家
+   - usage 从上游终帧/事件提取，填进 `*sm = tm.sample(usage, 是否流式)`，记账与会话统计自动生效
+6. **协议能力**：`candidateSupportsProtocol` 里声明——上游原生支持 responses 透传则恒真；只有 chat 且想承接 `/v1/responses` 则挂全局「Responses 协议转换」开关；像 Zed 那样适配层内双协议转换的恒真
+
+### 测试模式
+
+- 伪造上游：`httptest.NewServer` 模拟该供应商全部端点（鉴权、模型目录、对话 SSE），参照 `zedStartFakeCloud`；把可注入的端点基址做成 `Server` 字段（如 `zedBase`，默认官方地址）
+- e2e 走完整链路：`newTestServer` / `postJSON`（`main_test.go`），覆盖登录/导入 → 建 Provider → 两种客户端协议 × 流式/非流式 → usage 落盘 → 401 强制刷新重试 → 模型级静音
+- 转换器用表驱动单测（参照 `zedconv_test.go`）；需要真实文件格式的（如 SQLite fixture）放 `testdata/`
+
+### 已接入类型速览
+
+| | WorkBuddy / CodeBuddy | Zed |
+|---|---|---|
+| Kind | `workbuddy` / `workbuddy-intl` | `zed` |
+| 凭证入口 | 本机扫描 / 粘贴 JSON | 浏览器原生登录（RSA）/ 粘贴回调 |
+| 凭证结构 | refresh token 一次性轮换 | 原生凭据长期有效，JWT 重铸 |
+| 上游线协议 | chat completions（仅流式） | gpt→Responses、claude→Anthropic（自有信封） |
+| responses 承接 | 需开全局转换开关 | 适配层内直接承接 |
+| 定额动作 | 签到 / 余额快照 | 套餐用量快照 |
 
 ## 模型测试按钮
 
