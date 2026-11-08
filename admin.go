@@ -324,6 +324,17 @@ func (s *Server) handleUpstreamModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"models": ids})
 		return
 	}
+	// Zed：目录在 cloud.zed.dev/models（JWT + 原生客户端头），BaseURL 是
+	// completions 端点，不能直接拼 /models
+	if zedOf(p) != nil {
+		models, err := s.zedCatalog(p)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "拉取 Zed 模型目录失败: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"models": models})
+		return
+	}
 	req, _ := http.NewRequest(http.MethodGet, strings.TrimRight(p.BaseURL, "/")+"/models", nil)
 	if p.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
@@ -423,6 +434,33 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.wbModelTest(w, m, p, e, cred)
+		return
+	}
+	// Zed：目录在 cloud.zed.dev/models（JWT + 原生客户端头），核对模型名在目录中
+	if zedOf(p) != nil {
+		start := time.Now()
+		models, err := s.zedCatalog(p)
+		res := map[string]any{"latency_ms": time.Since(start).Milliseconds()}
+		switch {
+		case err != nil:
+			res["level"] = "fail"
+			res["message"] = "连接失败: " + err.Error()
+		default:
+			res["level"] = "ok"
+			res["message"] = fmt.Sprintf("端口通，模型名在 Zed 目录中（共 %d 个）", len(models))
+			found := false
+			for _, id := range models {
+				if id == m.Name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				res["level"] = "warn"
+				res["message"] = fmt.Sprintf("端口通，但 Zed 目录（%d 个）中没有 %q，请核对模型名", len(models), m.Name)
+			}
+		}
+		writeJSON(w, http.StatusOK, res)
 		return
 	}
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(p.BaseURL, "/")+"/models", nil)

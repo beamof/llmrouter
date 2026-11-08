@@ -421,6 +421,23 @@ func (s *Server) zedCloud() string {
 	return zedCloudBase
 }
 
+// zedCatalog 拉取该 provider 的 Zed 模型目录（顺带确保推理 JWT 新鲜）。
+// 后台「添加模型」下拉与模型连通性测试共用——Zed 的目录端点带原生客户端头、
+// 用 JWT 鉴权，provider 的 BaseURL 是 completions 端点，不能直接拼 /models。
+func (s *Server) zedCatalog(p Provider) ([]string, error) {
+	cred, err := s.zedRefreshToken(p, false)
+	if err != nil {
+		return nil, err
+	}
+	cli, cerr := s.upstreamClient(p, 15*time.Second)
+	if cerr != nil {
+		return nil, cerr
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return zedFetchModels(ctx, cli, s.zedCloud(), cred)
+}
+
 // zedRefreshToken 重铸 Zed 短期 JWT 并回写。force 时无视临期窗口（401/403 后强制换新）。
 // 原生凭据长期有效，不存在"刷新令牌失效"，重铸失败通常意味着原生凭据被吊销。
 func (s *Server) zedRefreshToken(p Provider, force bool) (*ZedCred, error) {

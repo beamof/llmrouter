@@ -439,3 +439,30 @@ func TestZedTokenExpiring(t *testing.T) {
 		t.Fatal("无 token 应视为临期")
 	}
 }
+
+// TestZedUpstreamModels Zed provider 的「上游模型」下拉必须走 zedCatalog
+// （cloud.zed.dev/models + JWT + 原生客户端头），不能拿 BaseURL 拼 /models
+// ——那是 completions 端点，拼出来的地址必 404/405。
+func TestZedUpstreamModels(t *testing.T) {
+	fc, s, app := zedStartFakeCloud(t)
+	p := &Provider{ID: "p1", Kind: "zed", BaseURL: fc.base + "/completions",
+		Zed: &ZedCred{UserID: "user-1", OrganizationID: "org-1", NativeCredential: json.RawMessage(`{"k":1}`)}}
+	s.store.UpsertProvider(p)
+	// 凭证没有 JWT：zedCatalog 会先重铸（users/me → llm_tokens）再拉目录
+	resp, body := zedGet(t, app, "/api/providers/p1/models")
+	if resp.StatusCode != 200 || !strings.Contains(body, `"gpt-5.4"`) || !strings.Contains(body, `"claude-sonnet-4.5"`) {
+		t.Fatalf("上游模型下拉应返回目录: %d %s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, `"gemini-3-pro"`) {
+		t.Fatalf("不可转换的模型不应出现: %s", body)
+	}
+	// 非 Zed provider 不受影响：仍走通用 OpenAI 分支（fake cloud 无 /v1/models，
+	// 报通用错误文案而非 Zed 分支文案，证明没有被 Zed 分支拦截）
+	p2 := &Provider{ID: "p2", Kind: "openai", BaseURL: fc.base + "/v1", APIKey: "k"}
+	s.store.UpsertProvider(p2)
+	resp, body = zedGet(t, app, "/api/providers/p2/models")
+	if strings.Contains(body, "Zed") {
+		t.Fatalf("普通 provider 不应走 Zed 分支: %d %s", resp.StatusCode, body)
+	}
+	_ = fc
+}
