@@ -61,6 +61,10 @@ func (s *Server) getSession(key string) (string, bool) {
 }
 
 func (s *Server) setSession(key, modelID, keyID, requested string) {
+	ttl := sessionTTL
+	if s.store != nil { // 单元测试可能只构造 Server 的会话表
+		ttl = s.store.SessionTTL()
+	}
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 	if s.sessions == nil {
@@ -79,7 +83,7 @@ func (s *Server) setSession(key, modelID, keyID, requested string) {
 	sess := session{
 		modelID: modelID, keyID: keyID, requested: requested,
 		firstAt: old.firstAt, count: old.count + 1,
-		lastAt: now, expires: now.Add(sessionTTL),
+		lastAt: now, expires: now.Add(ttl),
 	}
 	if sess.firstAt.IsZero() {
 		sess.firstAt = now
@@ -91,6 +95,39 @@ func (s *Server) clearSession(key string) {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 	delete(s.sessions, key)
+}
+
+// endSession 主动结束某个会话 ID 下的全部绑定（同一会话在不同协议/请求模型名下
+// 可能各有一条）。返回实际删除的绑定数。
+func (s *Server) endSession(id string) int {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	prefix := id + "\x00"
+	n := 0
+	for k := range s.sessions {
+		if k == id || strings.HasPrefix(k, prefix) {
+			delete(s.sessions, k)
+			n++
+		}
+	}
+	return n
+}
+
+// applySessionTTL 把新 TTL 立即应用到现有绑定：按最近活跃时刻重算到期时间，
+// 已超过新 TTL 的条目顺手删除。
+func (s *Server) applySessionTTL(ttl time.Duration) {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	now := time.Now()
+	for k, v := range s.sessions {
+		exp := v.lastAt.Add(ttl)
+		if now.After(exp) {
+			delete(s.sessions, k)
+			continue
+		}
+		v.expires = exp
+		s.sessions[k] = v
+	}
 }
 
 // sessionInfo 活跃会话的对外展示形状（GET /api/sessions）

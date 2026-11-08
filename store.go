@@ -131,6 +131,10 @@ type Store struct {
 	// 其他原生支持 responses 的模型；开启后此类模型才参与 responses 路由（由适配层转换）。
 	ResponsesConvert bool `json:"responses_convert,omitempty"`
 
+	// SessionTTLSeconds 会话粘性的滑动过期秒数，0 = 默认（sessionTTL，1 小时）。
+	// 每次会话内成功请求都会重新计时；通过设置接口修改时，现有绑定会立即按新值重算。
+	SessionTTLSeconds int64 `json:"session_ttl_seconds,omitempty"`
+
 	// inflight 各模型条目当前在途请求数，仅内存、不落盘（重启归零）。
 	// 键是模型条目 ID，这样同一模型名挂在多个 Provider 上时各自独立计数。
 	inflight map[string]int
@@ -544,6 +548,44 @@ func (s *Store) SetResponsesConvert(v bool) {
 		return
 	}
 	s.ResponsesConvert = v
+	s.save()
+}
+
+// maxSessionTTL 会话粘性有效期上限，避免超大值在 time.Duration 换算时溢出
+const maxSessionTTL = 30 * 24 * time.Hour
+
+// sessionTTLLocked 当前会话 TTL（调用方需持锁）
+func (s *Store) sessionTTLLocked() time.Duration {
+	switch {
+	case s.SessionTTLSeconds <= 0:
+		return sessionTTL
+	case s.SessionTTLSeconds > int64(maxSessionTTL/time.Second):
+		return maxSessionTTL
+	}
+	return time.Duration(s.SessionTTLSeconds) * time.Second
+}
+
+// SessionTTL 当前会话粘性有效期（默认 1 小时，上限 30 天）
+func (s *Store) SessionTTL() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sessionTTLLocked()
+}
+
+// SetSessionTTL 设置会话粘性有效期；<=0 恢复默认，超过上限按 30 天截断
+func (s *Store) SetSessionTTL(seconds int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case seconds <= 0:
+		seconds = 0
+	case seconds > int64(maxSessionTTL/time.Second):
+		seconds = int64(maxSessionTTL / time.Second)
+	}
+	if s.SessionTTLSeconds == seconds {
+		return
+	}
+	s.SessionTTLSeconds = seconds
 	s.save()
 }
 

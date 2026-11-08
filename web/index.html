@@ -554,6 +554,16 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
           </div>
 
           <div class="panel">
+            <div class="panel-head"><h3>会话有效期</h3></div>
+            <p class="hint" style="margin:0 0 12px"><code>X-Session-ID</code> 粘性绑定的滑动过期时间：每次成功请求后重新计时。保存后立即按最近活跃时间重算现有绑定；填 0 恢复默认 60 分钟，上限 30 天。</p>
+            <div class="row-inline">
+              <input id="sess-ttl" type="number" min="0" step="1" style="width:120px">
+              <span class="hint">分钟</span>
+              <button class="btn pri" onclick="saveSessionTTL()">保存</button>
+            </div>
+          </div>
+
+          <div class="panel">
             <div class="panel-head"><h3>管理令牌</h3></div>
             <p class="hint" style="margin:0 0 12px">服务端以 <code>-admin-token</code> 或环境变量 <code>LLMROUTER_ADMIN_TOKEN</code> 启动后，访问后台需要令牌。令牌仅保存在本机浏览器。</p>
             <div class="row-inline">
@@ -567,7 +577,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
             <div class="panel-head"><h3>运行说明</h3></div>
             <ul class="notes">
               <li>请求体原样透传（messages / tools / stream 等全部字段不做改动），响应字节级回传。</li>
-              <li>客户端带 <code>X-Session-ID</code> 头可开启会话粘性：同一会话固定走同一上游，仅在上游失败时才切换，1 小时无活动过期。</li>
+              <li>客户端带 <code>X-Session-ID</code> 头可开启会话粘性：同一会话固定走同一上游，仅在上游失败时才切换；默认 1 小时无活动过期（可在上方调整），也可在活跃会话面板手动结束。</li>
               <li>每日上限与静音时段按服务器本地时间计算；静音时段支持跨零点，如 22:00~06:00。</li>
               <li>缓存命中读取 <code>prompt_tokens_details.cached_tokens</code>，含在输入 token 内，首页单独展示。</li>
             </ul>
@@ -1069,17 +1079,17 @@ function renderHome() {
   renderDetail(rows);
 }
 
-// 活跃会话面板：带 X-Session-ID 的粘性绑定，1 小时无请求自动解绑（仅内存，重启即清）
+// 活跃会话面板：带 X-Session-ID 的粘性绑定，TTL 内无请求自动解绑（仅内存，重启即清）
 function renderSessions() {
   const head = $('sess-head'), body = $('sess-body');
   head.innerHTML = `<tr><th>会话 ID</th><th>Key</th><th>请求模型</th><th>绑定模型</th><th>Provider</th>
-    <th class="num">请求</th><th>最近活跃</th><th>剩余</th></tr>`;
+    <th class="num">请求</th><th>最近活跃</th><th>剩余</th><th style="width:64px">操作</th></tr>`;
   const list = S.sessions || [];
   $('sess-sub').textContent = list.length
-    ? `${list.length} 个会话 · 1 小时无请求自动解绑 · 重启即清`
-    : '客户端带 X-Session-ID 头的粘性会话 · 仅内存，重启即清';
+    ? `${list.length} 个会话 · ${ttlLabel()}无请求自动解绑 · 重启即清`
+    : `客户端带 X-Session-ID 头的粘性会话 · ${ttlLabel()}无请求自动解绑 · 仅内存，重启即清`;
   if (!list.length) {
-    body.innerHTML = `<tr><td colspan="8" class="empty">暂无活跃会话：客户端带 X-Session-ID 头请求成功后在此显示</td></tr>`;
+    body.innerHTML = `<tr><td colspan="9" class="empty">暂无活跃会话：客户端带 X-Session-ID 头请求成功后在此显示</td></tr>`;
     return;
   }
   body.innerHTML = list.map(x => {
@@ -1097,8 +1107,28 @@ function renderSessions() {
       <td class="num">${fmtN(x.count)}</td>
       <td title="${new Date(x.last_at).toLocaleString()}">${agoText(x.last_at)}</td>
       <td>${untilText(x.expires)}</td>
+      <td><button class="btn mini danger" data-sid="${esc(x.id)}" onclick="endSession(this.dataset.sid)">结束</button></td>
     </tr>`;
   }).join('');
+}
+
+// 会话 TTL 的人类可读文案（服务端返回生效中的秒数）
+function ttlLabel() {
+  const s = S.session_ttl_seconds || 3600;
+  if (s % 86400 === 0) return `${s / 86400} 天`;
+  if (s % 3600 === 0) return `${s / 3600} 小时`;
+  if (s >= 60) return `${Math.floor(s / 60)} 分钟`;
+  return `${Math.floor(s)} 秒`;
+}
+
+// 主动结束某个会话 ID 下的所有绑定（不同协议/请求模型名可能各有一条）
+async function endSession(id) {
+  if (!confirm(`结束会话「${id}」？该会话下的所有粘性绑定会被清除，后续请求重新选路。`)) return;
+  try {
+    S = await api('DELETE', '/api/sessions?id=' + encodeURIComponent(id));
+    renderAll();
+    toast('会话已结束');
+  } catch (e) { alert(e.message); }
 }
 
 function agoText(t) {
@@ -1400,6 +1430,17 @@ async function saveResponsesConvert(on) {
     alert(e.message);
     renderAll(); // 失败时回滚开关状态
   }
+}
+
+// 保存会话粘性 TTL（界面单位：分钟；0 = 恢复默认 60 分钟）
+async function saveSessionTTL() {
+  const min = parseFloat($('sess-ttl').value);
+  if (!isFinite(min) || min < 0) { alert('请输入 0 或正整数分钟'); return; }
+  try {
+    S = await api('PUT', '/api/settings', {session_ttl_seconds: Math.round(min * 60)});
+    renderAll();
+    toast('已保存会话有效期：' + ttlLabel());
+  } catch (e) { alert(e.message); }
 }
 
 async function move(id, dir) {
@@ -1770,6 +1811,7 @@ function renderGeneral() {
   $('ep-resp').textContent = origin + '/v1/responses';
   $('ep-models').textContent = origin + '/v1/models';
   if (document.activeElement !== $('auto-name')) $('auto-name').value = S.auto_model || 'auto';
+  if (document.activeElement !== $('sess-ttl')) $('sess-ttl').value = Math.round((S.session_ttl_seconds || 3600) / 60);
   $('resp-convert').checked = !!S.responses_convert;
   renderAuthState();
 }

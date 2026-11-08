@@ -31,6 +31,8 @@ type StateView struct {
 	AutoModel string              `json:"auto_model"`
 	// ResponsesConvert responses 协议转换开关（默认关闭），设置页据此渲染
 	ResponsesConvert bool `json:"responses_convert"`
+	// SessionTTLSeconds 生效中的会话粘性有效期（秒），设置页据此渲染
+	SessionTTLSeconds int64 `json:"session_ttl_seconds"`
 }
 
 // SnapshotJSON 持锁快照并序列化，避免和后台编辑、用量记账竞态
@@ -64,6 +66,7 @@ func (s *Store) SnapshotJSON() []byte {
 	v.Usage = append(v.Usage, s.Usage...)
 	v.AutoModel = s.AutoModel // 已持锁，直接读；空值由前端按默认 auto 处理
 	v.ResponsesConvert = s.ResponsesConvert
+	v.SessionTTLSeconds = int64(s.sessionTTLLocked() / time.Second)
 	sort.Slice(v.Usage, func(i, j int) bool {
 		a, b := v.Usage[i], v.Usage[j]
 		if a.Date != b.Date {
@@ -213,12 +216,13 @@ func (s *Server) handleModelUnmute(w http.ResponseWriter, r *http.Request) {
 	s.replyState(w, r)
 }
 
-// handleSettings 更新设置：auto 虚拟模型名、responses 协议转换开关。
+// handleSettings 更新设置：auto 虚拟模型名、responses 协议转换开关、会话 TTL。
 // 字段用指针，未提交的项保持原值（前端可以只改其中一项）。
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AutoModel        *string `json:"auto_model"`
-		ResponsesConvert *bool   `json:"responses_convert"`
+		AutoModel         *string `json:"auto_model"`
+		ResponsesConvert  *bool   `json:"responses_convert"`
+		SessionTTLSeconds *int64  `json:"session_ttl_seconds"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -232,6 +236,25 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ResponsesConvert != nil {
 		s.store.SetResponsesConvert(*req.ResponsesConvert)
+	}
+	if req.SessionTTLSeconds != nil {
+		s.store.SetSessionTTL(*req.SessionTTLSeconds)
+		s.applySessionTTL(s.store.SessionTTL()) // 现有绑定也按新 TTL 立即重算
+	}
+	s.replyState(w, r)
+}
+
+// handleSessionEnd 主动结束会话：删除该 X-Session-ID 下所有协议/模型绑定。
+// 会话 ID 走查询参数而非路径段，因为客户端可能使用含斜杠等字符的标识。
+func (s *Server) handleSessionEnd(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "缺少 id 参数")
+		return
+	}
+	if n := s.endSession(id); n == 0 {
+		writeErr(w, http.StatusNotFound, "会话不存在或已过期")
+		return
 	}
 	s.replyState(w, r)
 }

@@ -63,6 +63,7 @@ func (s *Server) routes() *http.ServeMux {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/state", s.replyState)
 	api.HandleFunc("GET /api/sessions", s.handleSessions)
+	api.HandleFunc("DELETE /api/sessions", s.handleSessionEnd)
 	api.HandleFunc("POST /api/providers", s.handleProviderUpsert)
 	api.HandleFunc("PUT /api/providers/{id}", s.handleProviderUpsert)
 	api.HandleFunc("DELETE /api/providers/{id}", s.handleProviderDelete)
