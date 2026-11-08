@@ -265,7 +265,8 @@ func (s *wbRespStream) begin() {
 	s.emit("response.created", map[string]any{"response": s.envelope("in_progress")})
 }
 
-// Write 消费过滤后的 SSE 字节流（按行切出 data: 载荷）
+// Write 消费过滤后的 SSE 字节流（按行切出 data: 载荷；注释行原样透传——
+// 思考持有期间的保活注释不产生事件，只维持客户端连接活跃）
 func (s *wbRespStream) Write(p []byte) (int, error) {
 	s.lines = append(s.lines, p...)
 	for {
@@ -278,6 +279,8 @@ func (s *wbRespStream) Write(p []byte) (int, error) {
 		line = bytes.TrimSuffix(line, []byte("\r"))
 		if d, ok := bytes.CutPrefix(line, []byte("data:")); ok {
 			s.feed(bytes.TrimPrefix(d, []byte(" ")))
+		} else if bytes.HasPrefix(line, []byte(":")) {
+			fmt.Fprintf(s.w, "%s\n\n", line)
 		}
 	}
 	return len(p), nil

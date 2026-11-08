@@ -1186,26 +1186,57 @@ func wbIsSpaceByte(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b
 
 // ── SSE 节拍过滤与非流式聚合 ──────────────────────────────────────────────
 
-// wbSSEFilter 过滤上游 SSE 里「整片只有换行」的 content 分片——上游把它当节拍插在
-// 正文分片之间（实测约占三分之一），不滤掉会污染客户端输出。按帧（空行分隔）处理：
-// 命中节拍的帧整帧丢弃，其余字节原样放行。模型真实输出的纯换行分片与节拍无法区分，
-// 也会被丢——与适配器行为一致。
+// wbSSEFilter 上游 SSE 的流式整形，按帧（空行分隔）处理：
+//   · 「整片只有换行」的 content 分片是上游插在正文之间的节拍，整帧丢弃——
+//     模型真实输出的纯换行分片与节拍无法区分，也会被丢，与适配器行为一致；
+//   · 思考流被上游拆成「一个分片一个 token」、中间夹纯空白的节拍分片，直接
+//     透传会让按分片渲染思考的客户端（ZCode 等）一词一行刷屏——纯 reasoning
+//     增量帧全部进缓冲，等思考结束（首个带 data 载荷的非 reasoning 帧：正文/
+//     工具调用/收尾/用量，或流结束）再合成一个分片一次性放行，保证同一段思考
+//     在客户端只出现一个思考条目。持有期间定期发 SSE 注释行（: keepalive）保活
+//     连接——注释行不产生事件，客户端渲染不受影响。上游中途的心跳注释帧同样
+//     透传、不打断持有。其余字节原样放行。
 type wbSSEFilter struct {
-	r   io.Reader
-	buf []byte // 已读入、待切帧
-	out []byte // 已放行、待交付
-	eof bool
-	err error // 底层读错误：残余帧交付完后返回，避免中途断流被当成正常结束
+	r    io.Reader
+	buf  []byte // 已读入、待切帧
+	out  []byte // 已放行、待交付
+	eof  bool
+	err  error // 底层读错误：残余帧交付完后返回，避免中途断流被当成正常结束
+
+	rsBuf  []byte    // 合并中的 reasoning 增量文本
+	rsTmpl []byte    // 合成帧的 data 载荷模板（沿用首个 reasoning 帧的其余字段）
+	rsLast time.Time // 最近一次保活注释的发出时刻（wbKeepaliveEvery 节流）
 }
 
-// wbMaxPending 单个未完成帧的最大缓冲：异常上游一直不发空行时防止内存无界增长
+// wbMaxPending 单个未完成帧的最大缓冲：异常上游一直不发空行时防止内存无界增长；
+// 也用作思考持有缓冲的上限（超限先放行一次，正常思考量远达不到）
 const wbMaxPending = 4 << 20
+
+// wbKeepaliveEvery 思考持有期间向客户端发送 SSE 注释行保活的间隔：长思考期间
+// 没有任何事件下发，部分 HTTP 客户端有空闲超时。变量便于测试覆写。
+var wbKeepaliveEvery = 10 * time.Second
 
 func (f *wbSSEFilter) Read(p []byte) (int, error) {
 	for len(f.out) == 0 {
+		if start := wbFrameBoundary(f.buf); start >= 0 {
+			frame := f.buf[:start]
+			f.buf = f.buf[start:]
+			f.handleFrame(frame)
+			continue
+		}
+		if len(f.buf) > wbMaxPending {
+			f.eof = true
+			f.err = fmt.Errorf("单帧超过 %d 字节仍未结束，放弃该响应", wbMaxPending)
+		}
 		if f.eof {
-			if len(f.buf) > 0 { // 流尾未以空行结束的残余
-				f.out, f.buf = f.buf, nil
+			if len(f.buf) > 0 { // 流尾未以空行结束的残余（或超限帧）：按规则放行
+				frame := f.buf
+				f.buf = nil
+				f.handleFrame(frame)
+				continue
+			}
+			f.flushReasoning()
+			if len(f.out) > 0 {
 				break
 			}
 			if f.err != nil {
@@ -1218,12 +1249,6 @@ func (f *wbSSEFilter) Read(p []byte) (int, error) {
 			if err != io.EOF {
 				f.err = err
 			}
-			if len(f.buf) > 0 { // 先把残余帧按规则放行，再在下一轮返回错误
-				if !wbNewlineBeat(f.buf) {
-					f.out = append(f.out, f.buf...)
-				}
-				f.buf = nil
-			}
 		}
 	}
 	n := copy(p, f.out)
@@ -1231,26 +1256,122 @@ func (f *wbSSEFilter) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// pump 读一块数据并切出所有完整帧
+// pump 读一块数据追加进缓冲（切帧在 Read 的循环里进行）
 func (f *wbSSEFilter) pump() error {
 	tmp := make([]byte, 16*1024)
 	n, err := f.r.Read(tmp)
 	f.buf = append(f.buf, tmp[:n]...)
-	for {
-		start := wbFrameBoundary(f.buf)
-		if start < 0 {
-			break
-		}
-		frame := f.buf[:start]
-		f.buf = f.buf[start:]
-		if !wbNewlineBeat(frame) {
-			f.out = append(f.out, frame...)
-		}
-	}
-	if len(f.buf) > wbMaxPending {
-		return fmt.Errorf("单帧超过 %d 字节仍未结束，放弃该响应", wbMaxPending)
-	}
 	return err
+}
+
+// handleFrame 处理一个完整帧：纯 reasoning 增量帧进合并缓冲（思考期间不放行），
+// 无 data 载荷的注释帧（上游心跳）透传且不打断持有，content 节拍帧丢弃，其余
+// （正文/工具调用/用量/[DONE]/未识别）先冲刷缓冲再原样放行——思考结束的标志
+// 正是这些帧的到来
+func (f *wbSSEFilter) handleFrame(frame []byte) {
+	if d, payload, ok := wbReasoningChunk(frame); ok {
+		now := time.Now()
+		if f.rsTmpl == nil {
+			f.rsTmpl, f.rsLast = payload, now
+		}
+		f.rsBuf = append(f.rsBuf, d...)
+		if len(f.rsBuf) >= wbMaxPending { // 兜底：正常思考量远达不到
+			f.flushReasoning()
+			return
+		}
+		// 持有期间定期发 SSE 注释行：不产生事件，仅维持客户端连接活跃
+		if now.Sub(f.rsLast) >= wbKeepaliveEvery && len(f.out) == 0 {
+			f.out = append(f.out, ": keepalive\n\n"...)
+			f.rsLast = now
+		}
+		return
+	}
+	if !bytes.Contains(frame, []byte("data:")) { // 注释/心跳帧：透传，不打断思考持有
+		f.out = append(f.out, frame...)
+		return
+	}
+	f.flushReasoning()
+	if !wbNewlineBeat(frame) {
+		f.out = append(f.out, frame...)
+	}
+}
+
+// flushReasoning 把合并中的 reasoning 增量合成一个分片放行；只剩空白（连续节拍、
+// 无正文）时丢弃。模板缺失或异常时兜底构造最小分片，保证增量不丢。
+func (f *wbSSEFilter) flushReasoning() {
+	buf, tmpl := f.rsBuf, f.rsTmpl
+	f.rsBuf, f.rsTmpl = nil, nil
+	if len(buf) == 0 || len(bytes.TrimSpace(buf)) == 0 {
+		return
+	}
+	var v map[string]any
+	if json.Unmarshal(tmpl, &v) != nil || v == nil {
+		v = map[string]any{}
+	}
+	choices, _ := v["choices"].([]any)
+	if len(choices) == 0 {
+		choices = append(choices, map[string]any{})
+		v["choices"] = choices
+	}
+	choice, _ := choices[0].(map[string]any)
+	if choice == nil {
+		choice = map[string]any{}
+		choices[0] = choice
+	}
+	delta, _ := choice["delta"].(map[string]any)
+	if delta == nil {
+		delta = map[string]any{}
+		choice["delta"] = delta
+	}
+	delta["reasoning_content"] = string(buf)
+	if b, err := json.Marshal(v); err == nil {
+		f.out = append(f.out, "data: "...)
+		f.out = append(f.out, b...)
+		f.out = append(f.out, '\n', '\n')
+	}
+}
+
+// wbReasoningChunk 该帧是否为纯 reasoning 增量帧（仅 delta.reasoning_content 非空，
+// 无正文/工具调用/收尾/用量）。是则返回增量文本与完整 data 载荷（合成帧的模板）。
+func wbReasoningChunk(frame []byte) (string, []byte, bool) {
+	var payload []byte
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if len(line) == 0 {
+			continue
+		}
+		d, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			return "", nil, false // 混有其他行（id/event/注释等），不合并，原样放行
+		}
+		payload = append(payload, bytes.TrimPrefix(d, []byte(" "))...)
+	}
+	if len(payload) == 0 {
+		return "", nil, false
+	}
+	var v struct {
+		Choices []struct {
+			Delta struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Refusal          string `json:"refusal"`
+				FunctionCall     any    `json:"function_call"`
+				ToolCalls        []any  `json:"tool_calls"`
+			} `json:"delta"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage json.RawMessage `json:"usage"`
+	}
+	if json.Unmarshal(payload, &v) != nil || len(v.Choices) == 0 {
+		return "", nil, false
+	}
+	ch := v.Choices[0]
+	if ch.Delta.ReasoningContent == "" || ch.Delta.Content != "" || ch.Delta.Refusal != "" ||
+		ch.Delta.FunctionCall != nil || len(ch.Delta.ToolCalls) > 0 || ch.FinishReason != "" ||
+		(len(v.Usage) > 0 && string(v.Usage) != "null") {
+		return "", nil, false
+	}
+	return ch.Delta.ReasoningContent, payload, true
 }
 
 // wbFrameBoundary 第一处帧边界（空行）的下一字节位置；没有完整帧返回 -1

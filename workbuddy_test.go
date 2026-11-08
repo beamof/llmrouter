@@ -407,6 +407,91 @@ func TestWBSSEFilter(t *testing.T) {
 	}
 }
 
+func TestWBSSEFilterReasoningMerge(t *testing.T) {
+	// 上游形态：一个分片一个 token，夹纯空格节拍，正文/收尾/用量帧混在中间
+	rc := func(s string) string {
+		b, _ := json.Marshal(s)
+		return `data: {"choices":[{"delta":{"content":"","reasoning_content":` + string(b) +
+			`,"refusal":""},"finish_reason":null}],"id":"t","usage":null}` + "\n\n"
+	}
+	content := "data: {\"choices\":[{\"delta\":{\"content\":\"答\"}}]}\n\n"
+	usage := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n"
+	done := "data: [DONE]\n\n"
+	heartbeat := ": heartbeat\n\n" // 思考中途的上游心跳：透传且不打断持有
+	in := rc("Let") + rc(" me") + rc(" ") + rc(" ") + heartbeat + rc("think") + rc(".") + rc("\n\n") +
+		content + rc("Next") + rc(" line") + rc(".") + usage + done + rc("尾") // 末帧无空行 → EOF 冲刷
+
+	f := &wbSSEFilter{r: strings.NewReader(in)}
+	out, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	// 正文/用量/[DONE]/心跳 原样放行
+	for _, want := range []string{content, usage, done, heartbeat} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("正常帧丢失 %q: %q", want, got)
+		}
+	}
+	// 解析放行后的 reasoning 增量
+	var deltas []string
+	for _, frame := range strings.Split(got, "\n\n") {
+		if d, ok := strings.CutPrefix(frame, "data: "); ok {
+			var v struct {
+				Choices []struct {
+					Delta struct {
+						ReasoningContent string `json:"reasoning_content"`
+					} `json:"delta"`
+				} `json:"choices"`
+			}
+			if json.Unmarshal([]byte(d), &v) == nil && len(v.Choices) > 0 &&
+				v.Choices[0].Delta.ReasoningContent != "" {
+				deltas = append(deltas, v.Choices[0].Delta.ReasoningContent)
+			}
+		}
+	}
+	joined := strings.Join(deltas, "")
+	if joined != "Let me  think.\n\nNext line.尾" {
+		t.Fatalf("合并后思考文本不完整: %q", joined)
+	}
+	// 心跳不打断持有：仍按思考段一次放行（content 前一段、usage 前一段、EOF 一段）
+	if len(deltas) != 3 {
+		t.Fatalf("应按思考段一次放行: %d %q", len(deltas), deltas)
+	}
+	// 逐 token 原文不应出现（合成分片里不会是单个 token）
+	if strings.Contains(got, `"reasoning_content":"Let"`) {
+		t.Fatalf("逐 token 分片未被合并: %q", got)
+	}
+}
+
+func TestWBSSEFilterReasoningKeepalive(t *testing.T) {
+	// 长思考持有期间发 SSE 注释行保活：不产生 data 帧，思考仍整段一次放行
+	old := wbKeepaliveEvery
+	wbKeepaliveEvery = -time.Second // 覆写为负值使条件恒真验证该路径
+	defer func() { wbKeepaliveEvery = old }()
+
+	rc := func(s string) string {
+		b, _ := json.Marshal(s)
+		return `data: {"choices":[{"delta":{"reasoning_content":` + string(b) + `}}]}` + "\n\n"
+	}
+	in := rc("一") + rc("二") + rc("三") + "data: [DONE]\n\n"
+	f := &wbSSEFilter{r: strings.NewReader(in)}
+	out, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	if n := strings.Count(got, ": keepalive"); n != 3 {
+		t.Fatalf("每个持有分片应触发一次保活注释: %d %q", n, got)
+	}
+	if n := strings.Count(got, "reasoning_content"); n != 1 {
+		t.Fatalf("思考应整段一次放行: %d %q", n, got)
+	}
+	if !strings.Contains(got, "一二三") || !strings.Contains(got, "[DONE]") {
+		t.Fatalf("内容或 [DONE] 丢失: %q", got)
+	}
+}
+
 func TestWBAgg(t *testing.T) {
 	stream := strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","content":"你"}}]}`,
