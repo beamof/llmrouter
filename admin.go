@@ -142,8 +142,17 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.BaseURL = s.zedCloud() + "/completions"
+	case "commandcode":
+		// Command Code 类型：数据面固定 /alpha/generate，不接受自定义（API Key
+		// 随请求发出，改写基址等于允许把密钥发往任意主机）
+		if p.CommandCode == nil || strings.TrimSpace(p.CommandCode.APIKey) == "" {
+			writeErr(w, http.StatusBadRequest, "Command Code 类型的 provider 必须携带凭证（commandcode.api_key），编辑时请勿丢弃 commandcode 字段")
+			return
+		}
+		p.BaseURL = s.ccAPI() + "/alpha/generate"
+		p.ResponsesURL = ""
 	default:
-		writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy、workbuddy-intl 或 zed")
+		writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy、workbuddy-intl、zed 或 commandcode")
 		return
 	}
 	if p.BaseURL == "" {
@@ -438,6 +447,16 @@ func (s *Server) handleUpstreamModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"models": models})
 		return
 	}
+	// Command Code：目录在 /provider/v1/models（不需要密钥），按套餐过滤
+	if ccOf(p) != nil {
+		models, err := s.ccCatalog(r.Context(), p)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "拉取 Command Code 模型目录失败: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"models": models})
+		return
+	}
 	req, _ := http.NewRequest(http.MethodGet, strings.TrimRight(p.BaseURL, "/")+"/models", nil)
 	if p.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
@@ -564,6 +583,11 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		writeJSON(w, http.StatusOK, res)
+		return
+	}
+	// Command Code：用模型目录做连通性探测，并核对模型名
+	if ccOf(p) != nil {
+		s.ccModelTest(w, m, p)
 		return
 	}
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(p.BaseURL, "/")+"/models", nil)

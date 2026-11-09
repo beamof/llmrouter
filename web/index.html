@@ -21,6 +21,7 @@
   --bad:#dc2626; --bad-bg:#fdecec; --bad-bd:#fecaca;
   --wb-bg:#e0f2fe; --wb-fg:#0369a1;
   --zed-bg:#f3e8ff; --zed-fg:#7e22ce;
+  --cc-bg:#ccfbf1; --cc-fg:#0f766e;
   --input-ph:#a4afc1;
   --topbar-fade:rgba(245,247,251,.55);
   --tip-bg:#111827; --tip-tx:#fff; --tip-mut:#c7d2fe;
@@ -47,6 +48,7 @@
     --bad:#f87171; --bad-bg:#3a1d1f; --bad-bd:#5b2a2d;
     --wb-bg:#0c2a3d; --wb-fg:#7dd3fc;
     --zed-bg:#2a1b40; --zed-fg:#d8b4fe;
+    --cc-bg:#0f2f2c; --cc-fg:#5eead4;
     --input-ph:#5f6f89;
     --topbar-fade:rgba(11,16,32,.6);
     --tip-bg:#e8eefc; --tip-tx:#0f172a; --tip-mut:#475569;
@@ -168,15 +170,20 @@ input::placeholder{color:var(--input-ph)}
 .row-inline{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 
 /* ---------- 首页统计 ---------- */
-.stats{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.7fr);gap:16px;margin-bottom:16px}
+.stats{margin-bottom:16px}
 .stat{background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px 18px}
 .stat .k{display:flex;align-items:center;gap:6px;color:var(--mut);font-size:12.5px}
 .stat .v{margin-top:6px;font-size:26px;font-weight:660;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
 .stat .s{margin-top:4px;color:var(--mut);font-size:11.5px;line-height:1.5}
-.stat.hero{background:linear-gradient(135deg,#4f46e5 0%,#6d28d9 55%,#9333ea 100%);border:none;color:#fff}
-.stat.hero .k,.stat.hero .s{color:#e0e7ff}
-.stat.hero .v{color:#fff}
-.stat-metrics{display:flex;align-items:center;padding:16px 18px}
+.stat-strip{display:flex;align-items:stretch;padding:0;overflow:hidden}
+.stat-total{
+  flex:0 0 auto;display:flex;flex-direction:column;justify-content:center;
+  padding:16px 24px 16px 18px;color:#fff;
+  background:linear-gradient(135deg,#4f46e5 0%,#6d28d9 55%,#9333ea 100%);
+}
+.stat-total .k,.stat-total .s{color:#e0e7ff}
+.stat-total .v{color:#fff}
+.stat-metrics{display:flex;align-items:center;flex:1;min-width:0;padding:16px 18px}
 .stat-metrics .metric{
   flex:1;min-width:0;display:flex;align-items:baseline;gap:6px;padding:0 18px;
   border-left:1px solid var(--bd2);white-space:nowrap;overflow:hidden;
@@ -262,6 +269,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 }
 .kind-tag.wb{background:var(--wb-bg);color:var(--wb-fg)}
 .kind-tag.zed{background:var(--zed-bg);color:var(--zed-fg)}
+.kind-tag.cc{background:var(--cc-bg);color:var(--cc-fg)}
 .provider-endpoint{display:flex;align-items:center;gap:6px;margin-top:3px;min-width:0;color:var(--mut);font-size:11.5px}
 .provider-endpoint .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px}
 .mini-tag{
@@ -416,7 +424,6 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
 #banner.on{display:flex}
 
 @media (max-width:1120px){
-  .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
   .stat-metrics .s{display:none}
   .dash{grid-template-columns:minmax(0,1fr)}
 }
@@ -442,7 +449,8 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
   #range-seg{overflow:auto;max-width:100%}
 }
 @media (max-width:640px){
-  .stats{grid-template-columns:minmax(0,1fr)}
+  .stat-strip{flex-direction:column}
+  .stat-total{padding:14px 14px 12px}
   .stat-metrics{padding:12px 10px}
   .stat-metrics .metric{padding:0 7px;gap:4px}
   .stat-metrics .k{font-size:11px}
@@ -810,6 +818,7 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
         <option value="workbuddy">WorkBuddy 国内版</option>
         <option value="workbuddy-intl">WorkBuddy 国际版</option>
         <option value="zed">Zed 账号</option>
+        <option value="commandcode">Command Code（Go 等订阅）</option>
       </select>
     </div>
     <div class="field"><label>名称</label><input id="p-name" placeholder="deepseek"></div>
@@ -849,6 +858,22 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
         </div>
       </div>
       <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 Zed 账号（编辑器自带的模型额度）作为上游：点击「登录 Zed」后在浏览器完成授权，自动创建 Provider 并同步 gpt-*/claude-* 模型（优先级 0，可自行调整）。服务器上没有浏览器时用上方粘贴回调兜底。上游访问需代理时填上方「网络代理」。支持 chat 与 responses 两种接入协议。</p></details>
+    </div>
+    <div id="p-cc" hidden style="margin-top:8px">
+      <div class="field"><label>API Key</label>
+        <div class="inline" style="flex:1">
+          <input id="p-cckey" class="mono" placeholder="留空 = 读取本机 commandcode login 的账号；也可粘贴 settings/keys 的 Key" style="flex:1" autocomplete="off">
+          <button class="btn mini pri" onclick="ccImport()">读取本机 CLI 登录</button>
+        </div>
+      </div>
+      <div id="p-ccstatus" class="hint" style="margin:4px 0 8px"></div>
+      <div class="field"><label>零数据保留</label>
+        <div class="inline">
+          <label class="switch"><input id="p-cczdr" type="checkbox"><i></i></label>
+          <span class="hint">每个请求带 x-cmd-zdr: 1（Command Code 的 ZDR）；通常费用更高，没有 ZDR 上游的模型会被拒绝</span>
+        </div>
+      </div>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">复用 Command Code 订阅额度（Go / Pro / GOAT / Max / Ultra）。Go 套餐没有 Provider API，llmrouter 走 CLI 自己的 POST /alpha/generate 线协议；出站请求会转换成 CLI 格式，回程再翻回 chat / responses。点击「读取本机 CLI 登录」读取 ~/.commandcode/auth.json（只读），或直接粘贴 API Key。导入后自动按套餐同步模型（Go 会过滤掉套餐不含的高级模型）。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
     </div>
   </div>
   <div class="dlg-foot split">
@@ -1439,26 +1464,28 @@ function renderStats(tot, label, rows, byModel) {
   const avg = tot.r > 0 ? Math.round(total / tot.r) : 0;
   const keys = new Set(rows.map(u => u.key_id || '')).size;
   $('stat-cards').innerHTML = `
-    <div class="stat hero">
-      <div class="k">总用量 · ${esc(label)}</div>
-      <div class="v" title="${exact(total)}">${fmtTok(total)}</div>
-      <div class="s">输入 + 输出 tokens</div>
-    </div>
-    <div class="stat stat-metrics">
-      <div class="metric" title="缓存命中 ${fmtTok(tot.ca)}（${hit}%）">
-        <span class="k">输入</span>
-        <b class="v" title="${exact(tot.pt)}">${fmtTok(tot.pt)}</b>
-        <span class="s">缓存 ${hit}%</span>
+    <div class="stat stat-strip">
+      <div class="stat-total">
+        <div class="k">总用量 · ${esc(label)}</div>
+        <div class="v" title="${exact(total)}">${fmtTok(total)}</div>
+        <div class="s">输入 + 输出 tokens</div>
       </div>
-      <div class="metric" title="平均每次 ${fmtTok(avg)} tokens">
-        <span class="k">输出</span>
-        <b class="v" title="${exact(tot.ct)}">${fmtTok(tot.ct)}</b>
-        <span class="s">均 ${fmtTok(avg)}</span>
-      </div>
-      <div class="metric" title="${byModel.size} 个模型 · ${keys} 个 Key">
-        <span class="k">请求数</span>
-        <b class="v">${fmtN(tot.r)}</b>
-        <span class="s">${byModel.size} 模型 · ${keys} Key</span>
+      <div class="stat-metrics">
+        <div class="metric" title="缓存命中 ${fmtTok(tot.ca)}（${hit}%）">
+          <span class="k">输入</span>
+          <b class="v" title="${exact(tot.pt)}">${fmtTok(tot.pt)}</b>
+          <span class="s">缓存 ${hit}%</span>
+        </div>
+        <div class="metric" title="平均每次 ${fmtTok(avg)} tokens">
+          <span class="k">输出</span>
+          <b class="v" title="${exact(tot.ct)}">${fmtTok(tot.ct)}</b>
+          <span class="s">均 ${fmtTok(avg)}</span>
+        </div>
+        <div class="metric" title="${byModel.size} 个模型 · ${keys} 个 Key">
+          <span class="k">请求数</span>
+          <b class="v">${fmtN(tot.r)}</b>
+          <span class="s">${byModel.size} 模型 · ${keys} Key</span>
+        </div>
       </div>
     </div>`;
 }
@@ -2093,6 +2120,7 @@ function providerKindTag(p) {
     case 'workbuddy': return '<span class="kind-tag wb">WB 国内</span>';
     case 'workbuddy-intl': return '<span class="kind-tag wb">WB 国际</span>';
     case 'zed': return '<span class="kind-tag zed">Zed</span>';
+    case 'commandcode': return '<span class="kind-tag cc">Command Code</span>';
     default: return '<span class="kind-tag">标准</span>';
   }
 }
@@ -2129,6 +2157,15 @@ function providerStatusHTML(p) {
       <span class="status-extra">${esc(z.username || z.github_login || z.user_id)}${e.detail ? ' · JWT 至 ' + e.detail : ''}</span>
     </div>`;
   }
+  if (p.kind === 'commandcode') {
+    const c = p.commandcode;
+    if (!c || !c.api_key) return '<span class="pill bad">未配置 Key</span>';
+    const who = c.user_name || c.user_id || 'Command Code';
+    return `<div class="status-line">
+      <span class="pill ok">Key 已配置</span>
+      <span class="status-extra">${esc(who)}${c.plan ? ' · ' + esc(c.plan) : ''}${c.zdr ? ' · ZDR' : ''} · <span class="mono">${esc(maskKey(c.api_key))}</span></span>
+    </div>`;
+  }
   if (p.api_key) {
     return `<div class="status-line"><span class="pill ok">Key 已配置</span><span class="status-extra mono">${esc(maskKey(p.api_key))}</span></div>`;
   }
@@ -2139,16 +2176,17 @@ function providerStatusHTML(p) {
 function providerEndpointHTML(p) {
   const isWB = p.kind === 'workbuddy' || p.kind === 'workbuddy-intl';
   const isZed = p.kind === 'zed';
+  const isCC = p.kind === 'commandcode';
   let endpoint = p.base_url;
-  if (!isWB && !isZed) {
+  if (!isWB && !isZed && !isCC) {
     try {
       const u = new URL(p.base_url);
       endpoint = u.host + (u.pathname === '/' ? '' : u.pathname.replace(/\/$/, ''));
     } catch { endpoint = p.base_url; }
   }
-  const text = isWB ? '官方客户端端点' : isZed ? 'cloud.zed.dev' : endpoint;
+  const text = isWB ? '官方客户端端点' : isZed ? 'cloud.zed.dev' : isCC ? 'api.commandcode.ai' : endpoint;
   const tags = [];
-  if (!isWB && !isZed && p.responses_url && p.responses_url !== p.base_url) tags.push('Responses 独立');
+  if (!isWB && !isZed && !isCC && p.responses_url && p.responses_url !== p.base_url) tags.push('Responses 独立');
   if (p.proxy) tags.push('代理');
   return `<div class="provider-endpoint" title="${esc(p.base_url)}">
     <span class="mono">${esc(text)}</span>
@@ -2165,6 +2203,7 @@ function renderProviders() {
   tb.innerHTML = S.providers.map(p => {
     const isWB = p.kind === 'workbuddy' || p.kind === 'workbuddy-intl';
     const isZed = p.kind === 'zed';
+    const isCC = p.kind === 'commandcode';
     let balCell, quick;
     if (isWB) {
       balCell = wbBalanceHTML(p);
@@ -2172,6 +2211,9 @@ function renderProviders() {
     } else if (isZed) {
       balCell = zedBalanceHTML(p);
       quick = `<button class="link-btn" onclick="zedRefreshNow('${p.id}')">刷新账号</button>`;
+    } else if (isCC) {
+      balCell = ccBalanceHTML(p);
+      quick = `<button class="link-btn" onclick="ccRefreshNow('${p.id}')">刷新套餐</button>`;
     } else {
       balCell = balanceHTML(p);
       quick = `<button class="link-btn" onclick="queryBalance('${p.id}')">查余额</button>`;
@@ -2291,21 +2333,88 @@ async function zedRefreshNow(id) {
   } catch (e) { alert(e.message); }
 }
 
+/* ---------- Command Code ---------- */
+// 编辑已有 provider 时取其凭证（保存时原样带回，导入成功后由服务端更新）
+function ccCredOf(editing) {
+  return (editing && editing.kind === 'commandcode' && editing.commandcode) ? editing.commandcode : null;
+}
+
+// Command Code 套餐/模型快照单元格
+function ccBalanceHTML(p) {
+  const c = p.commandcode;
+  if (!c) return '<span class="hint">未导入</span>';
+  const when = c.checked_at ? `<div class="cell-sub">更新于 ${agoText(c.checked_at)}</div>` : '';
+  let s = c.plan ? esc(c.plan) : '套餐未知';
+  if (c.zdr) s += ' · ZDR';
+  return `<div class="bal">${s}</div>${when}`;
+}
+
+function ccRenderStatus() {
+  const el = $('p-ccstatus');
+  if ($('p-kind').value !== 'commandcode') return;
+  const cred = ccCredOf(editingProvider);
+  if (!cred) { el.innerHTML = '尚未导入——点击「读取本机 CLI 登录」，或粘贴 API Key 后保存'; return; }
+  let html = `已导入：<b>${esc(cred.user_name || cred.user_id || 'Command Code')}</b>` +
+    (cred.plan ? ' · ' + esc(cred.plan) : '') + (cred.zdr ? ' · ZDR' : '') +
+    ` · <span class="mono">${esc(maskKey(cred.api_key || ''))}</span>`;
+  if (editingProvider) {
+    html += ` <button class="btn mini" onclick="ccRefreshNow('${editingProvider.id}')">刷新套餐 / 同步模型</button>`;
+  }
+  el.innerHTML = html;
+}
+
+// 从本机 CLI 登录态或输入框里的 API Key 导入；成功后自动创建/更新 Provider 与模型
+async function ccImport() {
+  const key = $('p-cckey').value.trim();
+  $('p-ccstatus').textContent = '正在读取并同步模型…';
+  try {
+    const res = await api('POST', '/api/commandcode/import', {
+      provider_id: editingProvider?.id || '',
+      name: $('p-name').value.trim(),
+      proxy: $('p-proxy').value.trim(),
+      zdr: $('p-cczdr').checked,
+      api_key: key,
+    });
+    await load();
+    editingProvider = S.providers.find(p => p.id === res.provider) || null;
+    if (editingProvider) $('p-name').value = editingProvider.name;
+    $('p-cckey').value = '';
+    $('p-cczdr').checked = !!editingProvider?.commandcode?.zdr;
+    ccRenderStatus();
+    const plan = res.plan ? `（套餐 ${res.plan}）` : '';
+    if (res.warning) toast(`已导入${plan}，但同步模型失败：${res.warning}`);
+    else toast(`已导入${plan}，同步 ${res.models} 个模型`);
+  } catch (e) { $('p-ccstatus').innerHTML = `导入失败：${esc(e.message)}`; }
+}
+
+async function ccRefreshNow(id) {
+  try {
+    const res = await api('POST', `/api/providers/${id}/commandcode-refresh`);
+    toast(`已刷新${res.plan ? '（套餐 ' + res.plan + '）' : ''}，同步 ${res.models} 个模型`);
+    await load();
+    editingProvider = S.providers.find(p => p.id === id) || editingProvider;
+    ccRenderStatus();
+  } catch (e) { alert(e.message); }
+}
+
 /* ---------- WorkBuddy 凭证 ---------- */
 const WB_ENDPOINTS = {'workbuddy': 'https://copilot.tencent.com/v2', 'workbuddy-intl': 'https://www.codebuddy.ai/v2'};
 let wbCred = null; // 当前弹窗持有的凭证（编辑时来自 provider，重新导入后覆盖）
 let wbHits = [];
 
 function onKindChange() {
-  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', special = wb || zed;
+  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode', special = wb || zed || cc;
   for (const id of ['row-base', 'row-key', 'row-resp', 'row-bal']) $(id).style.display = special ? 'none' : '';
   $('hint-normal').style.display = special ? 'none' : '';
   $('p-wb').hidden = !wb;
   $('p-zed').hidden = !zed;
+  $('p-cc').hidden = !cc;
   if (wb) $('p-base').value = WB_ENDPOINTS[kind];
   if (zed) $('p-base').value = 'https://cloud.zed.dev/completions';
+  if (cc) $('p-base').value = 'https://api.commandcode.ai/alpha/generate';
   wbRenderStatus();
   zedRenderStatus();
+  ccRenderStatus();
 }
 
 function wbRenderStatus() {
@@ -2425,19 +2534,21 @@ function editProvider(id) {
   $('p-zedsysid').value = editingProvider?.zed?.system_id || '';
   $('p-zedcb').value = '';
   zedLoginState = '';
+  $('p-cckey').value = '';
+  $('p-cczdr').checked = !!editingProvider?.commandcode?.zdr;
   onKindChange();
   dlgProvider.showModal();
 }
 
 async function saveProvider() {
-  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed';
+  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode';
   const body = {
     name: $('p-name').value.trim() || 'provider',
     kind,
     base_url: $('p-base').value.trim(),
-    responses_url: (wb || zed) ? '' : $('p-resp').value.trim(),
-    api_key: (wb || zed) ? '' : $('p-key').value.trim(),
-    balance_url: (wb || zed) ? '' : $('p-bal').value.trim(),
+    responses_url: (wb || zed || cc) ? '' : $('p-resp').value.trim(),
+    api_key: (wb || zed || cc) ? '' : $('p-key').value.trim(),
+    balance_url: (wb || zed || cc) ? '' : $('p-bal').value.trim(),
     proxy: $('p-proxy').value.trim(),
   };
   if (wb) {
@@ -2449,6 +2560,27 @@ async function saveProvider() {
     body.zed = zedCredOf(editingProvider);
     if (!body.base_url) body.base_url = 'https://cloud.zed.dev/completions';
     if (!body.zed || !body.zed.user_id) { alert('Zed 类型需要先完成「登录 Zed」'); return; }
+  }
+  if (cc) {
+    body.base_url = 'https://api.commandcode.ai/alpha/generate';
+    const cred = ccCredOf(editingProvider);
+    const typed = $('p-cckey').value.trim();
+    // 新 Provider，或编辑时填了不同的 Key：走导入接口（顺便按套餐同步模型）
+    if (!cred || (typed && typed !== cred.api_key)) {
+      if (!cred && !typed) { alert('Command Code 类型需要先「读取本机 CLI 登录」，或粘贴 API Key'); return; }
+      try {
+        const res = await api('POST', '/api/commandcode/import', {
+          provider_id: cred ? editingProvider.id : '',
+          name: $('p-name').value.trim(), proxy: body.proxy, zdr: $('p-cczdr').checked, api_key: typed,
+        });
+        dlgProvider.close();
+        await load();
+        renderAll();
+        toast(`已导入${res.plan ? '（套餐 ' + res.plan + '）' : ''}，同步 ${res.models} 个模型`);
+      } catch (e) { alert(e.message); }
+      return;
+    }
+    body.commandcode = { ...cred, zdr: $('p-cczdr').checked };
   }
   if (!body.base_url) { alert('Chat 基址必填'); return; }
   try {

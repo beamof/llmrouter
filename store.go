@@ -33,16 +33,17 @@ type RouteGroup struct {
 
 // Provider 一个上游服务商
 type Provider struct {
-	ID           string         `json:"id"`
-	Name         string         `json:"name"`
-	BaseURL      string         `json:"base_url"`                // chat completions 基址，填到 /v1，如 https://api.openai.com/v1
-	ResponsesURL string         `json:"responses_url,omitempty"` // responses 协议基址，空 = 同 BaseURL（如智谱两协议不同基址时分别填写）
-	APIKey       string         `json:"api_key,omitempty"`       // 上游密钥
-	BalanceURL   string         `json:"balance_url,omitempty"`   // 可选的余额查询地址（GET + 本密钥）
-	Proxy        string         `json:"proxy,omitempty"`         // 可选代理地址，支持 http(s):// 与 socks5(h)://；空 = 不代理（仍读环境变量）
-	Kind         string         `json:"kind,omitempty"`          // 上游类型：空 = 标准 OpenAI 兼容；"workbuddy" / "workbuddy-intl" = 复用 WorkBuddy 客户端登录态；"zed" = Zed 账号
-	WB           *WorkBuddyCred `json:"wb,omitempty"`            // WorkBuddy 凭证（Kind 为 workbuddy 系时使用，凭证明文存于状态文件）
-	Zed          *ZedCred       `json:"zed,omitempty"`           // Zed 凭证（Kind 为 zed 时使用，凭证明文存于状态文件）
+	ID           string           `json:"id"`
+	Name         string           `json:"name"`
+	BaseURL      string           `json:"base_url"`                // chat completions 基址，填到 /v1，如 https://api.openai.com/v1
+	ResponsesURL string           `json:"responses_url,omitempty"` // responses 协议基址，空 = 同 BaseURL（如智谱两协议不同基址时分别填写）
+	APIKey       string           `json:"api_key,omitempty"`       // 上游密钥
+	BalanceURL   string           `json:"balance_url,omitempty"`   // 可选的余额查询地址（GET + 本密钥）
+	Proxy        string           `json:"proxy,omitempty"`         // 可选代理地址，支持 http(s):// 与 socks5(h)://；空 = 不代理（仍读环境变量）
+	Kind         string           `json:"kind,omitempty"`          // 上游类型：空 = 标准 OpenAI 兼容；"workbuddy" / "workbuddy-intl" = 复用 WorkBuddy 客户端登录态；"zed" = Zed 账号；"commandcode" = Command Code 订阅（CLI 线协议）
+	WB           *WorkBuddyCred   `json:"wb,omitempty"`            // WorkBuddy 凭证（Kind 为 workbuddy 系时使用，凭证明文存于状态文件）
+	Zed          *ZedCred         `json:"zed,omitempty"`           // Zed 凭证（Kind 为 zed 时使用，凭证明文存于状态文件）
+	CommandCode  *CommandCodeCred `json:"commandcode,omitempty"`   // Command Code 凭证（Kind 为 commandcode 时使用）
 }
 
 // WorkBuddyCred WorkBuddy 上游的账号凭证（本机客户端扫描导入或后台粘贴）。
@@ -108,6 +109,20 @@ func (c *ZedCred) expires() time.Time {
 		return time.Time{}
 	}
 	return *c.ExpiresAt
+}
+
+// CommandCodeCred Command Code 订阅（commandcode.ai）的账号凭证。密钥长期有效，
+// 无需刷新；Plan 是最近一次读取的套餐名（Go / Pro / GOAT / Max / Ultra 等），
+// 用于按套餐过滤模型。CLI 为 true 表示密钥来自本机 `commandcode login` 的
+// ~/.commandcode/auth.json，刷新时可重新读取（CLI 换号后自动跟上）。
+type CommandCodeCred struct {
+	APIKey    string     `json:"api_key"`
+	UserID    string     `json:"user_id,omitempty"`
+	UserName  string     `json:"user_name,omitempty"`
+	Plan      string     `json:"plan,omitempty"`
+	CLI       bool       `json:"cli,omitempty"` // 来自本机 CLI 登录态
+	ZDR       bool       `json:"zdr,omitempty"` // 请求零数据保留（x-cmd-zdr: 1）
+	CheckedAt *time.Time `json:"checked_at,omitempty"`
 }
 
 // MuteWindow 每天重复的静音时段，支持跨零点（如 22:00~06:00）
@@ -510,6 +525,33 @@ func (s *Store) UpdateZedAuth(providerID string, c *ZedCred) bool {
 	p.Zed = &cp
 	s.save()
 	return true
+}
+
+// UpdateCommandCodeAuth 回写 Command Code 刷新后的凭证（换指针拷贝，理由同
+// UpdateWBAuth：Candidate 里的 Provider 是浅拷贝，并发请求各自持有不可变快照）。
+func (s *Store) UpdateCommandCodeAuth(providerID string, c *CommandCodeCred) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.CommandCode == nil {
+		return false
+	}
+	cp := *c
+	p.CommandCode = &cp
+	s.save()
+	return true
+}
+
+// ProviderByCommandCodeKey 按 API Key 找 provider（重复导入时原地更新）
+func (s *Store) ProviderByCommandCodeKey(key string) (Provider, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.Providers {
+		if p.Kind == "commandcode" && p.CommandCode != nil && p.CommandCode.APIKey == key {
+			return *p, true
+		}
+	}
+	return Provider{}, false
 }
 
 // UpdateZedPlan 回写 Zed 账号/套餐快照。从当前凭证复制后仅改 Plan，

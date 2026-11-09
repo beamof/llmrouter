@@ -429,6 +429,29 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				s.addSessionUsage(sessKey, sm)
 				return
 			}
+			// Command Code 候选走 CLI 线协议：出站翻译成 /alpha/generate 的
+			// envelope，回程把逐行事件流翻回 chat / responses 协议（两种接入
+			// 协议都在适配层内完成，不需要全局 responses 转换开关）
+			if ccOf(c.Provider) != nil {
+				sendBody := body
+				if isGroup {
+					sendBody = withModel(body, c.Model.Name)
+				}
+				var sm usageSample
+				if err := s.ccAttempt(w, r, c, sendBody, keyID, suffix == "/responses", tm, &sm); err != nil {
+					lastErr = err.Error()
+					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
+					attemptSkips = append(attemptSkips, SkipReason{
+						ModelID: c.Model.ID, Model: c.Model.Name, ProviderID: c.Provider.ID,
+						Reason: "尝试失败：" + truncateRunes(lastErr, 160),
+					})
+					continue // 名额释放与失败日志由 ccAttempt 处理
+				}
+				bind(c, http.StatusOK)
+				s.store.AddCallUsage(sid, req.Model, &c.Model, keyID, sm)
+				s.addSessionUsage(sessKey, sm)
+				return
+			}
 			sendBody := body
 			if isGroup {
 				sendBody = withModel(body, c.Model.Name) // 仅替换顶层 model 字段的值
@@ -533,8 +556,8 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 
 // candidateSupportsProtocol 判断候选能否处理该接入协议。标准 OpenAI 兼容 Provider
 // 两种协议都原样透传；WorkBuddy 上游只有 chat completions，仅在开启 responses
-// 协议转换时才由适配层翻译承接 /v1/responses；Zed 适配层两种协议恒可承接
-// （chat 直接转换，responses 在 gpt 线路保真透传、claude 线路经 chat 中转）。
+// 协议转换时才由适配层翻译承接 /v1/responses；Zed 与 Command Code 适配层两种
+// 协议恒可承接（chat 直接转换，responses 经 chat 中间形态转换）。
 func candidateSupportsProtocol(c Candidate, protocol string, responsesConvert bool) bool {
 	if protocol != "responses" {
 		return true

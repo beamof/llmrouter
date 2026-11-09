@@ -11,7 +11,8 @@
 - **Responses 协议转换（默认关闭）**：`/v1/responses` 只路由到原生支持 Responses 的模型；仅支持 chat 的上游（WorkBuddy）默认被跳过并自动改用其他模型。设置页开启转换后，这类上游才以「responses → chat」翻译方式承接请求
 - **WorkBuddy/CodeBuddy 适配**：国内版（copilot.tencent.com，历史 workbuddy.cn 域名仍可服务）/ 国际版（codebuddy.ai，历史 workbuddy.ai 同站）两种内置 Provider 类型，复用官方客户端登录态调用其模型额度（详见下文）
 - **Zed 适配**：复用 Zed 编辑器账号的模型额度（`gpt-*`、`claude-*`），原生登录 + JWT 自动重铸 + 双向协议转换，chat 与 responses 两种接入协议直接承接（详见下文）
-- **第三方供应商接入框架**：WorkBuddy 与 Zed 共用同一套适配器骨架（Kind + 凭证 + `xxAttempt` 分流），新增私有协议上游按固定清单接入（详见下文）
+- **Command Code 适配**：复用 Command Code 订阅额度（Go / Pro / GOAT / Max / Ultra），读取本机 CLI 登录态或粘贴 API Key，走 CLI 的 `/alpha/generate` 线协议（Go 套餐没有 Provider API），chat 与 responses 两种接入协议直接承接（详见下文）
+- **第三方供应商接入框架**：WorkBuddy、Zed 与 Command Code 共用同一套适配器骨架（Kind + 凭证 + `xxAttempt` 分流），新增私有协议上游按固定清单接入（详见下文）
 - **网页后台**（中文，单文件，无前端依赖）：路由组 / Provider / 模型增删改、优先级排序、用量统计（按 token 计）、每日 token 上限、并行上限、按时段静音（mute）、上游余额查询、会话与异常日志
 - **深浅色主题**：跟随系统 `prefers-color-scheme` 自动切换，无需手动设置
 - **在线升级**：后台比对 GitHub Release 最新版本，一键下载当前平台安装包、校验 SHA256、替换二进制并自动重启（见下文「版本检测与自动升级」）
@@ -145,9 +146,31 @@ Provider「类型」选 **Zed 账号** 后，可复用 Zed 编辑器账号自带
 
 > Zed 线协议为逆向实现，参照 [ccLoad](https://github.com/caidaoli/ccload)（MIT）的 `internal/zedauth` 与 `zed_wire.go`。上游协议变化时可能需要同步更新（如 `Zed/1.23.2` 版本号常量）。使用他人账号或违反 Zed 服务条款的风险请自行评估。
 
+## Command Code 上游
+
+Provider「类型」选 **Command Code（Go 等订阅）** 后，可复用 [Command Code](https://commandcode.ai) 订阅额度（Go / Pro / GOAT / Max / Ultra / Teams Pro），与标准 Provider 混挂、共用全部路由规则。
+
+**凭证导入**（后台 Provider 弹窗，二选一）：
+
+- **读取本机 CLI 登录**：读取 `~/.commandcode/auth.json`（`commandcode login` 写入，只读不改），自动创建/更新 Provider 并按套餐同步模型；之后点「刷新套餐 / 同步模型」会重新读取，CLI 换号后自动跟上
+- **粘贴 API Key**：从 [commandcode.ai/settings/keys](https://commandcode.ai/settings/keys) 生成后粘贴
+
+**行为差异**：
+
+- Go 套餐**没有 Provider API**，其 Key 只在 CLI 的 `POST /alpha/generate` 被接受。适配器把 chat completions 请求翻译成 CLI envelope（`config` + `params`，含 system / messages / tools / max_tokens / reasoning_effort），回程把逐行 JSON 事件（`text-delta` / `reasoning-delta` / `tool-call` / `finish`）翻译回 chat 分片；Pro / GOAT / Max 等套餐同样走这条线（CLI 也用它）
+- 上游**恒为流式**：非流式客户端由网关聚合；usage 从 `finish` 事件的 `totalUsage` 提取（含缓存读取与 reasoning tokens）
+- 两种接入协议（`/v1/chat/completions`、`/v1/responses`）都直接承接，不需要开 Responses 协议转换（responses 先经 chat 中间形态转换）
+- `max_tokens` 上限 **200000**（超过会被上游整单拒绝），未指定时按 CLI 默认 64000；`reasoning_effort` 按模型支持的档位收敛（`none` / `off` 不下发，用模型默认）
+- 模型目录来自 `GET /provider/v1/models`（不需要密钥），按套餐过滤：Go / GOAT 去掉高级模型，Pro / Provider 去掉各自禁用的模型；目录拉不到时退回 CLI 自带模型表。套餐读不到时不按套餐过滤，由上游以 403 `MODEL_NOT_IN_PLAN` 拒绝
+- 模型「测试」与添加模型时的下拉都用同一份目录；上游 429（用量窗口满）自动静音 5 小时，402（额度用尽）与 403（套餐不含该模型）换下一候选
+- 数据面基址固定为官方 `https://api.commandcode.ai/alpha/generate`，不能自定义（避免把 API Key 发往其他主机）；需代理时在「网络代理」栏配置
+- 可选 **零数据保留**：开启后每个请求带 `x-cmd-zdr: 1`（对齐 CLI 的 `CMD_ZDR=1`）
+
+> 线协议参照 [magpie](https://github.com/yetone/magpie) 与社区插件 [@magpie-community/opencode-commandcode-auth](https://github.com/magpie-community/plugins/tree/main/packages/commandcode)（MIT）的 Command Code 实现（command-code 1.72.2）。上游协议变化时可能需要同步更新版本号与模型表。
+
 ## 第三方供应商接入框架
 
-WorkBuddy 与 Zed 两个适配器遵循同一套骨架：**Provider 挂 `Kind` 与凭证 → 代理候选循环分流到 `xxAttempt` → 适配器内完成鉴权、出站转换与回程翻译**。新增一类私有协议上游（官方客户端登录态、自有信封/线协议）时按下面的清单接入；标准 OpenAI 兼容上游不需要任何代码，直接加 Provider 即可。
+WorkBuddy、Zed 与 Command Code 三个适配器遵循同一套骨架：**Provider 挂 `Kind` 与凭证 → 代理候选循环分流到 `xxAttempt` → 适配器内完成鉴权、出站转换与回程翻译**。新增一类私有协议上游（官方客户端登录态、自有信封/线协议）时按下面的清单接入；标准 OpenAI 兼容上游不需要任何代码，直接加 Provider 即可。
 
 ### 总体约定
 
@@ -201,14 +224,14 @@ func (s *Server) xxAttempt(w http.ResponseWriter, r *http.Request,
 
 ### 已接入类型速览
 
-| | WorkBuddy / CodeBuddy | Zed |
-|---|---|---|
-| Kind | `workbuddy` / `workbuddy-intl` | `zed` |
-| 凭证入口 | 本机扫描 / 粘贴 JSON | 浏览器原生登录（RSA）/ 粘贴回调 |
-| 凭证结构 | refresh token 一次性轮换 | 原生凭据长期有效，JWT 重铸 |
-| 上游线协议 | chat completions（仅流式） | gpt→Responses、claude→Anthropic（自有信封） |
-| responses 承接 | 需开全局转换开关 | 适配层内直接承接 |
-| 定额动作 | 签到 / 余额快照 | 套餐用量快照 |
+| | WorkBuddy / CodeBuddy | Zed | Command Code |
+|---|---|---|---|
+| Kind | `workbuddy` / `workbuddy-intl` | `zed` | `commandcode` |
+| 凭证入口 | 本机扫描 / 粘贴 JSON | 浏览器原生登录（RSA）/ 粘贴回调 | 读取本机 CLI 登录 / 粘贴 API Key |
+| 凭证结构 | refresh token 一次性轮换 | 原生凭据长期有效，JWT 重铸 | API Key 长期有效，无刷新 |
+| 上游线协议 | chat completions（仅流式） | gpt→Responses、claude→Anthropic（自有信封） | CLI `/alpha/generate`（NDJSON 事件流） |
+| responses 承接 | 需开全局转换开关 | 适配层内直接承接 | 适配层内直接承接 |
+| 定额动作 | 签到 / 余额快照 | 套餐用量快照 | 套餐读取 / 模型目录同步 |
 
 ## 模型测试按钮
 

@@ -52,6 +52,8 @@ type Server struct {
 	zedLogins  map[string]*zedLoginSession // Zed 原生登录会话（键 = state），仅内存
 	zedBase    string                      // Zed 云端基址覆盖（测试注入用，空 = 官方端点）
 
+	ccBase string // Command Code 基址覆盖（测试注入用，空 = 官方端点）
+
 	pxMu   sync.Mutex
 	pxTpts map[string]*http.Transport // 按代理地址缓存的 Transport（连接池共享），仅内存
 
@@ -94,6 +96,8 @@ func (s *Server) routes() *http.ServeMux {
 	api.HandleFunc("POST /api/zed/login/paste", s.handleZedLoginPaste)
 	api.HandleFunc("POST /api/zed/login/cancel", s.handleZedLoginCancel)
 	api.HandleFunc("POST /api/providers/{id}/zed-refresh", s.handleZedRefresh)
+	api.HandleFunc("POST /api/commandcode/import", s.handleCommandCodeImport)
+	api.HandleFunc("POST /api/providers/{id}/commandcode-refresh", s.handleCommandCodeRefresh)
 	api.HandleFunc("POST /api/groups", s.handleGroupCreate)
 	api.HandleFunc("PUT /api/groups/{id}", s.handleGroupUpdate)
 	api.HandleFunc("DELETE /api/groups/{id}", s.handleGroupDelete)
