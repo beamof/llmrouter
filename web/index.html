@@ -135,12 +135,16 @@ input::placeholder{color:#a4afc1}
 .stat.hero{background:linear-gradient(135deg,#4f46e5 0%,#6d28d9 55%,#9333ea 100%);border:none;color:#fff}
 .stat.hero .k,.stat.hero .s{color:#e0e7ff}
 .stat.hero .v{color:#fff}
-.stat-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding:16px 8px}
-.stat-metrics .metric{padding:0 18px;border-left:1px solid var(--bd2);min-width:0}
-.stat-metrics .metric:first-child{border-left:none;padding-left:10px}
-.stat-metrics .metric:last-child{padding-right:10px}
-.stat-metrics .v{font-size:22px}
-.stat-metrics .s{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat-metrics{display:flex;align-items:center;padding:16px 18px}
+.stat-metrics .metric{
+  flex:1;min-width:0;display:flex;align-items:baseline;gap:6px;padding:0 18px;
+  border-left:1px solid var(--bd2);white-space:nowrap;overflow:hidden;
+}
+.stat-metrics .metric:first-child{border-left:none;padding-left:0}
+.stat-metrics .metric:last-child{padding-right:0}
+.stat-metrics .v{font-size:22px;margin:0;flex:none}
+.stat-metrics .k{flex:none}
+.stat-metrics .s{flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis}
 
 .dash{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);gap:16px;align-items:start;margin-bottom:16px}
 .dash .panel{margin-bottom:0}
@@ -361,6 +365,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
 @media (max-width:1120px){
   .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .stat-metrics .s{display:none}
   .dash{grid-template-columns:minmax(0,1fr)}
 }
 @media (max-width:860px){
@@ -386,11 +391,10 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 }
 @media (max-width:640px){
   .stats{grid-template-columns:minmax(0,1fr)}
-  .stat-metrics{grid-template-columns:minmax(0,1fr);padding:8px 18px}
-  .stat-metrics .metric{padding:10px 0;border-left:none;border-top:1px solid var(--bd2)}
-  .stat-metrics .metric:first-child{border-top:none;padding-top:2px}
-  .stat-metrics .metric:last-child{padding-bottom:2px}
-  .stat-metrics .s{white-space:normal}
+  .stat-metrics{padding:14px 16px}
+  .stat-metrics .metric{padding:0 10px;gap:5px}
+  .stat-metrics .v{font-size:18px}
+  .stat-metrics .s{display:none}
   .panel{padding:14px}
   .panel-head{flex-direction:column;align-items:flex-start;gap:6px}
   .panel-head h3{white-space:nowrap}
@@ -1380,20 +1384,20 @@ function renderStats(tot, label, rows, byModel) {
       <div class="s">输入 + 输出 tokens</div>
     </div>
     <div class="stat stat-metrics">
-      <div class="metric">
-        <div class="k">输入 tokens</div>
-        <div class="v" title="${exact(tot.pt)}">${fmtTok(tot.pt)}</div>
-        <div class="s">缓存命中 ${fmtTok(tot.ca)}（${hit}%）</div>
+      <div class="metric" title="缓存命中 ${fmtTok(tot.ca)}（${hit}%）">
+        <span class="k">输入</span>
+        <b class="v" title="${exact(tot.pt)}">${fmtTok(tot.pt)}</b>
+        <span class="s">缓存 ${hit}%</span>
       </div>
-      <div class="metric">
-        <div class="k">输出 tokens</div>
-        <div class="v" title="${exact(tot.ct)}">${fmtTok(tot.ct)}</div>
-        <div class="s">平均每次 ${fmtTok(avg)} tokens</div>
+      <div class="metric" title="平均每次 ${fmtTok(avg)} tokens">
+        <span class="k">输出</span>
+        <b class="v" title="${exact(tot.ct)}">${fmtTok(tot.ct)}</b>
+        <span class="s">均 ${fmtTok(avg)}</span>
       </div>
-      <div class="metric">
-        <div class="k">请求数</div>
-        <div class="v">${fmtN(tot.r)}</div>
-        <div class="s">${byModel.size} 个模型 · ${keys} 个 Key</div>
+      <div class="metric" title="${byModel.size} 个模型 · ${keys} 个 Key">
+        <span class="k">请求数</span>
+        <b class="v">${fmtN(tot.r)}</b>
+        <span class="s">${byModel.size} 模型 · ${keys} Key</span>
       </div>
     </div>`;
 }
