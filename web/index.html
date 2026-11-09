@@ -463,14 +463,22 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
         <section id="stab-models">
           <div class="panel">
             <div class="panel-head">
+              <h3>路由组</h3>
+              <div class="hint">每个路由组对外是一个虚拟模型名，请求该名字时只在本组模型里按优先级选路；组与组互不影响</div>
+            </div>
+            <div class="row-inline" id="group-tabs" style="margin-bottom:10px"></div>
+            <div class="row-inline hint" id="group-meta"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
               <h3>模型路由</h3>
-              <div class="hint">优先级数值越大越优先，可用 ▲▼ 调整顺序；同一模型名可挂多个 Provider 自动故障转移。「暴露」开关控制模型名是否出现在 /v1/models 列表</div>
+              <div class="hint">当前组的成员：模型配置全局共享（每日上限、并行上限、静音时段等改一次全组生效），只有组内优先级不同；「移出本组」只删成员关系，模型仍可被其他组使用</div>
             </div>
             <div class="tbl-wrap">
               <table>
                 <thead><tr>
                   <th style="width:88px">优先级</th><th>模型</th><th>Provider</th><th style="width:72px">暴露</th><th>状态</th>
-                  <th class="num">今日用量</th><th class="num">并行</th><th>静音时段</th><th>连通性</th><th style="width:150px">操作</th>
+                  <th class="num">今日用量</th><th class="num">并行</th><th>静音时段</th><th>连通性</th><th style="width:230px">操作</th>
                 </tr></thead>
                 <tbody id="models-body"></tbody>
               </table>
@@ -536,8 +544,8 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
           </div>
 
           <div class="panel">
-            <div class="panel-head"><h3>自动模型名</h3></div>
-            <p class="hint" style="margin:0 0 12px">请求体 model 填这个名字时，会在所有可用模型里按优先级自动挑选；仅替换 model 字段，其余内容照旧透传。</p>
+            <div class="panel-head"><h3>默认路由组名</h3></div>
+            <p class="hint" style="margin:0 0 12px">第一组（默认路由组）的对外模型名。请求体 model 填这个名字时，会在该组模型里按优先级自动挑选；其余路由组在「模型路由」页添加和管理。</p>
             <div class="row-inline">
               <input id="auto-name" class="mono" style="width:200px">
               <button class="btn pri" onclick="saveAutoName()">保存</button>
@@ -661,6 +669,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 <dialog id="dlg-model">
   <div class="dlg-body">
     <div class="dlg-head"><h3 id="dlg-model-title">添加模型</h3></div>
+    <div class="field"><label>路由组</label><div class="inline"><b id="m-group" class="mono"></b><span class="hint">共享配置保存一次，多个组共用；只有组内优先级不同</span></div></div>
     <div class="field"><label>Provider *</label><select id="m-provider"></select></div>
     <div class="field" style="align-items:flex-start"><label>模型名 *</label>
       <div style="flex:1;min-width:0">
@@ -669,7 +678,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
         <div class="hint" id="m-fetch-status" style="margin-top:4px"></div>
       </div>
     </div>
-    <div class="field"><label>优先级</label><div class="inline"><input id="m-priority" type="number" value="10" style="max-width:110px"><span class="hint">越大越优先</span></div></div>
+    <div class="field"><label>本组优先级</label><div class="inline"><input id="m-priority" type="number" value="10" style="max-width:110px"><span class="hint">只影响当前路由组；越大越优先</span></div></div>
     <div class="field"><label>每日上限</label>
       <div class="inline"><input id="m-limit" type="number" min="0" step="0.1" value="0" style="max-width:110px"><span class="hint">万 tokens / 天（填 50 = 50 万），0 = 不限</span></div>
     </div>
@@ -679,7 +688,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
     <div class="field"><label>暴露</label>
       <div class="inline">
         <label class="switch"><input id="m-expose" type="checkbox"><i></i></label>
-        <span class="hint">在 /v1/models 列表中暴露该模型名；关闭只影响列表，直接指定 model 或走 auto 仍可用</span>
+        <span class="hint">在 /v1/models 列表中暴露该模型名；关闭只影响列表，直接指定 model 或走所在路由组仍可用</span>
       </div>
     </div>
     <div class="field" style="align-items:flex-start"><label>静音时段</label>
@@ -693,6 +702,34 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
   <div class="dlg-foot">
     <button class="btn" onclick="dlgModel.close()">取消</button>
     <button class="btn pri" onclick="saveModel()">保存</button>
+  </div>
+</dialog>
+
+<!-- 路由组弹窗 -->
+<dialog id="dlg-group">
+  <div class="dlg-body">
+    <div class="dlg-head"><h3 id="dlg-group-title">新建路由组</h3></div>
+    <div class="field"><label>组名 *</label><input id="g-name" class="mono" placeholder="例如 auto / coding / cheap" style="width:100%"></div>
+    <p class="hint" style="margin:-2px 0 12px">组名就是客户端请求体里的 model 名：填它时只在本组模型里按优先级选路。</p>
+    <div class="field"><label>备注</label><input id="g-note" placeholder="可选，如：日常编码 / 便宜模型" style="width:100%"></div>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" onclick="dlgGroup.close()">取消</button>
+    <button class="btn pri" onclick="saveGroup()">保存</button>
+  </div>
+</dialog>
+
+<!-- 加入已有模型弹窗 -->
+<dialog id="dlg-attach">
+  <div class="dlg-body">
+    <div class="dlg-head"><h3>加入已有模型</h3></div>
+    <p class="hint" style="margin:0 0 12px">选择一条已存在的共享模型配置加入路由组「<b id="a-group" class="mono"></b>」。不会复制配置，组内只新增一条优先级。</p>
+    <div class="field"><label>模型配置 *</label><select id="a-model" style="flex:1;min-width:0"></select></div>
+    <div class="field"><label>本组优先级</label><div class="inline"><input id="a-priority" type="number" value="1" style="max-width:110px"><span class="hint">越大越优先</span></div></div>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" onclick="dlgAttach.close()">取消</button>
+    <button class="btn pri" onclick="saveAttach()">加入本组</button>
   </div>
 </dialog>
 
@@ -714,13 +751,14 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
 <script>
 'use strict';
-let S = {providers: [], models: [], usage: [], session_usage: [], balances: {}, api_keys: [], logs: [], responses_convert: false};
+let S = {providers: [], groups: [], models: [], usage: [], session_usage: [], balances: {}, api_keys: [], logs: [], responses_convert: false};
 let page = 'home', stab = 'models', range = 'today', detailMode = 'model';
 let logFilter = 'all', expandedLogs = new Set();
-let needAuth = false, authorized = false, authMessage = '', editingModel = null, editingProvider = null;
+let needAuth = false, authorized = false, authMessage = '', editingModel = null, editingProvider = null, editingGroup = null;
+let activeGroup = ''; // 当前查看的路由组 ID，空 = 第一组
 
 const $ = id => document.getElementById(id);
-const dlgProvider = $('dlg-provider'), dlgModel = $('dlg-model'), dlgToken = $('dlg-token');
+const dlgProvider = $('dlg-provider'), dlgModel = $('dlg-model'), dlgGroup = $('dlg-group'), dlgAttach = $('dlg-attach'), dlgToken = $('dlg-token');
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtN = n => (n || 0).toLocaleString();
@@ -848,6 +886,7 @@ async function load() {
     ]);
     S = st || {};
     S.providers ||= [];
+    S.groups ||= [];
     S.models ||= [];
     S.usage ||= [];
     S.balances ||= {};
@@ -1369,7 +1408,6 @@ function goSettings(tab) {
 }
 
 /* ---------- 模型 ---------- */
-const sortedModels = () => [...S.models].sort((a, b) => (b.priority - a.priority) || a.id.localeCompare(b.id));
 
 function isMuted(ws) {
   const now = new Date();
@@ -1385,13 +1423,66 @@ function isMuted(ws) {
   return false;
 }
 
+// 当前选中的路由组；组被删/首次加载时回落到第一组
+function activeGroupObj() {
+  const gs = S.groups || [];
+  if (!gs.length) return null;
+  let g = gs.find(x => x.id === activeGroup);
+  if (!g) g = gs[0];
+  activeGroup = g.id;
+  return g;
+}
+
+function selectGroup(id) {
+  activeGroup = id;
+  renderModels();
+}
+
+// 当前组的成员：把共享模型配置与组内优先级合并成表格行
+const groupModels = () => {
+  const g = activeGroupObj();
+  if (!g) return [];
+  return (g.members || [])
+    .map(mem => {
+      const m = S.models.find(x => x.id === mem.model_id);
+      return m ? {...m, priority: mem.priority} : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => (b.priority - a.priority) || a.id.localeCompare(b.id));
+};
+
+// 路由组标签与当前组信息（对外模型名、备注、重命名/删除/加入已有模型入口）
+function renderGroups() {
+  const gs = S.groups || [];
+  const cur = activeGroupObj();
+  $('group-tabs').innerHTML = gs.map(g => {
+    const n = (g.members || []).length;
+    const on = cur && g.id === cur.id;
+    return `<button class="btn mini${on ? ' pri' : ''}" onclick="selectGroup('${g.id}')">
+      <span class="mono">${esc(g.name)}</span> (${n})</button>`;
+  }).join('') + '<button class="btn mini" onclick="openGroup()">＋ 新建路由组</button>';
+  $('group-meta').innerHTML = cur ? `
+    对外模型名 <code class="mono">${esc(cur.name)}</code>${cur.note ? ' · ' + esc(cur.note) : ''}
+    <button class="btn mini" onclick="openGroup('${cur.id}')">重命名 / 备注</button>
+    <button class="btn mini" onclick="openAttach()">＋ 加入已有模型</button>
+    ${gs.length > 1 ? `<button class="btn mini danger" onclick="delGroup('${cur.id}')">删除该组</button>` : ''}
+    <span>模型配置全局共享，组间只有优先级不同</span>` : '<span>暂无路由组</span>';
+}
+
 function renderModels() {
+  renderGroups();
   const tb = $('models-body');
-  if (!S.models.length) {
-    tb.innerHTML = `<tr><td colspan="10" class="empty">还没有模型，点右上角「添加模型」开始</td></tr>`;
+  const cur = activeGroupObj();
+  const list = groupModels();
+  if (!cur) {
+    tb.innerHTML = `<tr><td colspan="10" class="empty">还没有路由组</td></tr>`;
     return;
   }
-  tb.innerHTML = sortedModels().map((m, i) => {
+  if (!list.length) {
+    tb.innerHTML = `<tr><td colspan="10" class="empty">「${esc(cur.name)}」还没有模型，点右上角「添加模型」开始</td></tr>`;
+    return;
+  }
+  tb.innerHTML = list.map((m, i) => {
     const muted = isMuted(m.mutes);
     const autoUntil = m.muted_until && new Date(m.muted_until) > new Date() ? new Date(m.muted_until) : null;
     const over = m.daily_limit > 0 && m.used_today >= m.daily_limit;
@@ -1443,7 +1534,8 @@ function renderModels() {
       </td>
       <td style="white-space:nowrap">
         <button class="btn mini" onclick="editModel('${m.id}')">编辑</button>
-        <button class="btn mini danger" onclick="delModel('${m.id}')">删除</button>
+        <button class="btn mini" onclick="detachModel('${m.id}')" title="只从当前组移除，模型配置若仍被其他组使用则保留">移出本组</button>
+        <button class="btn mini danger" onclick="delModel('${m.id}')" title="删除共享模型配置，并从所有路由组移除">删除</button>
       </td>
     </tr>`;
   }).join('');
@@ -1522,24 +1614,28 @@ async function saveSessionTTL() {
 }
 
 async function move(id, dir) {
-  const ids = sortedModels().map(m => m.id);
+  const ids = groupModels().map(m => m.id);
   const i = ids.indexOf(id), j = i + dir;
   if (i < 0 || j < 0 || j >= ids.length) return;
   [ids[i], ids[j]] = [ids[j], ids[i]];
   try {
-    S = await api('POST', '/api/models/reorder', {ids});
+    S = await api('POST', '/api/models/reorder', {group_id: activeGroupObj()?.id, ids});
     renderAll();
   } catch (e) { alert(e.message); }
 }
 
 function editModel(id) {
   if (!S.providers.length) { alert('请先在 Providers 页添加一个 Provider'); goSettings('providers'); return; }
+  const cur = activeGroupObj();
+  if (!cur) { alert('请先新建一个路由组'); return; }
   editingModel = id ? S.models.find(m => m.id === id) : null;
   $('dlg-model-title').textContent = id ? '编辑模型' : '添加模型';
+  $('m-group').textContent = cur.name;
   $('m-provider').innerHTML = S.providers.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
   $('m-provider').value = editingModel?.provider_id || S.providers[0].id;
   $('m-name').value = editingModel?.name || '';
-  $('m-priority').value = editingModel?.priority ?? ((sortedModels()[0]?.priority || 0) + 1);
+  const curMem = (cur.members || []).find(x => x.model_id === id);
+  $('m-priority').value = curMem ? curMem.priority : ((groupModels()[0]?.priority || 0) + 1);
   $('m-limit').value = editingModel?.daily_limit ? editingModel.daily_limit / 10000 : 0;
   $('m-concurrent').value = editingModel?.max_concurrent || 0;
   $('m-expose').checked = !!editingModel?.expose;
@@ -1584,6 +1680,7 @@ async function saveModel() {
   }).filter(Boolean);
   const body = {
     provider_id: $('m-provider').value,
+    group_id: activeGroupObj()?.id || '',
     name: $('m-name').value.trim(),
     priority: parseInt($('m-priority').value) || 0,
     daily_limit: Math.round((parseFloat($('m-limit').value) || 0) * 10000), // 界面单位：万 tokens
@@ -1600,13 +1697,90 @@ async function saveModel() {
   } catch (e) { alert(e.message); }
 }
 
+// 删除共享模型配置：从所有路由组移除
 async function delModel(id) {
   const m = S.models.find(x => x.id === id);
-  if (!confirm(`确定删除模型「${m?.name || id}」？`)) return;
+  if (!confirm(`确定删除共享模型配置「${m?.name || id}」？它会从所有路由组移除，且不可恢复。`)) return;
   try {
     S = await api('DELETE', '/api/models/' + id);
     renderAll();
     toast('已删除');
+  } catch (e) { alert(e.message); }
+}
+
+// 只从当前组移除；模型配置若仍被其他组使用则保留
+async function detachModel(id) {
+  const cur = activeGroupObj();
+  const m = S.models.find(x => x.id === id);
+  const owners = (S.groups || []).filter(g => (g.members || []).some(x => x.model_id === id));
+  const last = owners.length <= 1;
+  if (!confirm(`从路由组「${cur?.name || ''}」移出模型「${m?.name || id}」？${last ? '它已不属于任何组，共享配置会一并删除。' : '模型配置仍被其他组使用，会保留。'}`)) return;
+  try {
+    S = await api('DELETE', '/api/groups/' + cur.id + '/models/' + id);
+    renderAll();
+    toast(last ? '已移出并删除配置' : '已移出本组');
+  } catch (e) { alert(e.message); }
+}
+
+/* ---------- 路由组 ---------- */
+function openAttach() {
+  const cur = activeGroupObj();
+  if (!cur) return;
+  const inGroup = new Set((cur.members || []).map(m => m.model_id));
+  const candidates = S.models.filter(m => !inGroup.has(m.id));
+  if (!candidates.length) { alert('没有可加入的其他模型配置；请先在任意组里「添加模型」'); return; }
+  $('a-group').textContent = cur.name;
+  $('a-model').innerHTML = candidates.map(m =>
+    `<option value="${m.id}">${esc(pname(m.provider_id))} / ${esc(m.name)}</option>`).join('');
+  $('a-priority').value = (groupModels()[0]?.priority || 0) + 1;
+  dlgAttach.showModal();
+}
+
+async function saveAttach() {
+  const cur = activeGroupObj();
+  if (!cur) return;
+  try {
+    S = await api('POST', '/api/groups/' + cur.id + '/models', {
+      model_id: $('a-model').value,
+      priority: parseInt($('a-priority').value) || 0,
+    });
+    dlgAttach.close();
+    renderAll();
+    toast('已加入本组（共享原有配置）');
+  } catch (e) { alert(e.message); }
+}
+function openGroup(id) {
+  editingGroup = id ? (S.groups || []).find(g => g.id === id) : null;
+  $('dlg-group-title').textContent = id ? '编辑路由组' : '新建路由组';
+  $('g-name').value = editingGroup?.name || '';
+  $('g-note').value = editingGroup?.note || '';
+  dlgGroup.showModal();
+}
+
+async function saveGroup() {
+  const body = {name: $('g-name').value.trim(), note: $('g-note').value.trim()};
+  if (!body.name) { alert('组名必填'); return; }
+  try {
+    S = await api(editingGroup ? 'PUT' : 'POST', editingGroup ? '/api/groups/' + editingGroup.id : '/api/groups', body);
+    dlgGroup.close();
+    if (!editingGroup) {
+      const created = (S.groups || []).find(g => g.name === body.name);
+      if (created) activeGroup = created.id;
+    }
+    renderAll();
+    toast(editingGroup ? '已保存路由组' : '已新建路由组');
+  } catch (e) { alert(e.message); }
+}
+
+async function delGroup(id) {
+  const g = (S.groups || []).find(x => x.id === id);
+  const n = (g?.members || []).length;
+  if (!confirm(`确定删除路由组「${g?.name || id}」？将移除 ${n} 条成员关系；仅属于该组的模型配置会一并删除，被其他组共享的配置保留。`)) return;
+  try {
+    S = await api('DELETE', '/api/groups/' + id);
+    if (activeGroup === id) activeGroup = '';
+    renderAll();
+    toast('已删除路由组');
   } catch (e) { alert(e.message); }
 }
 

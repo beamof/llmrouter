@@ -8,9 +8,28 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
+
+// defaultGroupID 默认路由组的固定 ID，不占用 NextID（保持旧数据里 p1/m1 等 ID 序列不变）
+const defaultGroupID = "default"
+
+// GroupMember 路由组成员：引用一条全局共享的模型配置，只有组内优先级是组特有的。
+type GroupMember struct {
+	ModelID  string `json:"model_id"`
+	Priority int    `json:"priority"` // 组内优先级，越大越优先
+}
+
+// RouteGroup 一个路由组：对外暴露一个虚拟模型名，请求该名字时只在成员模型里按组内优先级选路。
+// 模型配置本身全局共享，同一个模型可加入多个路由组，并在各组拥有不同优先级。
+type RouteGroup struct {
+	ID      string        `json:"id"`
+	Name    string        `json:"name"`           // 对外模型名，客户端请求体 model 填这个名字
+	Note    string        `json:"note,omitempty"` // 备注，仅后台展示
+	Members []GroupMember `json:"members"`        // 成员模型及组内优先级
+}
 
 // Provider 一个上游服务商
 type Provider struct {
@@ -97,19 +116,24 @@ type MuteWindow struct {
 	To   string `json:"to"`
 }
 
-// Model 一条路由规则：某 provider 上的某个模型
+// Model 一条模型配置：某 provider 上的某个模型以及全部共享参数。
+// 模型配置不隶属于任何路由组；路由组通过 RouteGroup.Members 引用它并只覆盖优先级。
 type Model struct {
-	ID            string       `json:"id"`
-	ProviderID    string       `json:"provider_id"`
-	Name          string       `json:"name"`           // 对外模型名，须与请求体 model 字段一致
-	Priority      int          `json:"priority"`       // 越大越优先
-	DailyLimit    int64        `json:"daily_limit"`    // 每日请求上限，0 = 不限
-	MaxConcurrent int          `json:"max_concurrent"` // 最大并行请求数，0 = 不限；超出后新请求改走后续候选
+	ID         string `json:"id"`
+	ProviderID string `json:"provider_id"`
+	// GroupID 仅用于读取旧版数据（每模型单组），加载迁移后恒为空。
+	GroupID string `json:"group_id,omitempty"`
+	Name    string `json:"name"` // 模型名：直接调用时的 model 名，也是发往上游的 model 字段
+	// Priority 直连优先级：直接指定模型名时的排序值，由各路由组成员优先级的最大值自动维护；
+	// 组内选路使用 GroupMember.Priority，不使用该字段。
+	Priority      int          `json:"priority"`
+	DailyLimit    int64        `json:"daily_limit"`    // 每日请求上限，0 = 不限（全局共享，按模型配置统计）
+	MaxConcurrent int          `json:"max_concurrent"` // 最大并行请求数，0 = 不限；全局共享
 	Mutes         []MuteWindow `json:"mutes,omitempty"`
 
-	// Expose 该模型名是否出现在 /v1/models 列表里。默认 false：只有 auto 虚拟模型始终可见，
+	// Expose 该模型名是否出现在 /v1/models 列表里。默认 false：路由组名始终可见，
 	// 想让客户端下拉出现真实模型名时再按路由单独打开。同一模型名任一路由开启即暴露；
-	// 关闭只影响列表展示，直接指定 model 名或走 auto 路由都不受影响。
+	// 关闭只影响列表展示，直接指定 model 名或走所在路由组都不受影响。
 	Expose bool `json:"expose,omitempty"`
 
 	// MutedUntil 上游返回 429 后自动静音到的时刻（绝对时间），零值 = 未静音。
@@ -180,8 +204,14 @@ type Store struct {
 	// SessionUsage 按天 × 会话 聚合的用量；会话过期后仍保留，供用量页按会话查看。
 	SessionUsage []*SessionStat      `json:"session_usage,omitempty"`
 	Balances     map[string]*Balance `json:"balances"`
-	Logs         []*LogEntry         `json:"logs,omitempty"`       // 异常/失败日志，最多 maxLogs 条
-	AutoModel    string              `json:"auto_model,omitempty"` // 对外声明的自动模型名，空 = "auto"
+	Logs         []*LogEntry         `json:"logs,omitempty"` // 异常/失败日志，最多 maxLogs 条
+
+	// Groups 路由组：每个组对外暴露一个虚拟模型名，只在该组的模型里选路。
+	// 至少保留一个；第一组是默认组（兼容旧的单一 auto 语义）。
+	Groups []*RouteGroup `json:"groups,omitempty"`
+	// AutoModel 旧版单一自动模型名，仅用于读取旧状态文件做迁移；
+	// 加载后始终与第一组名字同步，实际路由以 Groups 为准。
+	AutoModel string `json:"auto_model,omitempty"`
 
 	// ResponsesConvert 是否允许把 /v1/responses 请求翻译成 chat/completions 出站。
 	// 默认关闭：仅支持 chat 的上游（WorkBuddy）不承接 responses 请求，路由会改选
@@ -200,20 +230,174 @@ type Store struct {
 func LoadStore(path string) (*Store, error) {
 	s := &Store{path: path, Balances: map[string]*Balance{}}
 	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return s, nil
-	}
-	if err != nil {
+	switch {
+	case os.IsNotExist(err):
+	case err != nil:
 		return nil, err
-	}
-	if err := json.Unmarshal(b, s); err != nil {
-		return nil, err
+	default:
+		if err := json.Unmarshal(b, s); err != nil {
+			return nil, err
+		}
 	}
 	s.path = path
 	if s.Balances == nil {
 		s.Balances = map[string]*Balance{}
 	}
+	s.normalizeGroupsLocked() // 旧状态文件没有组：按原 auto_model 建默认组，模型全部归入
 	return s, nil
+}
+
+// normalizeGroupsLocked 修复/迁移路由组数据：至少保留一个组；把旧版「模型归属单个组」
+// 迁移为「组持有成员列表」；每条模型配置至少加入默认组；并重算直连优先级。
+// 调用方需持锁（LoadStore 为单线程，可直接调用）。
+func (s *Store) normalizeGroupsLocked() {
+	seen := make(map[string]bool, len(s.Groups))
+	groups := s.Groups[:0]
+	for _, g := range s.Groups {
+		if g == nil || g.ID == "" || seen[g.ID] {
+			continue
+		}
+		g.Name = strings.TrimSpace(g.Name)
+		if g.Name == "" {
+			continue
+		}
+		seen[g.ID] = true
+		if g.Members == nil {
+			g.Members = []GroupMember{} // JSON 输出 [] 而不是 null
+		}
+		groups = append(groups, g)
+	}
+	s.Groups = groups
+	if len(s.Groups) == 0 {
+		name := strings.TrimSpace(s.AutoModel)
+		if name == "" {
+			name = "auto"
+		}
+		s.Groups = []*RouteGroup{{ID: defaultGroupID, Name: name, Members: []GroupMember{}}}
+	}
+
+	models := make(map[string]*Model, len(s.Models))
+	for _, m := range s.Models {
+		if m != nil && m.ID != "" {
+			models[m.ID] = m
+		}
+	}
+	// 旧版数据：模型自带 group_id，折叠成目标组的成员关系（保留组内优先级）。
+	for _, m := range s.Models {
+		if m == nil {
+			continue
+		}
+		if m.GroupID != "" {
+			if g := s.groupByIDLocked(m.GroupID); g != nil {
+				s.addMemberLocked(g, m.ID, m.Priority)
+			}
+			m.GroupID = ""
+		}
+	}
+	// 清理悬空/重复成员，并记下已有归属的模型。
+	memberOf := make(map[string]bool, len(models))
+	for _, g := range s.Groups {
+		out := g.Members[:0]
+		seenMember := make(map[string]bool, len(g.Members))
+		for _, mem := range g.Members {
+			if mem.ModelID == "" || seenMember[mem.ModelID] {
+				continue
+			}
+			if _, ok := models[mem.ModelID]; !ok {
+				continue
+			}
+			seenMember[mem.ModelID] = true
+			memberOf[mem.ModelID] = true
+			out = append(out, mem)
+		}
+		g.Members = out
+	}
+	// 每条模型配置至少属于一个组（兼容旧数据与直接 UpsertModel 的场景）。
+	def := s.Groups[0]
+	for _, m := range s.Models {
+		if m != nil && m.ID != "" && !memberOf[m.ID] {
+			s.addMemberLocked(def, m.ID, m.Priority)
+		}
+	}
+	s.recomputeModelPrioritiesLocked()
+	s.AutoModel = def.Name
+}
+
+// groupByIDLocked 按 ID 取组指针（调用方需持锁）
+func (s *Store) groupByIDLocked(id string) *RouteGroup {
+	for _, g := range s.Groups {
+		if g.ID == id {
+			return g
+		}
+	}
+	return nil
+}
+
+// memberIndexLocked 成员在组内的下标，-1 = 不是成员（调用方需持锁）
+func memberIndexLocked(g *RouteGroup, modelID string) int {
+	for i, mem := range g.Members {
+		if mem.ModelID == modelID {
+			return i
+		}
+	}
+	return -1
+}
+
+// addMemberLocked 加入成员；已存在则保留原组内优先级（调用方需持锁）
+func (s *Store) addMemberLocked(g *RouteGroup, modelID string, priority int) {
+	if g == nil || modelID == "" || memberIndexLocked(g, modelID) >= 0 {
+		return
+	}
+	g.Members = append(g.Members, GroupMember{ModelID: modelID, Priority: priority})
+}
+
+// setMemberPriorityLocked 加入成员或更新其在组内的优先级（调用方需持锁）
+func (s *Store) setMemberPriorityLocked(g *RouteGroup, modelID string, priority int) {
+	if g == nil || modelID == "" {
+		return
+	}
+	if i := memberIndexLocked(g, modelID); i >= 0 {
+		g.Members[i].Priority = priority
+		return
+	}
+	g.Members = append(g.Members, GroupMember{ModelID: modelID, Priority: priority})
+}
+
+// anyMembershipLocked 该模型是否仍属于至少一个组（调用方需持锁）
+func (s *Store) anyMembershipLocked(modelID string) bool {
+	for _, g := range s.Groups {
+		if memberIndexLocked(g, modelID) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// recomputeModelPriorityLocked 直连优先级 = 所有成员优先级的最大值（调用方需持锁）
+func (s *Store) recomputeModelPriorityLocked(m *Model) {
+	if m == nil {
+		return
+	}
+	best, found := 0, false
+	for _, g := range s.Groups {
+		if i := memberIndexLocked(g, m.ID); i >= 0 {
+			if !found || g.Members[i].Priority > best {
+				best, found = g.Members[i].Priority, true
+			}
+		}
+	}
+	if found {
+		m.Priority = best
+	} else {
+		m.Priority = 0
+	}
+}
+
+// recomputeModelPrioritiesLocked 重算全部模型的直连优先级（调用方需持锁）
+func (s *Store) recomputeModelPrioritiesLocked() {
+	for _, m := range s.Models {
+		s.recomputeModelPriorityLocked(m)
+	}
 }
 
 // save 原子落盘，并裁掉 35 天前的用量（调用方需持锁）
@@ -419,14 +603,26 @@ func (s *Store) DeleteProvider(id string) bool {
 		return false
 	}
 	s.Providers = s.Providers[:n]
+	removed := map[string]bool{}
 	m := 0
 	for _, x := range s.Models {
 		if x.ProviderID != id {
 			s.Models[m] = x
 			m++
+			continue
 		}
+		removed[x.ID] = true
 	}
 	s.Models = s.Models[:m]
+	for _, g := range s.Groups { // 清掉指向已删模型的成员关系
+		kept := g.Members[:0]
+		for _, mem := range g.Members {
+			if !removed[mem.ModelID] {
+				kept = append(kept, mem)
+			}
+		}
+		g.Members = kept
+	}
 	u := 0
 	for _, x := range s.Usage {
 		if x.ProviderID != id {
@@ -460,13 +656,45 @@ func (s *Store) Model(id string) (Model, bool) {
 	return Model{}, false
 }
 
+// UpsertModel 保存共享模型配置。新模型至少加入默认组；已有模型保留其全部组成员关系。
 func (s *Store) UpsertModel(m *Model) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.upsertModelLocked(m, "")
+	s.save()
+}
+
+// UpsertModelInGroup 保存共享模型配置，并设置它在 targetGroupID 组内的优先级。
+// 同一个模型配置可被多个组引用；这里只改目标组的成员优先级，不影响其他组。
+func (s *Store) UpsertModelInGroup(m *Model, groupID string, priority int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if groupID == "" {
+		groupID = s.defaultGroupIDLocked()
+	}
+	g := s.groupByIDLocked(groupID)
+	if g == nil {
+		return fmt.Errorf("路由组不存在")
+	}
+	s.upsertModelLocked(m, g.ID)
+	s.setMemberPriorityLocked(g, m.ID, priority)
+	s.recomputeModelPriorityLocked(m)
+	s.save()
+	return nil
+}
+
+// upsertModelLocked 保存配置（调用方需持锁）。targetGroupID 非空时确保模型加入该组；
+// 否则新模型加入默认组。旧版携带的 GroupID 也在此迁移后清空。
+func (s *Store) upsertModelLocked(m *Model, targetGroupID string) {
+	legacyGroupID := m.GroupID
+	m.GroupID = ""
 	for i, old := range s.Models {
-		if old.ID == m.ID {
+		if old.ID != "" && old.ID == m.ID {
+			// 后台弹窗不提交运行时静音状态，更新时保留，避免一次编辑把限流静音清掉
+			m.MutedUntil = old.MutedUntil
+			m.MuteReason = old.MuteReason
 			s.Models[i] = m
-			s.save()
+			s.recomputeModelPriorityLocked(m)
 			return
 		}
 	}
@@ -474,9 +702,19 @@ func (s *Store) UpsertModel(m *Model) {
 		m.ID = s.newID("m")
 	}
 	s.Models = append(s.Models, m)
-	s.save()
+	gid := targetGroupID
+	if gid == "" {
+		gid = legacyGroupID
+	}
+	if g := s.groupByIDLocked(gid); g != nil {
+		s.addMemberLocked(g, m.ID, m.Priority)
+	} else if g := s.groupByIDLocked(s.defaultGroupIDLocked()); g != nil {
+		s.addMemberLocked(g, m.ID, m.Priority)
+	}
+	s.recomputeModelPriorityLocked(m)
 }
 
+// DeleteModel 删除共享模型配置，并从所有路由组中移除该成员。
 func (s *Store) DeleteModel(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -491,23 +729,99 @@ func (s *Store) DeleteModel(id string) bool {
 		return false
 	}
 	s.Models = s.Models[:n]
+	for _, g := range s.Groups {
+		kept := g.Members[:0]
+		for _, mem := range g.Members {
+			if mem.ModelID != id {
+				kept = append(kept, mem)
+			}
+		}
+		g.Members = kept
+	}
 	s.save()
 	return true
 }
 
-// Reorder 按传入顺序重新赋优先级，排最前者最大
-func (s *Store) Reorder(ids []string) {
+// ReorderGroup 按传入顺序重排某组的成员优先级，排最前者最大；只影响该组。
+func (s *Store) ReorderGroup(groupID string, ids []string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, m := range s.Models {
-		for i, id := range ids {
-			if m.ID == id {
-				m.Priority = len(ids) - i
-				break
+	g := s.groupByIDLocked(groupID)
+	if g == nil {
+		return false
+	}
+	for i, id := range ids {
+		if idx := memberIndexLocked(g, id); idx >= 0 {
+			g.Members[idx].Priority = len(ids) - i
+		}
+	}
+	s.recomputeModelPrioritiesLocked()
+	s.save()
+	return true
+}
+
+// Reorder 兼容旧接口：重排默认组成员。
+func (s *Store) Reorder(ids []string) {
+	s.ReorderGroup(s.DefaultGroupID(), ids)
+}
+
+// AttachModelToGroup 把已有模型配置加入组（已在组内则更新组内优先级）。
+func (s *Store) AttachModelToGroup(groupID, modelID string, priority int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.groupByIDLocked(groupID)
+	if g == nil {
+		return fmt.Errorf("路由组不存在")
+	}
+	m := s.modelByIDLocked(modelID)
+	if m == nil {
+		return fmt.Errorf("模型不存在")
+	}
+	s.setMemberPriorityLocked(g, modelID, priority)
+	s.recomputeModelPriorityLocked(m)
+	s.save()
+	return nil
+}
+
+// DetachModelFromGroup 只把模型移出该组；若它已不属于任何组，则连同共享配置一起删除。
+func (s *Store) DetachModelFromGroup(groupID, modelID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.groupByIDLocked(groupID)
+	if g == nil {
+		return false
+	}
+	i := memberIndexLocked(g, modelID)
+	if i < 0 {
+		return false
+	}
+	g.Members = append(g.Members[:i], g.Members[i+1:]...)
+	if m := s.modelByIDLocked(modelID); m != nil {
+		if !s.anyMembershipLocked(modelID) {
+			n := 0
+			for _, x := range s.Models {
+				if x.ID != modelID {
+					s.Models[n] = x
+					n++
+				}
 			}
+			s.Models = s.Models[:n]
+		} else {
+			s.recomputeModelPriorityLocked(m)
 		}
 	}
 	s.save()
+	return true
+}
+
+// modelByIDLocked 按 ID 取模型指针（调用方需持锁）
+func (s *Store) modelByIDLocked(id string) *Model {
+	for _, m := range s.Models {
+		if m.ID == id {
+			return m
+		}
+	}
+	return nil
 }
 
 // AddAPIKey 生成并保存一个客户端密钥
@@ -711,21 +1025,183 @@ type Candidate struct {
 	Model    Model
 }
 
-// AutoModelName 对外声明的自动模型名（默认 auto）
+// AutoModelName 默认路由组（第一组）对外声明的模型名（默认 auto）
 func (s *Store) AutoModelName() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.AutoModel == "" {
+	if len(s.Groups) == 0 {
 		return "auto"
 	}
-	return s.AutoModel
+	return s.Groups[0].Name
 }
 
-func (s *Store) SetAutoModel(name string) {
+// SetAutoModel 重命名默认路由组（兼容旧设置接口），与其他组重名时报错。
+func (s *Store) SetAutoModel(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "auto"
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.Groups) == 0 {
+		s.normalizeGroupsLocked()
+	}
+	for _, g := range s.Groups[1:] {
+		if g.Name == name {
+			return fmt.Errorf("路由组名 %q 已被其他组使用", name)
+		}
+	}
+	if s.Groups[0].Name == name {
+		return nil
+	}
+	s.Groups[0].Name = name
 	s.AutoModel = name
 	s.save()
+	return nil
+}
+
+// cloneGroup 深拷贝组（含成员切片），避免返回值与内部状态共享底层数组
+func cloneGroup(g *RouteGroup) RouteGroup {
+	c := *g
+	c.Members = append([]GroupMember(nil), g.Members...)
+	return c
+}
+
+// GroupsList 全部路由组的拷贝（后台/模型列表展示用）
+func (s *Store) GroupsList() []RouteGroup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]RouteGroup, 0, len(s.Groups))
+	for _, g := range s.Groups {
+		out = append(out, cloneGroup(g))
+	}
+	return out
+}
+
+// GroupByName 按对外模型名找路由组
+func (s *Store) GroupByName(name string) (RouteGroup, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, g := range s.Groups {
+		if g.Name == name {
+			return cloneGroup(g), true
+		}
+	}
+	return RouteGroup{}, false
+}
+
+// GroupByID 按 ID 找路由组（存在性校验用）
+func (s *Store) GroupByID(id string) (RouteGroup, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if g := s.groupByIDLocked(id); g != nil {
+		return cloneGroup(g), true
+	}
+	return RouteGroup{}, false
+}
+
+// DefaultGroupID 默认（第一）路由组的 ID
+func (s *Store) DefaultGroupID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Groups) == 0 {
+		return ""
+	}
+	return s.Groups[0].ID
+}
+
+// AddGroup 新建路由组，名字在组间必须唯一。
+func (s *Store) AddGroup(name, note string) (RouteGroup, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return RouteGroup{}, fmt.Errorf("路由组名不能为空")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Groups) == 0 {
+		s.normalizeGroupsLocked()
+	}
+	for _, g := range s.Groups {
+		if g.Name == name {
+			return RouteGroup{}, fmt.Errorf("路由组名 %q 已存在", name)
+		}
+	}
+	g := &RouteGroup{ID: s.newID("g"), Name: name, Note: strings.TrimSpace(note), Members: []GroupMember{}}
+	s.Groups = append(s.Groups, g)
+	s.save()
+	return cloneGroup(g), nil
+}
+
+// UpdateGroup 重命名/改备注；名字同样在组间唯一。
+func (s *Store) UpdateGroup(id, name, note string) (RouteGroup, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return RouteGroup{}, fmt.Errorf("路由组名不能为空")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var target *RouteGroup
+	for _, g := range s.Groups {
+		if g.ID != id {
+			if g.Name == name {
+				return RouteGroup{}, fmt.Errorf("路由组名 %q 已存在", name)
+			}
+			continue
+		}
+		target = g
+	}
+	if target == nil {
+		return RouteGroup{}, fmt.Errorf("路由组不存在")
+	}
+	target.Name = name
+	target.Note = strings.TrimSpace(note)
+	if s.Groups[0] == target {
+		s.AutoModel = target.Name
+	}
+	s.save()
+	return cloneGroup(target), nil
+}
+
+// DeleteGroup 删除路由组。共享模型配置若仍属于其他组则保留；只删除已无任何归属的模型。
+// 至少保留一个路由组。
+func (s *Store) DeleteGroup(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Groups) <= 1 {
+		return false
+	}
+	idx := -1
+	for i, g := range s.Groups {
+		if g.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return false
+	}
+	s.Groups = append(s.Groups[:idx], s.Groups[idx+1:]...)
+	n := 0
+	for _, m := range s.Models {
+		if s.anyMembershipLocked(m.ID) {
+			s.Models[n] = m
+			n++
+			continue
+		}
+	}
+	s.Models = s.Models[:n] // 仅删掉不再属于任何组的模型配置
+	s.recomputeModelPrioritiesLocked()
+	s.AutoModel = s.Groups[0].Name
+	s.save()
+	return true
+}
+
+// defaultGroupIDLocked 默认组 ID，必要时先修复组数据（调用方需持锁）
+func (s *Store) defaultGroupIDLocked() string {
+	if len(s.Groups) == 0 {
+		s.normalizeGroupsLocked()
+	}
+	return s.Groups[0].ID
 }
 
 // ResponsesConvertEnabled 是否允许 /v1/responses → chat/completions 协议转换（默认关闭）
@@ -908,17 +1384,51 @@ func (s *Store) providerLocked(id string) (*Provider, bool) {
 }
 
 // CandidatesDetailed 与 Candidates / AllCandidates 同义，但同时返回被剔除条目的原因。
-// name 为空或 all 为 true 时不按名字过滤（auto 虚拟模型用）。
+// name 为空或 all 为 true 时不按名字过滤（全局 fallback 用）。
+// candidatesDetailedLocked 见 CandidatesDetailed（调用方需持锁）
 func (s *Store) CandidatesDetailed(name string, now time.Time, all bool) ([]Candidate, []SkipReason) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	entries := make([]candidateEntry, 0, len(s.Models))
+	for _, m := range s.Models {
+		if all || m.Name == name {
+			entries = append(entries, candidateEntry{m: m, priority: m.Priority})
+		}
+	}
+	return s.candidatesLocked(entries, now)
+}
+
+// GroupCandidatesDetailed 某路由组内的可用候选，按组内成员优先级降序；
+// 同时返回被剔除条目的原因。
+func (s *Store) GroupCandidatesDetailed(groupID string, now time.Time) ([]Candidate, []SkipReason) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.groupByIDLocked(groupID)
+	if g == nil {
+		return nil, nil
+	}
+	entries := make([]candidateEntry, 0, len(g.Members))
+	for _, mem := range g.Members {
+		if m := s.modelByIDLocked(mem.ModelID); m != nil {
+			entries = append(entries, candidateEntry{m: m, priority: mem.Priority})
+		}
+	}
+	return s.candidatesLocked(entries, now)
+}
+
+// candidateEntry 一次选路的输入：模型配置 + 本次上下文使用的优先级（组内或直连）
+type candidateEntry struct {
+	m        *Model
+	priority int
+}
+
+// candidatesLocked 按给定条目剔除不可用项并排序（调用方需持锁）。
+func (s *Store) candidatesLocked(entries []candidateEntry, now time.Time) ([]Candidate, []SkipReason) {
 	today := now.Format("2006-01-02")
 	var out []Candidate
 	var skips []SkipReason
-	for _, m := range s.Models {
-		if !all && m.Name != name {
-			continue
-		}
+	for _, e := range entries {
+		m := e.m
 		if r := s.skipReason(m, now, today); r != "" {
 			skips = append(skips, SkipReason{ModelID: m.ID, Model: m.Name, ProviderID: m.ProviderID, Reason: r})
 			continue
@@ -929,6 +1439,7 @@ func (s *Store) CandidatesDetailed(name string, now time.Time, all bool) ([]Cand
 			continue
 		}
 		c := Candidate{Provider: *p, Model: *m}
+		c.Model.Priority = e.priority // 组内选路使用成员优先级，直连使用模型直连优先级
 		c.Model.Mutes = append([]MuteWindow(nil), m.Mutes...)
 		out = append(out, c)
 	}
@@ -936,7 +1447,7 @@ func (s *Store) CandidatesDetailed(name string, now time.Time, all bool) ([]Cand
 	return out, skips
 }
 
-// AllCandidates 所有模型的可用候选（auto 虚拟模型路由用），剔除静音中、超每日上限的，按优先级降序
+// AllCandidates 所有模型的可用候选（全局兜底用），剔除静音中、超每日上限的，按优先级降序
 func (s *Store) AllCandidates(now time.Time) []Candidate {
 	out, _ := s.CandidatesDetailed("", now, true)
 	return out

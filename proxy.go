@@ -35,7 +35,7 @@ func (f flushWriter) Write(p []byte) (int, error) {
 type session struct {
 	modelID   string    // 绑定的模型路由 ID
 	keyID     string    // 命中的客户端 Key（"env" = 环境变量令牌，空 = 免鉴权）
-	requested string    // 客户端请求的 model 名（auto 虚拟模型时与绑定值不同）
+	requested string    // 客户端请求的 model 名（命中路由组时与绑定模型名不同）
 	firstAt   time.Time // 首次绑定时刻
 	lastAt    time.Time // 最近一次成功请求时刻
 	count     int       // 会话内成功请求数
@@ -252,9 +252,8 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			return
 		}
 
-		// auto 虚拟模型：对外统一声明一个名字，按全局优先级自动挑选实际模型
-		autoName := s.store.AutoModelName()
-		isAuto := req.Model == autoName
+		// 路由组：组名即对外虚拟模型名，命中组时只在组内按优先级挑选实际模型
+		group, isGroup := s.store.GroupByName(req.Model)
 		protocol := "chat"
 		if suffix == "/responses" {
 			protocol = "responses"
@@ -297,7 +296,13 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				}
 			}
 		}
-		rule, ruleSkips := s.store.CandidatesDetailed(req.Model, now, isAuto)
+		var rule []Candidate
+		var ruleSkips []SkipReason
+		if isGroup {
+			rule, ruleSkips = s.store.GroupCandidatesDetailed(group.ID, now)
+		} else {
+			rule, ruleSkips = s.store.CandidatesDetailed(req.Model, now, false)
+		}
 		skips = append(skips, ruleSkips...)
 		protocolSkipped := 0
 		for _, c := range rule {
@@ -312,8 +317,9 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			addCand(c)
 		}
 		// 请求指定的模型全部不支持该协议时，改用其他支持该协议的模型（不跨协议硬发）。
+		// 组请求只在组内兜底；直接模型名沿用全局兜底。
 		// 仅当确有模型因协议被剔除才触发，避免掩盖「模型未配置/静音/超限」等真实原因。
-		if protocol == "responses" && !isAuto && len(cands) == 0 && protocolSkipped > 0 {
+		if protocol == "responses" && !isGroup && len(cands) == 0 && protocolSkipped > 0 {
 			all, _ := s.store.CandidatesDetailed("", now, true)
 			for _, c := range all {
 				if candidateSupportsProtocol(c, protocol, responsesConvert) {
@@ -325,11 +331,11 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			msg := fmt.Sprintf("模型 %q 当前没有可用上游（未配置、处于静音时段、已达每日上限或并行已满）", req.Model)
 			if protocol == "responses" && !responsesConvert && protocolSkipped > 0 {
 				msg = fmt.Sprintf("模型 %q 不支持 Responses 协议，且没有其他可用模型能承接该协议（可在设置中开启 Responses 协议转换，或改用 Chat Completions 入口）", req.Model)
-				if isAuto {
-					msg = "当前没有可用模型支持 Responses 协议（可在设置中开启 Responses 协议转换，或改用 Chat Completions 入口）"
+				if isGroup {
+					msg = fmt.Sprintf("路由组 %q 中没有支持 Responses 协议的模型（可在设置中开启 Responses 协议转换，或改用 Chat Completions 入口）", req.Model)
 				}
-			} else if isAuto {
-				msg = "当前没有可用模型（全部未配置、处于静音时段、已达每日上限或并行已满）"
+			} else if isGroup {
+				msg = fmt.Sprintf("路由组 %q 当前没有可用模型（组内未配置、处于静音时段、已达每日上限或并行已满）", req.Model)
 			}
 			s.logFail(LogEntry{
 				Level: "error", Kind: kindNoCandidate, Status: http.StatusNotFound,
@@ -359,7 +365,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 					Requested:  req.Model,
 					Switched:   boundID != "",
 					Status:     status,
-				}, c, boundID, cands, skips, attemptSkips, isAuto))
+				}, c, boundID, cands, skips, attemptSkips, isGroup))
 			}
 		}
 		for _, c := range cands {
@@ -382,7 +388,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			// wbAttempt 翻译成 chat 协议发上游，回程再渲染回 responses 形态
 			if e, _ := wbOf(c.Provider); e != nil {
 				sendBody := body
-				if isAuto {
+				if isGroup {
 					sendBody = withModel(body, c.Model.Name)
 				}
 				var sm usageSample
@@ -405,7 +411,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 			// 两种接入协议均承接，内部按模型前缀选 Zed 线协议）
 			if zedOf(c.Provider) != nil {
 				sendBody := body
-				if isAuto {
+				if isGroup {
 					sendBody = withModel(body, c.Model.Name)
 				}
 				var sm usageSample
@@ -424,7 +430,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				return
 			}
 			sendBody := body
-			if isAuto {
+			if isGroup {
 				sendBody = withModel(body, c.Model.Name) // 仅替换顶层 model 字段的值
 			}
 			up, err := s.upstreamRequest(r, c.Provider, suffix, sendBody)
@@ -543,7 +549,7 @@ func candidateSupportsProtocol(c Candidate, protocol string, responsesConvert bo
 // 只在新建会话或会话中途换模型时调用，所以理由只有「新会话」「会话切换」两类。
 // skips 是选路规则的剔除项（静音/上限等），attemptSkips 是循环中实际尝试过但
 // 让位的候选（并行抢不到名额、上游失败后降级），两者合并进 skipped 一并落盘。
-func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, cands []Candidate, skips, attemptSkips []SkipReason, isAuto bool) LogEntry {
+func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, cands []Candidate, skips, attemptSkips []SkipReason, isGroup bool) LogEntry {
 	// 候选顺序，带上优先级，便于看清"为什么是它"
 	for _, c := range cands {
 		e.Candidates = append(e.Candidates, fmt.Sprintf("%s/%s (优先级 %d)", c.Provider.Name, c.Model.Name, c.Model.Priority))
@@ -554,8 +560,8 @@ func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, c
 	case boundID != "" && boundID != chosen.Model.ID:
 		e.Switched = true
 		e.Reason = fmt.Sprintf("会话内更换模型：原绑定上游本次不可用，按优先级切换到最高可用候选（%d）", chosen.Model.Priority)
-	case isAuto:
-		e.Reason = fmt.Sprintf("新会话，auto 虚拟模型：全部可用模型中优先级最高（%d）", chosen.Model.Priority)
+	case isGroup:
+		e.Reason = fmt.Sprintf("新会话，路由组 %q：组内优先级最高（%d）", e.Requested, chosen.Model.Priority)
 	default:
 		e.Reason = fmt.Sprintf("新会话，按优先级选中最高可用候选（%d）", chosen.Model.Priority)
 	}
@@ -563,7 +569,7 @@ func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, c
 		e.Reason += fmt.Sprintf("；前 %d 个候选尝试失败已降级（原因见已剔除）", len(attemptSkips))
 	}
 	// 指定模型全部不支持 responses 协议时已回落到其他模型，理由里要点明
-	if !isAuto && e.Requested != "" && chosen.Model.Name != e.Requested {
+	if !isGroup && e.Requested != "" && chosen.Model.Name != e.Requested {
 		e.Reason += fmt.Sprintf("；请求的模型 %q 不支持该协议或无可用条目，已改用支持该协议的其他模型", e.Requested)
 	}
 
@@ -582,7 +588,7 @@ func (s *Server) buildSessionLog(e LogEntry, chosen Candidate, boundID string, c
 	return e
 }
 
-// withModel 只替换请求体顶层 model 字段的值，其余字段以 RawMessage 原样保留（auto 虚拟模型用）
+// withModel 只替换请求体顶层 model 字段的值，其余字段以 RawMessage 原样保留（路由组请求用）
 func withModel(body []byte, name string) []byte {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(body, &top); err != nil {
@@ -930,12 +936,20 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	names := s.store.ModelNames()
-	auto := s.store.AutoModelName()
-	data := []map[string]any{{"id": auto, "object": "model", "owned_by": "llmrouter"}}
-	for _, n := range names {
-		if n == auto { // 已有同名模型路由时避免重复
+	data := []map[string]any{}
+	seen := map[string]bool{}
+	for _, g := range s.store.GroupsList() { // 路由组名始终可见
+		if seen[g.Name] {
 			continue
 		}
+		seen[g.Name] = true
+		data = append(data, map[string]any{"id": g.Name, "object": "model", "owned_by": "llmrouter"})
+	}
+	for _, n := range names {
+		if seen[n] { // 已有同名路由组时避免重复
+			continue
+		}
+		seen[n] = true
 		data = append(data, map[string]any{"id": n, "object": "model", "owned_by": "llmrouter"})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})

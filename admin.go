@@ -22,10 +22,11 @@ type ModelView struct {
 
 // StateView 后台页面所需的完整状态
 type StateView struct {
-	Providers []*Provider  `json:"providers"`
-	Models    []ModelView  `json:"models"`
-	APIKeys   []*APIKey    `json:"api_keys"`
-	Usage     []*UsageStat `json:"usage"`
+	Providers []*Provider   `json:"providers"`
+	Groups    []*RouteGroup `json:"groups"`
+	Models    []ModelView   `json:"models"`
+	APIKeys   []*APIKey     `json:"api_keys"`
+	Usage     []*UsageStat  `json:"usage"`
 	// SessionUsage 按天 × 会话 聚合的用量，含已过期会话；用量页「按会话」视图用。
 	SessionUsage []*SessionStat      `json:"session_usage"`
 	Balances     map[string]*Balance `json:"balances"`
@@ -49,9 +50,12 @@ func (s *Store) SnapshotJSON() []byte {
 		}
 	}
 	// 空状态也要输出 [] 而非 null，前端才不会拿到 null 数组
-	v := StateView{Providers: []*Provider{}, Models: []ModelView{}, APIKeys: []*APIKey{}, Usage: []*UsageStat{}, SessionUsage: []*SessionStat{}, Balances: map[string]*Balance{}, Logs: []*LogEntry{}}
+	v := StateView{Providers: []*Provider{}, Groups: []*RouteGroup{}, Models: []ModelView{}, APIKeys: []*APIKey{}, Usage: []*UsageStat{}, SessionUsage: []*SessionStat{}, Balances: map[string]*Balance{}, Logs: []*LogEntry{}}
 	if s.Providers != nil {
 		v.Providers = s.Providers
+	}
+	if s.Groups != nil {
+		v.Groups = s.Groups
 	}
 	if s.APIKeys != nil {
 		v.APIKeys = s.APIKeys
@@ -183,13 +187,102 @@ func (s *Server) handleModelUpsert(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "provider 不存在")
 		return
 	}
-	s.store.UpsertModel(&m)
+	// group_id 只是「在哪个组里编辑/创建」的上下文；模型配置本身全局共享，
+	// priority 写入该组的成员优先级，不影响模型在其他组的优先级。
+	groupID := m.GroupID
+	if err := s.store.UpsertModelInGroup(&m, groupID, m.Priority); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	s.replyState(w, r)
 }
 
 func (s *Server) handleModelDelete(w http.ResponseWriter, r *http.Request) {
 	if !s.store.DeleteModel(r.PathValue("id")) {
 		writeErr(w, http.StatusNotFound, "model 不存在")
+		return
+	}
+	s.replyState(w, r)
+}
+
+// handleGroupAttachModel 把已有的共享模型配置加入某路由组，并设置组内优先级
+func (s *Server) handleGroupAttachModel(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ModelID  string `json:"model_id"`
+		Priority int    `json:"priority"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.ModelID == "" {
+		writeErr(w, http.StatusBadRequest, "model_id 不能为空")
+		return
+	}
+	if err := s.store.AttachModelToGroup(r.PathValue("id"), req.ModelID, req.Priority); err != nil {
+		status := http.StatusBadRequest
+		if _, ok := s.store.GroupByID(r.PathValue("id")); !ok {
+			status = http.StatusNotFound
+		}
+		writeErr(w, status, err.Error())
+		return
+	}
+	s.replyState(w, r)
+}
+
+// handleGroupDetachModel 把模型移出路由组；若它已不属于任何组，共享配置一并删除
+func (s *Server) handleGroupDetachModel(w http.ResponseWriter, r *http.Request) {
+	if !s.store.DetachModelFromGroup(r.PathValue("id"), r.PathValue("modelID")) {
+		writeErr(w, http.StatusNotFound, "该路由组中不存在这个模型")
+		return
+	}
+	s.replyState(w, r)
+}
+
+// handleGroupCreate 新建路由组：组名即对外虚拟模型名，请求该名字时只在组内选路
+func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		Note string `json:"note"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if _, err := s.store.AddGroup(req.Name, req.Note); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.replyState(w, r)
+}
+
+// handleGroupUpdate 重命名路由组 / 修改备注
+func (s *Server) handleGroupUpdate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		Note string `json:"note"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if _, err := s.store.UpdateGroup(r.PathValue("id"), req.Name, req.Note); err != nil {
+		status := http.StatusBadRequest
+		if _, ok := s.store.GroupByID(r.PathValue("id")); !ok {
+			status = http.StatusNotFound
+		}
+		writeErr(w, status, err.Error())
+		return
+	}
+	s.replyState(w, r)
+}
+
+// handleGroupDelete 删除路由组及其下全部模型；至少保留一个组
+func (s *Server) handleGroupDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.store.GroupByID(id); !ok {
+		writeErr(w, http.StatusNotFound, "路由组不存在")
+		return
+	}
+	if !s.store.DeleteGroup(id) {
+		writeErr(w, http.StatusBadRequest, "至少保留一个路由组")
 		return
 	}
 	s.replyState(w, r)
@@ -212,12 +305,19 @@ func (s *Server) handleModelExpose(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleReorder(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs []string `json:"ids"`
+		IDs     []string `json:"ids"`
+		GroupID string   `json:"group_id"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	s.store.Reorder(req.IDs)
+	if req.GroupID == "" {
+		req.GroupID = s.store.DefaultGroupID()
+	}
+	if !s.store.ReorderGroup(req.GroupID, req.IDs) {
+		writeErr(w, http.StatusNotFound, "路由组不存在")
+		return
+	}
 	s.replyState(w, r)
 }
 
@@ -241,7 +341,7 @@ func (s *Server) handleModelUnmute(w http.ResponseWriter, r *http.Request) {
 	s.replyState(w, r)
 }
 
-// handleSettings 更新设置：auto 虚拟模型名、responses 协议转换开关、会话 TTL。
+// handleSettings 更新设置：默认路由组名、responses 协议转换开关、会话 TTL。
 // 字段用指针，未提交的项保持原值（前端可以只改其中一项）。
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -257,7 +357,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			name = "auto"
 		}
-		s.store.SetAutoModel(name)
+		if err := s.store.SetAutoModel(name); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if req.ResponsesConvert != nil {
 		s.store.SetResponsesConvert(*req.ResponsesConvert)
