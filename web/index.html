@@ -127,7 +127,7 @@ input::placeholder{color:#a4afc1}
 .row-inline{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 
 /* ---------- 首页统计 ---------- */
-.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:16px}
+.stats{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.7fr);gap:16px;margin-bottom:16px}
 .stat{background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px 18px}
 .stat .k{display:flex;align-items:center;gap:6px;color:var(--mut);font-size:12.5px}
 .stat .v{margin-top:6px;font-size:26px;font-weight:660;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
@@ -135,6 +135,12 @@ input::placeholder{color:#a4afc1}
 .stat.hero{background:linear-gradient(135deg,#4f46e5 0%,#6d28d9 55%,#9333ea 100%);border:none;color:#fff}
 .stat.hero .k,.stat.hero .s{color:#e0e7ff}
 .stat.hero .v{color:#fff}
+.stat-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding:16px 8px}
+.stat-metrics .metric{padding:0 18px;border-left:1px solid var(--bd2);min-width:0}
+.stat-metrics .metric:first-child{border-left:none;padding-left:10px}
+.stat-metrics .metric:last-child{padding-right:10px}
+.stat-metrics .v{font-size:22px}
+.stat-metrics .s{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 .dash{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);gap:16px;align-items:start;margin-bottom:16px}
 .dash .panel{margin-bottom:0}
@@ -192,6 +198,20 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 
 .bal{font-size:12.5px;line-height:1.55}
 .bal b{color:var(--ok);font-weight:650}
+.provider-name{display:flex;align-items:center;gap:7px;min-width:0}
+.provider-name b{font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kind-tag{
+  display:inline-flex;align-items:center;flex:none;padding:0 6px;border-radius:999px;
+  font-size:10.5px;line-height:1.7;font-weight:600;background:#eef2f8;color:var(--mut);
+}
+.kind-tag.wb{background:#e0f2fe;color:#0369a1}
+.kind-tag.zed{background:#f3e8ff;color:#7e22ce}
+.provider-endpoint{display:flex;align-items:center;gap:6px;margin-top:3px;min-width:0;color:var(--mut);font-size:11.5px}
+.provider-endpoint .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px}
+.mini-tag{
+  flex:none;font-size:10px;line-height:1.7;padding:0 5px;border-radius:5px;
+  background:#f8fafc;color:var(--mut);border:1px solid var(--bd2);
+}
 .test-res{font-size:11.5px;line-height:1.45;margin-top:3px;max-width:230px}
 
 /* ---------- 异常日志 ---------- */
@@ -215,6 +235,20 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .settings-tabs button{border:none;background:none;padding:6px 14px;border-radius:8px;font-size:13px;color:var(--mut);cursor:pointer}
 .settings-tabs button:hover{color:var(--tx2)}
 .settings-tabs button.on{background:#fff;color:var(--tx);font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.1)}
+.hint-toggle{margin:0 0 12px}
+.hint-toggle>summary{
+  display:inline-flex;align-items:center;gap:6px;cursor:pointer;list-style:none;user-select:none;
+  color:var(--mut);font-size:12px;line-height:1.4;padding:3px 9px;border-radius:999px;
+  background:#f1f5f9;border:1px solid transparent;transition:background .15s,color .15s,border-color .15s;
+}
+.hint-toggle>summary::-webkit-details-marker{display:none}
+.hint-toggle>summary::before{content:"▸";color:#94a3b8;font-size:10px;transition:transform .15s}
+.hint-toggle[open]>summary::before{transform:rotate(90deg)}
+.hint-toggle>summary:hover{color:var(--acc);background:var(--acc-l);border-color:#c7d2fe}
+.hint-toggle[open]>summary{color:var(--acc);background:var(--acc-l);border-color:#c7d2fe}
+.hint-toggle .hint{
+  margin:8px 0 0;padding:9px 12px;border-radius:9px;background:#f8fafc;border:1px solid var(--bd2);
+}
 
 /* ---------- 模型路由工作区 ---------- */
 .route-workspace{display:grid;grid-template-columns:264px minmax(0,1fr);gap:16px;align-items:start}
@@ -352,6 +386,11 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 }
 @media (max-width:640px){
   .stats{grid-template-columns:minmax(0,1fr)}
+  .stat-metrics{grid-template-columns:minmax(0,1fr);padding:8px 18px}
+  .stat-metrics .metric{padding:10px 0;border-left:none;border-top:1px solid var(--bd2)}
+  .stat-metrics .metric:first-child{border-top:none;padding-top:2px}
+  .stat-metrics .metric:last-child{padding-bottom:2px}
+  .stat-metrics .s{white-space:normal}
   .panel{padding:14px}
   .panel-head{flex-direction:column;align-items:flex-start;gap:6px}
   .panel-head h3{white-space:nowrap}
@@ -586,11 +625,11 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
           <div class="panel">
             <div class="panel-head">
               <h3>Providers</h3>
-              <div class="hint">Base URL 填到 /v1，例如 https://api.openai.com/v1</div>
+              <div class="hint">名称、类型与凭证状态一眼可见；Base URL 填到 /v1</div>
             </div>
             <div class="tbl-wrap">
               <table>
-                <thead><tr><th>名称</th><th>基址</th><th>密钥</th><th>上游余额</th><th style="width:150px">操作</th></tr></thead>
+                <thead><tr><th>Provider</th><th style="width:230px">状态</th><th style="min-width:220px">余额 / 套餐</th><th style="width:150px">操作</th></tr></thead>
                 <tbody id="providers-body"></tbody>
               </table>
             </div>
@@ -640,7 +679,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
           <div class="panel">
             <div class="panel-head"><h3>默认路由组名</h3></div>
-            <p class="hint" style="margin:0 0 12px">第一组（默认路由组）的对外模型名。请求体 model 填这个名字时，会在该组模型里按优先级自动挑选；其余路由组在「模型路由」页添加和管理。</p>
+            <details class="hint-toggle"><summary>说明</summary><p class="hint">第一组（默认路由组）的对外模型名。请求体 model 填这个名字时，会在该组模型里按优先级自动挑选；其余路由组在「模型路由」页添加和管理。</p></details>
             <div class="row-inline">
               <input id="auto-name" class="mono" style="width:200px">
               <button class="btn pri" onclick="saveAutoName()">保存</button>
@@ -650,7 +689,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
           <div class="panel">
             <div class="panel-head"><h3>Responses 协议转换</h3></div>
-            <p class="hint" style="margin:0 0 12px">WorkBuddy 上游只提供 Chat Completions。关闭时（默认），<code>/v1/responses</code> 只路由到原生支持 Responses 的模型，仅支持 chat 的模型会被跳过；请求的模型名只挂在这类模型上时，会自动改用其他支持 Responses 的模型。开启后，网关才允许把 Responses 请求翻译成 chat 发出，再把结果渲染回 Responses 形态。</p>
+            <details class="hint-toggle"><summary>说明</summary><p class="hint">WorkBuddy 上游只提供 Chat Completions。关闭时（默认），<code>/v1/responses</code> 只路由到原生支持 Responses 的模型，仅支持 chat 的模型会被跳过；请求的模型名只挂在这类模型上时，会自动改用其他支持 Responses 的模型。开启后，网关才允许把 Responses 请求翻译成 chat 发出，再把结果渲染回 Responses 形态。</p></details>
             <div class="row-inline">
               <label class="switch"><input id="resp-convert" type="checkbox" onchange="saveResponsesConvert(this.checked)"><i></i></label>
               <span class="hint">允许 responses → chat completions 转换</span>
@@ -659,7 +698,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
           <div class="panel">
             <div class="panel-head"><h3>会话有效期</h3></div>
-            <p class="hint" style="margin:0 0 12px"><code>X-Session-ID</code> 粘性绑定的滑动过期时间：每次成功请求后重新计时。保存后立即按最近活跃时间重算现有绑定；填 0 恢复默认 60 分钟，上限 30 天。</p>
+            <details class="hint-toggle"><summary>说明</summary><p class="hint"><code>X-Session-ID</code> 粘性绑定的滑动过期时间：每次成功请求后重新计时。保存后立即按最近活跃时间重算现有绑定；填 0 恢复默认 60 分钟，上限 30 天。</p></details>
             <div class="row-inline">
               <input id="sess-ttl" type="number" min="0" step="1" style="width:120px">
               <span class="hint">分钟</span>
@@ -669,7 +708,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
           <div class="panel">
             <div class="panel-head"><h3>管理令牌</h3></div>
-            <p class="hint" style="margin:0 0 12px">服务端以 <code>-admin-token</code> 或环境变量 <code>LLMROUTER_ADMIN_TOKEN</code> 启动后，访问后台需要令牌。令牌仅保存在本机浏览器。</p>
+            <details class="hint-toggle"><summary>说明</summary><p class="hint">服务端以 <code>-admin-token</code> 或环境变量 <code>LLMROUTER_ADMIN_TOKEN</code> 启动后，访问后台需要令牌。令牌仅保存在本机浏览器。</p></details>
             <div class="row-inline">
               <span id="token-status" class="hint"></span>
               <button class="btn" onclick="openToken()">设置令牌</button>
@@ -679,7 +718,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
           <div class="panel">
             <div class="panel-head"><h3>版本与更新</h3><span class="hint" id="ver-current">正在读取版本…</span></div>
-            <p class="hint" style="margin:0 0 12px">「检测更新」会读取 GitHub Release 的最新版本；有新版本时可一键下载对应平台的安装包，校验 SHA256 后替换当前可执行文件，服务会自动重启（重启期间短暂不可用）。</p>
+            <details class="hint-toggle"><summary>说明</summary><p class="hint">「检测更新」会读取 GitHub Release 的最新版本；有新版本时可一键下载对应平台的安装包，校验 SHA256 后替换当前可执行文件，服务会自动重启（重启期间短暂不可用）。</p></details>
             <div class="row-inline">
               <button class="btn pri" id="btn-upd-check" onclick="checkUpdate(true)">检测更新</button>
               <button class="btn" id="btn-upd-apply" onclick="applyUpdate()" hidden>立即升级</button>
@@ -690,12 +729,12 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
           <div class="panel">
             <div class="panel-head"><h3>运行说明</h3></div>
-            <ul class="notes">
+            <details class="hint-toggle"><summary>展开运行说明</summary><ul class="notes" style="margin:8px 0 0">
               <li>请求体原样透传（messages / tools / stream 等全部字段不做改动），响应字节级回传。</li>
               <li>客户端带 <code>X-Session-ID</code> 头可开启会话粘性：同一会话固定走同一上游，仅在上游失败时才切换；默认 1 小时无活动过期（可在上方调整），也可在活跃会话面板手动结束。</li>
               <li>每日上限与静音时段按服务器本地时间计算；静音时段支持跨零点，如 22:00~06:00。</li>
               <li>缓存命中优先读取 <code>prompt_tokens_details.cached_tokens</code> / <code>input_tokens_details.cached_tokens</code>，缺失时回落 DeepSeek 的 <code>prompt_cache_hit_tokens</code> 等字段（含在输入 token 内），首页单独展示。</li>
-            </ul>
+            </ul></details>
           </div>
         </section>
       </section>
@@ -721,7 +760,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
     <div class="field" id="row-resp"><label>Responses 基址</label><input id="p-resp" class="mono" placeholder="留空 = 同 Chat 基址"></div>
     <div class="field" id="row-bal"><label>余额查询 URL</label><input id="p-bal" class="mono" placeholder="https://api.deepseek.com/user/balance"></div>
     <div class="field" id="row-proxy"><label>网络代理</label><input id="p-proxy" class="mono" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"></div>
-    <p class="hint" id="hint-normal" style="margin:6px 0 0">两种协议的基址可以不同（如智谱 Coding Plan 没有 /responses，可单独填 https://open.bigmodel.cn/api/v1）。余额查询地址可留空：智谱、DeepSeek 会自动使用官方余额接口。</p>
+    <details class="hint-toggle" id="hint-normal" style="margin-top:6px"><summary>说明</summary><p class="hint">两种协议的基址可以不同（如智谱 Coding Plan 没有 /responses，可单独填 https://open.bigmodel.cn/api/v1）。余额查询地址可留空：智谱、DeepSeek 会自动使用官方余额接口。</p></details>
     <div id="p-wb" hidden style="margin-top:8px">
       <div class="field"><label>凭证密钥</label>
         <div class="inline" style="flex:1"><input id="p-wbkey" class="mono" placeholder="atRestSecretKey（客户端 v5.6.2+ 加密快照用，可选）" style="flex:1">
@@ -735,7 +774,7 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
         </div>
       </div>
       <div id="p-wbstatus" class="hint" style="margin:4px 0"></div>
-      <p class="hint" style="margin:6px 0 0">复用 WorkBuddy / CodeBuddy 客户端登录态：扫描本机客户端目录（Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth）或粘贴凭证 JSON 导入；导入后 llmrouter 用 refreshToken 自动续期，与客户端互不影响。上游仅支持 chat completions 协议。访问上游需要代理时（如国际版）填写上方「网络代理」。</p>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">复用 WorkBuddy / CodeBuddy 客户端登录态：扫描本机客户端目录（Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth）或粘贴凭证 JSON 导入；导入后 llmrouter 用 refreshToken 自动续期，与客户端互不影响。上游仅支持 chat completions 协议。访问上游需要代理时（如国际版）填写上方「网络代理」。</p></details>
     </div>
     <div id="p-zed" hidden style="margin-top:8px">
       <div class="field"><label>system_id</label>
@@ -751,12 +790,17 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
           <button class="btn mini" onclick="zedLoginPaste()" style="margin-top:4px">用粘贴的 URL 完成登录</button>
         </div>
       </div>
-      <p class="hint" style="margin:6px 0 0">用 Zed 账号（编辑器自带的模型额度）作为上游：点击「登录 Zed」后在浏览器完成授权，自动创建 Provider 并同步 gpt-*/claude-* 模型（优先级 0，可自行调整）。服务器上没有浏览器时用下方粘贴回调兜底。上游访问需代理时填上方「网络代理」。支持 chat 与 responses 两种接入协议。</p>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 Zed 账号（编辑器自带的模型额度）作为上游：点击「登录 Zed」后在浏览器完成授权，自动创建 Provider 并同步 gpt-*/claude-* 模型（优先级 0，可自行调整）。服务器上没有浏览器时用上方粘贴回调兜底。上游访问需代理时填上方「网络代理」。支持 chat 与 responses 两种接入协议。</p></details>
     </div>
   </div>
-  <div class="dlg-foot">
-    <button class="btn" onclick="dlgProvider.close()">取消</button>
-    <button class="btn pri" onclick="saveProvider()">保存</button>
+  <div class="dlg-foot split">
+    <div class="foot-left" id="p-danger" hidden>
+      <button class="btn mini danger" onclick="delProvider(editingProvider.id)">删除 Provider</button>
+    </div>
+    <div class="foot-right">
+      <button class="btn" onclick="dlgProvider.close()">取消</button>
+      <button class="btn pri" onclick="saveProvider()">保存</button>
+    </div>
   </div>
 </dialog>
 
@@ -1333,22 +1377,24 @@ function renderStats(tot, label, rows, byModel) {
     <div class="stat hero">
       <div class="k">总用量 · ${esc(label)}</div>
       <div class="v" title="${exact(total)}">${fmtTok(total)}</div>
-      <div class="s">${fmtN(tot.r)} 次请求 · 输入 ${fmtTok(tot.pt)} / 输出 ${fmtTok(tot.ct)}</div>
+      <div class="s">输入 + 输出 tokens</div>
     </div>
-    <div class="stat">
-      <div class="k">输入 tokens</div>
-      <div class="v" title="${exact(tot.pt)}">${fmtTok(tot.pt)}</div>
-      <div class="s">缓存命中 ${fmtTok(tot.ca)}（${hit}%）</div>
-    </div>
-    <div class="stat">
-      <div class="k">输出 tokens</div>
-      <div class="v" title="${exact(tot.ct)}">${fmtTok(tot.ct)}</div>
-      <div class="s">平均每次 ${fmtTok(avg)} tokens</div>
-    </div>
-    <div class="stat">
-      <div class="k">请求数</div>
-      <div class="v">${fmtN(tot.r)}</div>
-      <div class="s">${byModel.size} 个模型 · ${keys} 个 Key</div>
+    <div class="stat stat-metrics">
+      <div class="metric">
+        <div class="k">输入 tokens</div>
+        <div class="v" title="${exact(tot.pt)}">${fmtTok(tot.pt)}</div>
+        <div class="s">缓存命中 ${fmtTok(tot.ca)}（${hit}%）</div>
+      </div>
+      <div class="metric">
+        <div class="k">输出 tokens</div>
+        <div class="v" title="${exact(tot.ct)}">${fmtTok(tot.ct)}</div>
+        <div class="s">平均每次 ${fmtTok(avg)} tokens</div>
+      </div>
+      <div class="metric">
+        <div class="k">请求数</div>
+        <div class="v">${fmtN(tot.r)}</div>
+        <div class="s">${byModel.size} 个模型 · ${keys} 个 Key</div>
+      </div>
     </div>`;
 }
 
@@ -1925,57 +1971,118 @@ const maskKey = k => !k ? '—' : (k.length <= 8 ? '***' : k.slice(0, 5) + '…'
 function balanceHTML(p) {
   const b = S.balances[p.id];
   if (!b) return '<span class="hint">未查询</span>';
-  const items = (b.found || []).slice(0, 3).map(s => {
+  const when = b.at ? `<div class="cell-sub">更新于 ${agoText(b.at)}</div>` : '';
+  if (!b.ok) {
+    return `<div class="bal" title="${esc((b.raw || '').slice(0, 500))}"><span class="pill bad">查询失败</span></div>${when}`;
+  }
+  const items = (b.found || []).slice(0, 2).map(s => {
     const i = s.indexOf(' = ');
     if (i < 0) return `<div><b>${esc(s)}</b></div>`; // 已是友好文案（如智谱套餐）
     const field = s.slice(0, i).split('.').pop(), val = s.slice(i + 3);
     return `<div><b>${esc(val)}</b> <span class="hint">${esc(field)}</span></div>`;
   }).join('');
-  return `<div class="bal" title="${esc((b.raw || '').slice(0, 500))}">${items || '<span class="hint">未识别出余额字段</span>'}</div>
-    <div class="cell-sub">${new Date(b.at).toLocaleString()}</div>`;
+  return `<div class="bal" title="${esc((b.raw || '').slice(0, 500))}">${items || '<span class="hint">未识别余额字段</span>'}</div>${when}`;
+}
+
+function providerKindTag(p) {
+  switch (p.kind) {
+    case 'workbuddy': return '<span class="kind-tag wb">WB 国内</span>';
+    case 'workbuddy-intl': return '<span class="kind-tag wb">WB 国际</span>';
+    case 'zed': return '<span class="kind-tag zed">Zed</span>';
+    default: return '<span class="kind-tag">标准</span>';
+  }
+}
+
+// 凭证到期状态：已过期 / 24 小时内 / 3 天内 / 有效
+function expiryBadge(t) {
+  const d = t ? new Date(t) : null;
+  if (!d || isNaN(d)) return {cls: '', label: '到期未知', detail: ''};
+  const ms = d.getTime() - Date.now();
+  if (ms <= 0) return {cls: 'bad', label: '已过期', detail: d.toLocaleDateString()};
+  const hours = ms / 36e5;
+  if (hours < 24) return {cls: 'warn', label: '即将到期', detail: `${Math.max(1, Math.round(hours))} 小时后`};
+  if (hours < 72) return {cls: 'warn', label: '即将到期', detail: d.toLocaleDateString()};
+  return {cls: 'ok', label: '有效', detail: d.toLocaleDateString()};
+}
+
+// 凭证状态：键类型不同，展示的身份/有效期也不同
+function providerStatusHTML(p) {
+  if (p.kind === 'workbuddy' || p.kind === 'workbuddy-intl') {
+    const c = p.wb;
+    if (!c || !c.access_token) return '<span class="pill bad">未导入凭证</span>';
+    const e = expiryBadge(c.expires_at);
+    return `<div class="status-line">
+      <span class="pill ${e.cls || 'ok'}">${e.cls ? e.label : '凭证有效'}</span>
+      <span class="status-extra">${esc(c.nickname || c.uid)}${e.detail ? ' · token 至 ' + e.detail : ''}</span>
+    </div>`;
+  }
+  if (p.kind === 'zed') {
+    const z = p.zed;
+    if (!z || !z.user_id) return '<span class="pill bad">未登录</span>';
+    const e = expiryBadge(z.expires_at);
+    return `<div class="status-line">
+      <span class="pill ${e.cls || 'ok'}">${e.cls ? e.label : 'JWT 有效'}</span>
+      <span class="status-extra">${esc(z.username || z.github_login || z.user_id)}${e.detail ? ' · JWT 至 ' + e.detail : ''}</span>
+    </div>`;
+  }
+  if (p.api_key) {
+    return `<div class="status-line"><span class="pill ok">Key 已配置</span><span class="status-extra mono">${esc(maskKey(p.api_key))}</span></div>`;
+  }
+  return `<div class="status-line"><span class="pill warn">未配置 Key</span><span class="status-extra">透传客户端 Authorization</span></div>`;
+}
+
+// 接入地址只保留可读的 host/path；WB/Zed 的端点由服务端派生，不重复展示长 URL
+function providerEndpointHTML(p) {
+  const isWB = p.kind === 'workbuddy' || p.kind === 'workbuddy-intl';
+  const isZed = p.kind === 'zed';
+  let endpoint = p.base_url;
+  if (!isWB && !isZed) {
+    try {
+      const u = new URL(p.base_url);
+      endpoint = u.host + (u.pathname === '/' ? '' : u.pathname.replace(/\/$/, ''));
+    } catch { endpoint = p.base_url; }
+  }
+  const text = isWB ? '官方客户端端点' : isZed ? 'cloud.zed.dev' : endpoint;
+  const tags = [];
+  if (!isWB && !isZed && p.responses_url && p.responses_url !== p.base_url) tags.push('Responses 独立');
+  if (p.proxy) tags.push('代理');
+  return `<div class="provider-endpoint" title="${esc(p.base_url)}">
+    <span class="mono">${esc(text)}</span>
+    ${tags.map(t => `<span class="mini-tag">${t}</span>`).join('')}
+  </div>`;
 }
 
 function renderProviders() {
   const tb = $('providers-body');
   if (!S.providers.length) {
-    tb.innerHTML = `<tr><td colspan="5" class="empty">还没有 Provider，点右上角「添加 Provider」开始</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="4" class="empty">还没有 Provider，点右上角「添加 Provider」开始</td></tr>`;
     return;
   }
   tb.innerHTML = S.providers.map(p => {
     const isWB = p.kind === 'workbuddy' || p.kind === 'workbuddy-intl';
     const isZed = p.kind === 'zed';
-    const resp = !isWB && !isZed && p.responses_url && p.responses_url !== p.base_url
-      ? `<div class="cell-sub mono">responses: ${esc(p.responses_url)}</div>` : '';
-    const px = p.proxy ? `<div class="cell-sub mono">proxy: ${esc(p.proxy)}</div>` : '';
-    let keyCell;
+    let balCell, quick;
     if (isWB) {
-      const exp = p.wb?.expires_at ? new Date(p.wb.expires_at) : null;
-      keyCell = `<div>${esc(p.wb?.nickname || p.wb?.uid || '未导入凭证')}</div>` +
-        (exp ? `<div class="cell-sub">token 到期 ${exp.toLocaleString()}</div>` : '') +
-        `<button class="btn mini" onclick="wbRefreshNow('${p.id}')" style="margin-top:4px">续期</button>`;
+      balCell = wbBalanceHTML(p);
+      quick = `<button class="link-btn" onclick="wbUsageNow('${p.id}')">查余额</button>`;
     } else if (isZed) {
-      const exp = p.zed?.expires_at ? new Date(p.zed.expires_at) : null;
-      keyCell = `<div>${esc(p.zed?.username || p.zed?.github_login || p.zed?.user_id || '未登录')}</div>` +
-        (exp ? `<div class="cell-sub">JWT 到期 ${exp.toLocaleString()}</div>` : '') +
-        `<button class="btn mini" onclick="zedRefreshNow('${p.id}')" style="margin-top:4px">重铸</button>`;
+      balCell = zedBalanceHTML(p);
+      quick = `<button class="link-btn" onclick="zedRefreshNow('${p.id}')">刷新账号</button>`;
     } else {
-      keyCell = esc(maskKey(p.api_key));
+      balCell = balanceHTML(p);
+      quick = `<button class="link-btn" onclick="queryBalance('${p.id}')">查余额</button>`;
     }
-    const balCell = isWB
-      ? `${wbBalanceHTML(p)}<button class="btn mini" onclick="wbUsageNow('${p.id}')" style="margin-top:4px">查余额</button>` +
-        (p.kind === 'workbuddy' && !p.wb?.enterprise_id ? ` <button class="btn mini" onclick="wbCheckinNow('${p.id}')">签到</button>` : '')
-      : isZed
-      ? `${zedBalanceHTML(p)}<button class="btn mini" onclick="zedRefreshNow('${p.id}')" style="margin-top:4px">刷新账号</button>`
-      : `${balanceHTML(p)}<button class="btn mini" onclick="queryBalance('${p.id}')" style="margin-top:4px">查询余额</button>`;
     return `<tr>
-      <td><b>${esc(p.name)}</b>${isWB ? `<div class="cell-sub">WorkBuddy ${esc(p.kind === 'workbuddy' ? '国内版' : '国际版')}</div>` : ''}${isZed ? `<div class="cell-sub">Zed 账号</div>` : ''}</td>
-      <td class="mono" style="max-width:320px;word-break:break-all">${esc(p.base_url)}${resp}${px}</td>
-      <td class="mono">${keyCell}</td>
-      <td style="min-width:200px">${balCell}</td>
-      <td style="white-space:nowrap">
-        <button class="btn mini" onclick="editProvider('${p.id}')">编辑</button>
-        <button class="btn mini danger" onclick="delProvider('${p.id}')">删除</button>
+      <td>
+        <div class="provider-name"><b>${esc(p.name)}</b>${providerKindTag(p)}</div>
+        ${providerEndpointHTML(p)}
       </td>
+      <td>${providerStatusHTML(p)}</td>
+      <td>${balCell}</td>
+      <td><div class="row-actions">
+        ${quick}
+        <button class="link-btn" onclick="editProvider('${p.id}')">编辑</button>
+      </div></td>
     </tr>`;
   }).join('');
 }
@@ -1983,9 +2090,9 @@ function renderProviders() {
 // Zed 套餐/用量快照单元格
 function zedBalanceHTML(p) {
   const plan = p.zed && p.zed.plan;
-  if (!plan) return '<span class="hint">套餐信息未刷新</span>';
-  const t = plan.checked_at ? new Date(plan.checked_at).toLocaleString() : '';
-  return `<div>${zedPlanInline(plan)}</div><div class="cell-sub">${t} 查询</div>`;
+  if (!plan) return '<span class="hint">未查询</span>';
+  const when = plan.checked_at ? `<div class="cell-sub">更新于 ${agoText(plan.checked_at)}</div>` : '';
+  return `<div class="bal">${zedPlanInline(plan)}</div>${when}`;
 }
 
 /* ---------- Zed 账号登录 ---------- */
@@ -2122,9 +2229,9 @@ function wbUsageInline(u) {
 
 function wbBalanceHTML(p) {
   const u = p.wb && p.wb.usage;
-  if (!u) return '<span class="hint">按 token 计费，余额未查询</span>';
-  const t = u.checked_at ? new Date(u.checked_at).toLocaleString() : '';
-  return `<div>${esc(wbUsageInline(u))}</div><div class="cell-sub">${t} 查询</div>`;
+  if (!u) return '<span class="hint">未查询</span>';
+  const when = u.checked_at ? `<div class="cell-sub">更新于 ${agoText(u.checked_at)}</div>` : '';
+  return `<div class="bal">${esc(wbUsageInline(u))}</div>${when}`;
 }
 
 async function wbScanRun() {
@@ -2198,6 +2305,7 @@ async function wbUsageNow(id) {
 function editProvider(id) {
   editingProvider = id ? S.providers.find(p => p.id === id) : null;
   $('dlg-provider-title').textContent = id ? '编辑 Provider' : '添加 Provider';
+  $('p-danger').hidden = !editingProvider;
   $('p-kind').value = editingProvider?.kind || '';
   $('p-name').value = editingProvider?.name || '';
   $('p-base').value = editingProvider?.base_url || '';
@@ -2260,6 +2368,7 @@ async function delProvider(id) {
   if (!confirm(`确定删除 Provider「${p?.name || id}」及其所有模型？`)) return;
   try {
     S = await api('DELETE', '/api/providers/' + id);
+    if (dlgProvider.open) dlgProvider.close();
     renderAll();
     toast('已删除');
   } catch (e) { alert(e.message); }
