@@ -215,6 +215,75 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .settings-tabs button{border:none;background:none;padding:6px 14px;border-radius:8px;font-size:13px;color:var(--mut);cursor:pointer}
 .settings-tabs button:hover{color:var(--tx2)}
 .settings-tabs button.on{background:#fff;color:var(--tx);font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.1)}
+
+/* ---------- 模型路由工作区 ---------- */
+.route-workspace{display:grid;grid-template-columns:264px minmax(0,1fr);gap:16px;align-items:start}
+.route-groups{
+  background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);box-shadow:var(--shadow);
+  padding:14px;position:sticky;top:84px;
+}
+.route-groups-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:10px}
+.route-groups-head b{font-size:13.5px;letter-spacing:.01em}
+.route-groups-head .hint{margin-top:2px}
+.group-list{display:flex;flex-direction:column;gap:4px;max-height:calc(100vh - 280px);overflow:auto}
+.group-item{
+  display:flex;flex-direction:column;gap:3px;width:100%;text-align:left;cursor:pointer;
+  border:1px solid transparent;background:#f8fafc;border-radius:10px;padding:9px 10px;
+  transition:background .15s,border-color .15s;
+}
+.group-item:hover{background:#f1f5f9}
+.group-item.on{background:var(--acc-l);border-color:#c7d2fe}
+.group-item-top{display:flex;align-items:center;gap:6px;min-width:0}
+.group-item-name{font-weight:650;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.group-tag{margin-left:auto;flex:none;font-size:10.5px;line-height:1.5;color:var(--acc);background:#eef0ff;border-radius:999px;padding:0 6px}
+.group-item-meta{color:var(--mut);font-size:11.5px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.route-groups-foot{margin-top:12px;padding-top:10px;border-top:1px dashed var(--bd)}
+.route-panel{margin-bottom:0}
+.group-hero{
+  display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  padding-bottom:14px;border-bottom:1px solid var(--bd2);margin-bottom:12px;
+}
+.group-hero-title{display:flex;align-items:center;gap:8px;min-width:0}
+.group-hero h2{
+  margin:0;font-size:18px;letter-spacing:-.01em;
+  font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.group-hero .hint{margin-top:3px}
+.model-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.pri-cell{display:flex;align-items:center;gap:7px}
+.pri-num{
+  display:inline-flex;min-width:28px;justify-content:center;padding:1px 7px;border-radius:7px;
+  background:#eef2f8;font-weight:700;font-size:12px;font-variant-numeric:tabular-nums;
+}
+.pri-moves{display:inline-flex;flex-direction:row;gap:2px}
+.pri-moves button{
+  padding:0 5px;border:1px solid var(--bd);border-radius:4px;background:#fff;color:var(--mut);
+  font-size:9px;line-height:1.2;cursor:pointer;
+}
+.pri-moves button:hover{color:var(--acc);border-color:#c7d2fe;background:#f8faff}
+.model-cell{display:flex;flex-direction:column;gap:2px;min-width:0}
+.model-name{font-weight:650;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-prov{color:var(--mut);font-size:11.5px}
+.status-line{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.status-extra{color:var(--mut);font-size:11.5px;line-height:1.45}
+.usage-line{display:flex;align-items:center;gap:8px;min-width:0}
+.usage-line .mini-bar{flex:1;min-width:56px}
+.usage-text{color:var(--mut);font-size:11.5px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.more-actions{display:flex;gap:6px;flex-wrap:wrap}
+.row-actions{display:flex;align-items:center;gap:12px;white-space:nowrap}
+.link-btn{border:none;background:none;padding:0;color:var(--acc);font-size:12.5px;cursor:pointer}
+.link-btn:hover{text-decoration:underline}
+.link-btn.danger{color:var(--bad)}
+.dlg-foot.split{justify-content:space-between;align-items:center}
+.foot-left,.foot-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+@media (max-width:1000px){
+  .route-workspace{grid-template-columns:minmax(0,1fr)}
+  .route-groups{position:static}
+  .group-list{flex-direction:row;flex-wrap:wrap;max-height:none;overflow:visible;padding-bottom:2px}
+  .group-item{width:auto;min-width:140px;flex:0 1 auto}
+  .route-groups-foot{display:none}
+}
 .ep-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px dashed var(--bd);flex-wrap:wrap}
 .ep-row:last-child{border-bottom:none}
 .ep-label{width:150px;flex:none;color:var(--mut);font-size:12.5px}
@@ -461,27 +530,53 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
 
         <!-- 模型路由 -->
         <section id="stab-models">
-          <div class="panel">
-            <div class="panel-head">
-              <h3>路由组</h3>
-              <div class="hint">每个路由组对外是一个虚拟模型名，请求该名字时只在本组模型里按优先级选路；组与组互不影响</div>
-            </div>
-            <div class="row-inline" id="group-tabs" style="margin-bottom:10px"></div>
-            <div class="row-inline hint" id="group-meta"></div>
-          </div>
-          <div class="panel">
-            <div class="panel-head">
-              <h3>模型路由</h3>
-              <div class="hint">当前组的成员：模型配置全局共享（每日上限、并行上限、静音时段等改一次全组生效），只有组内优先级不同；「移出本组」只删成员关系，模型仍可被其他组使用</div>
-            </div>
-            <div class="tbl-wrap">
-              <table>
-                <thead><tr>
-                  <th style="width:88px">优先级</th><th>模型</th><th>Provider</th><th style="width:72px">暴露</th><th>状态</th>
-                  <th class="num">今日用量</th><th class="num">并行</th><th>静音时段</th><th>连通性</th><th style="width:230px">操作</th>
-                </tr></thead>
-                <tbody id="models-body"></tbody>
-              </table>
+          <div class="route-workspace">
+            <aside class="route-groups">
+              <div class="route-groups-head">
+                <div>
+                  <b>路由组</b>
+                  <div class="hint">组名即对外模型名</div>
+                </div>
+                <button class="btn mini pri" onclick="openGroup()">＋ 新建</button>
+              </div>
+              <div class="group-list" id="group-list"></div>
+              <div class="route-groups-foot hint">模型配置全局共享（上限 / 静音 / 暴露等），组间只有优先级不同</div>
+            </aside>
+
+            <div class="panel route-panel">
+              <div class="group-hero">
+                <div class="group-hero-main" style="min-width:0">
+                  <div class="group-hero-title">
+                    <h2 id="group-title">—</h2>
+                    <span class="pill ok" id="group-default-badge" hidden>默认组</span>
+                  </div>
+                  <div class="hint" id="group-sub"></div>
+                </div>
+                <div class="row-inline" id="group-actions"></div>
+              </div>
+
+              <div class="model-toolbar">
+                <div class="hint" id="model-summary"></div>
+                <div class="row-inline">
+                  <button class="btn mini" onclick="openAttach()">加入已有模型</button>
+                  <button class="btn mini pri" onclick="editModel()">＋ 添加模型</button>
+                </div>
+              </div>
+
+              <div class="tbl-wrap">
+                <table>
+                  <thead><tr>
+                    <th style="width:84px">顺序</th>
+                    <th>模型 / Provider</th>
+                    <th style="width:168px">状态</th>
+                    <th style="width:190px">今日用量</th>
+                    <th style="width:160px">并行</th>
+                    <th style="width:66px">暴露</th>
+                    <th style="width:150px">操作</th>
+                  </tr></thead>
+                  <tbody id="models-body"></tbody>
+                </table>
+              </div>
             </div>
           </div>
         </section>
@@ -699,9 +794,15 @@ dialog::backdrop{background:rgba(15,23,42,.45);backdrop-filter:blur(3px)}
       </div>
     </div>
   </div>
-  <div class="dlg-foot">
-    <button class="btn" onclick="dlgModel.close()">取消</button>
-    <button class="btn pri" onclick="saveModel()">保存</button>
+  <div class="dlg-foot split">
+    <div class="foot-left" id="m-danger" hidden>
+      <button class="btn mini danger" onclick="detachModel(editingModel.id)">移出本组</button>
+      <button class="btn mini danger" onclick="delModel(editingModel.id)">删除共享配置</button>
+    </div>
+    <div class="foot-right">
+      <button class="btn" onclick="dlgModel.close()">取消</button>
+      <button class="btn pri" onclick="saveModel()">保存</button>
+    </div>
   </div>
 </dialog>
 
@@ -960,7 +1061,7 @@ document.querySelectorAll('#stab-nav button').forEach(b => b.onclick = () => {
 
 function renderStabAction() {
   const map = {
-    models: '<button class="btn pri" onclick="editModel()">＋ 添加模型</button>',
+    models: '',
     providers: '<button class="btn pri" onclick="editProvider()">＋ 添加 Provider</button>',
     keys: '',
     general: '',
@@ -1451,22 +1552,75 @@ const groupModels = () => {
     .sort((a, b) => (b.priority - a.priority) || a.id.localeCompare(b.id));
 };
 
-// 路由组标签与当前组信息（对外模型名、备注、重命名/删除/加入已有模型入口）
+// 左侧路由组列表 + 当前组标题与操作
 function renderGroups() {
   const gs = S.groups || [];
   const cur = activeGroupObj();
-  $('group-tabs').innerHTML = gs.map(g => {
+  $('group-list').innerHTML = gs.map((g, i) => {
     const n = (g.members || []).length;
     const on = cur && g.id === cur.id;
-    return `<button class="btn mini${on ? ' pri' : ''}" onclick="selectGroup('${g.id}')">
-      <span class="mono">${esc(g.name)}</span> (${n})</button>`;
-  }).join('') + '<button class="btn mini" onclick="openGroup()">＋ 新建路由组</button>';
-  $('group-meta').innerHTML = cur ? `
-    对外模型名 <code class="mono">${esc(cur.name)}</code>${cur.note ? ' · ' + esc(cur.note) : ''}
-    <button class="btn mini" onclick="openGroup('${cur.id}')">重命名 / 备注</button>
-    <button class="btn mini" onclick="openAttach()">＋ 加入已有模型</button>
-    ${gs.length > 1 ? `<button class="btn mini danger" onclick="delGroup('${cur.id}')">删除该组</button>` : ''}
-    <span>模型配置全局共享，组间只有优先级不同</span>` : '<span>暂无路由组</span>';
+    return `<button class="group-item${on ? ' on' : ''}" onclick="selectGroup('${g.id}')">
+      <span class="group-item-top">
+        <span class="group-item-name mono">${esc(g.name)}</span>
+        ${i === 0 ? '<span class="group-tag">默认</span>' : ''}
+      </span>
+      <span class="group-item-meta">${n} 个模型${g.note ? ' · ' + esc(g.note) : ''}</span>
+    </button>`;
+  }).join('') || '<div class="hint" style="padding:10px 2px">还没有路由组</div>';
+
+  $('group-title').textContent = cur ? cur.name : '—';
+  $('group-default-badge').hidden = !cur || !gs.length || gs[0].id !== cur.id;
+  $('group-sub').innerHTML = cur
+    ? `对外模型名 <code class="mono">${esc(cur.name)}</code>${cur.note ? ' · ' + esc(cur.note) : ''}`
+    : '';
+  $('group-actions').innerHTML = cur ? `
+    <button class="btn mini" onclick="openGroup('${cur.id}')">组设置</button>
+    ${gs.length > 1 ? `<button class="btn mini danger" onclick="delGroup('${cur.id}')">删除组</button>` : ''}` : '';
+}
+
+// 状态合并了限流静音、静音时段、每日上限与并行上限的提示
+function statusInfo(m) {
+  const autoUntil = m.muted_until && new Date(m.muted_until) > new Date() ? new Date(m.muted_until) : null;
+  if (autoUntil) {
+    return {
+      cls: 'bad', label: '限流静音', title: m.mute_reason || '',
+      extra: `至 ${autoUntil.toLocaleString()} <button class="btn mini" onclick="unmuteModel('${m.id}')">解除</button>`,
+    };
+  }
+  if (isMuted(m.mutes)) {
+    return {cls: 'warn', label: '静音时段', extra: (m.mutes || []).map(w => esc(w.from + '~' + w.to)).join('，')};
+  }
+  if (m.daily_limit > 0 && (m.used_today || 0) >= m.daily_limit) {
+    return {cls: 'bad', label: '已达上限', extra: `今日 ${fmtTok(m.used_today)} / ${fmtTok(m.daily_limit)}`};
+  }
+  if (m.max_concurrent > 0 && (m.inflight || 0) >= m.max_concurrent) {
+    return {cls: 'warn', label: '并行已满', extra: `${m.inflight || 0} / ${m.max_concurrent} 在途`};
+  }
+  return {cls: 'ok', label: '可用'};
+}
+
+function usageHTML(m) {
+  const used = m.used_today || 0;
+  if (!(m.daily_limit > 0)) {
+    return `<span class="usage-text">已用 ${fmtTok(used)} tokens · 不限</span>`;
+  }
+  const pct = Math.min(100, Math.round(used / m.daily_limit * 100));
+  return `<div class="usage-line">
+    <div class="mini-bar" title="${exact(used)} / ${exact(m.daily_limit)}"><i class="${used >= m.daily_limit ? 'over' : ''}" style="width:${Math.max(pct, used > 0 ? 2 : 0)}%"></i></div>
+    <span class="usage-text">${fmtTok(used)} / ${fmtTok(m.daily_limit)}</span>
+  </div>`;
+}
+
+function concHTML(m) {
+  const inf = m.inflight || 0;
+  if (!(m.max_concurrent > 0)) {
+    return `<span class="usage-text">${inf} 个在途 · 不限</span>`;
+  }
+  const pct = Math.min(100, Math.round(inf / m.max_concurrent * 100));
+  return `<div class="usage-line">
+    <div class="mini-bar" title="${inf} / ${m.max_concurrent} 在途"><i class="${inf >= m.max_concurrent ? 'over' : ''}" style="width:${Math.max(pct, inf > 0 ? 3 : 0)}%"></i></div>
+    <span class="usage-text">${inf} / ${m.max_concurrent}</span>
+  </div>`;
 }
 
 function renderModels() {
@@ -1474,69 +1628,47 @@ function renderModels() {
   const tb = $('models-body');
   const cur = activeGroupObj();
   const list = groupModels();
+  $('model-summary').textContent = cur
+    ? `本组 ${list.length} 个模型${list.length ? ' · 按组内优先级从高到低' : ''}`
+    : '';
   if (!cur) {
-    tb.innerHTML = `<tr><td colspan="10" class="empty">还没有路由组</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="7" class="empty">还没有路由组</td></tr>`;
     return;
   }
   if (!list.length) {
-    tb.innerHTML = `<tr><td colspan="10" class="empty">「${esc(cur.name)}」还没有模型，点右上角「添加模型」开始</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="7" class="empty">「${esc(cur.name)}」还没有模型：点上方「添加模型」，或用「加入已有模型」复用其他组的配置</td></tr>`;
     return;
   }
-  tb.innerHTML = list.map((m, i) => {
-    const muted = isMuted(m.mutes);
-    const autoUntil = m.muted_until && new Date(m.muted_until) > new Date() ? new Date(m.muted_until) : null;
-    const over = m.daily_limit > 0 && m.used_today >= m.daily_limit;
-    const full = m.max_concurrent > 0 && (m.inflight || 0) >= m.max_concurrent;
-    const status = autoUntil ? `<span class="pill bad" title="${esc(m.mute_reason || '')}">限流静音</span>`
-      : muted ? '<span class="pill warn">静音中</span>'
-      : over ? '<span class="pill bad">已超限</span>'
-      : full ? '<span class="pill warn">并行已满</span>'
-      : '<span class="pill ok">可用</span>';
-    // 自动静音的到期提示（附手动解除入口）
-    const muteNote = autoUntil ? `<div class="cell-sub">至 ${autoUntil.toLocaleString()}
-      <button class="btn mini" onclick="unmuteModel('${m.id}')" style="margin-left:4px">解除</button></div>` : '';
-    const pct = m.daily_limit > 0 ? Math.min(100, Math.round(m.used_today / m.daily_limit * 100)) : 0;
-    const limitTxt = m.daily_limit > 0 ? fmtTok(m.daily_limit) : '∞';
-    const bar = m.daily_limit > 0
-      ? `<div class="mini-bar"><i class="${over ? 'over' : ''}" style="width:${Math.max(pct, m.used_today > 0 ? 2 : 0)}%"></i></div>` : '';
-    // 并行占用：有上限时显示 在途/上限，无上限只显示在途数
-    const concPct = m.max_concurrent > 0 ? Math.min(100, Math.round((m.inflight || 0) / m.max_concurrent * 100)) : 0;
-    const concBar = m.max_concurrent > 0
-      ? `<div class="mini-bar" style="min-width:70px"><i class="${full ? 'over' : ''}" style="width:${Math.max(concPct, (m.inflight || 0) > 0 ? 3 : 0)}%"></i></div>` : '';
-    const concTxt = m.max_concurrent > 0 ? `${m.inflight || 0} / ${m.max_concurrent}` : `${m.inflight || 0} / ∞`;
+  tb.innerHTML = list.map(m => {
+    const st = statusInfo(m);
     return `<tr>
-      <td style="white-space:nowrap">
-        <span class="hint" style="display:inline-block;width:18px">${i + 1}</span>
-        <b>${m.priority}</b>
-        <button class="btn mini" title="提高优先级" onclick="move('${m.id}',-1)" style="padding:1px 6px">▲</button>
-        <button class="btn mini" title="降低优先级" onclick="move('${m.id}',1)" style="padding:1px 6px">▼</button>
-      </td>
-      <td class="mono"><b>${esc(m.name)}</b></td>
-      <td>${esc(pname(m.provider_id))}</td>
-      <td><label class="switch" title="${m.expose ? '已出现在 /v1/models 列表中，点击隐藏' : '未出现在 /v1/models 列表中，点击暴露'}"><input type="checkbox" ${m.expose ? 'checked' : ''} onchange="toggleExpose('${m.id}', this.checked)"><i></i></label></td>
-      <td>${status}${muteNote}</td>
-      <td class="num">
-        <div class="usage-cell" style="align-items:flex-end">
-          ${bar}
-          <span title="${exact(m.used_today)} / ${m.daily_limit > 0 ? exact(m.daily_limit) : '不限'}">${fmtTok(m.used_today)} / ${limitTxt}</span>
-        </div>
-      </td>
-      <td class="num">
-        <div class="usage-cell" style="align-items:flex-end">
-          ${concBar}
-          <span title="当前在途 ${m.inflight || 0} 个请求${m.max_concurrent > 0 ? '，上限 ' + m.max_concurrent : '，不限'}">${concTxt}</span>
-        </div>
-      </td>
-      <td>${(m.mutes || []).map(w => `<span class="cell-sub">${esc(w.from + '~' + w.to)}</span>`).join('<br>') || '<span class="hint">—</span>'}</td>
       <td>
-        <button class="btn mini" onclick="testModel('${m.id}')">测试</button>
-        <div class="test-res" id="test-${m.id}"></div>
+        <div class="pri-cell">
+          <span class="pri-num" title="组内优先级">${m.priority}</span>
+          <span class="pri-moves">
+            <button title="提高优先级" onclick="move('${m.id}',-1)">▲</button>
+            <button title="降低优先级" onclick="move('${m.id}',1)">▼</button>
+          </span>
+        </div>
       </td>
-      <td style="white-space:nowrap">
-        <button class="btn mini" onclick="editModel('${m.id}')">编辑</button>
-        <button class="btn mini" onclick="detachModel('${m.id}')" title="只从当前组移除，模型配置若仍被其他组使用则保留">移出本组</button>
-        <button class="btn mini danger" onclick="delModel('${m.id}')" title="删除共享模型配置，并从所有路由组移除">删除</button>
+      <td>
+        <div class="model-cell">
+          <span class="model-name mono" title="${esc(m.name)}">${esc(m.name)}</span>
+          <span class="model-prov">${esc(pname(m.provider_id))}</span>
+          <div class="test-res" id="test-${m.id}"></div>
+        </div>
       </td>
+      <td><div class="status-line">
+        <span class="pill ${st.cls}"${st.title ? ` title="${esc(st.title)}"` : ''}>${st.label}</span>
+        ${st.extra ? `<span class="status-extra">${st.extra}</span>` : ''}
+      </div></td>
+      <td>${usageHTML(m)}</td>
+      <td>${concHTML(m)}</td>
+      <td><label class="switch" title="${m.expose ? '已出现在 /v1/models 列表中，点击隐藏' : '未出现在 /v1/models 列表中，点击暴露'}"><input type="checkbox" ${m.expose ? 'checked' : ''} onchange="toggleExpose('${m.id}', this.checked)"><i></i></label></td>
+      <td><div class="row-actions">
+        <button class="link-btn" onclick="editModel('${m.id}')">编辑</button>
+        <button class="link-btn" onclick="testModel('${m.id}')">测试</button>
+      </div></td>
     </tr>`;
   }).join('');
 }
@@ -1630,6 +1762,7 @@ function editModel(id) {
   if (!cur) { alert('请先新建一个路由组'); return; }
   editingModel = id ? S.models.find(m => m.id === id) : null;
   $('dlg-model-title').textContent = id ? '编辑模型' : '添加模型';
+  $('m-danger').hidden = !editingModel;
   $('m-group').textContent = cur.name;
   $('m-provider').innerHTML = S.providers.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
   $('m-provider').value = editingModel?.provider_id || S.providers[0].id;
@@ -1703,6 +1836,7 @@ async function delModel(id) {
   if (!confirm(`确定删除共享模型配置「${m?.name || id}」？它会从所有路由组移除，且不可恢复。`)) return;
   try {
     S = await api('DELETE', '/api/models/' + id);
+    if (dlgModel.open) dlgModel.close();
     renderAll();
     toast('已删除');
   } catch (e) { alert(e.message); }
@@ -1717,6 +1851,7 @@ async function detachModel(id) {
   if (!confirm(`从路由组「${cur?.name || ''}」移出模型「${m?.name || id}」？${last ? '它已不属于任何组，共享配置会一并删除。' : '模型配置仍被其他组使用，会保留。'}`)) return;
   try {
     S = await api('DELETE', '/api/groups/' + cur.id + '/models/' + id);
+    if (dlgModel.open) dlgModel.close();
     renderAll();
     toast(last ? '已移出并删除配置' : '已移出本组');
   } catch (e) { alert(e.message); }
