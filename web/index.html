@@ -245,6 +245,8 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .pill.ok{color:var(--ok);background:var(--ok-bg)}
 .pill.warn{color:var(--warn);background:var(--warn-bg)}
 .pill.bad{color:var(--bad);background:var(--bad-bg)}
+.pill.acc{color:var(--acc);background:var(--acc-l)}
+.pill.mut{color:var(--mut);background:var(--soft3)}
 /* 开关：表格与弹窗共用 */
 .switch{position:relative;display:inline-block;width:34px;height:19px;flex:none;vertical-align:middle}
 .switch input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:1}
@@ -999,6 +1001,17 @@ const fmtTok = n => {
 const exact = n => fmtN(n) + ' tokens';
 const pname = id => (S.providers.find(p => p.id === id) || {}).name || id || '—';
 const keyName = id => !id ? '免鉴权' : id === 'env' ? '环境变量' : ((S.api_keys || []).find(k => k.id === id) || {}).name || '已删除';
+// 思考等级单元格：主值 = 实际下发档位（off/none 灰、其余强调色），声明值与实发不同
+// 时小字标注「声明 X」（实发为空说明该线路没下发档位）
+function effortCell(declared, sent) {
+  declared = declared || ''; sent = sent || '';
+  const isOff = s => s === 'off' || s === 'none';
+  const main = sent
+    ? `<span class="pill ${isOff(sent) ? 'mut' : 'acc'}">${esc(sent)}</span>`
+    : '<span class="hint">—</span>';
+  const sub = declared && declared !== sent ? `<div class="cell-sub">声明 ${esc(declared)}</div>` : '';
+  return `${main}${sub}`;
+}
 
 /* ---------- 日期 ---------- */
 const localDate = d => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
@@ -1387,14 +1400,14 @@ function renderHome() {
 // 活跃会话面板：带 X-Session-ID 的粘性绑定，TTL 内无请求自动解绑（仅内存，重启即清）
 function renderSessions() {
   const head = $('sess-head'), body = $('sess-body');
-  head.innerHTML = `<tr><th>会话 ID</th><th>Key</th><th>请求模型</th><th>绑定模型</th><th>Provider</th>
+  head.innerHTML = `<tr><th>会话 ID</th><th>Key</th><th>请求模型</th><th>绑定模型</th><th>思考</th><th>Provider</th>
     <th class="num">请求</th><th class="num">输出速度</th><th>最近活跃</th><th>剩余</th><th style="width:64px">操作</th></tr>`;
   const list = S.sessions || [];
   $('sess-sub').textContent = list.length
     ? `${list.length} 个会话 · 速度 = 输出 tokens / 生成耗时（流式从首字节算）· ${ttlLabel()}无请求自动解绑 · 过期会话可在下方「用量明细 → 按会话」查看`
     : `客户端带 X-Session-ID 头的粘性会话 · ${ttlLabel()}无请求自动解绑 · 历史会话见下方「用量明细 → 按会话」`;
   if (!list.length) {
-    body.innerHTML = `<tr><td colspan="10" class="empty">暂无活跃会话：客户端带 X-Session-ID 头请求成功后在此显示</td></tr>`;
+    body.innerHTML = `<tr><td colspan="11" class="empty">暂无活跃会话：客户端带 X-Session-ID 头请求成功后在此显示</td></tr>`;
     return;
   }
   body.innerHTML = list.map(x => {
@@ -1416,6 +1429,7 @@ function renderSessions() {
       <td>${esc(keyName(x.key_id))}</td>
       <td class="mono">${x.requested ? esc(x.requested) : '<span class="hint">—</span>'}</td>
       <td class="mono"><b>${esc(bound)}</b>${switched ? ' <span class="hint">(auto)</span>' : ''}</td>
+      <td title="实际发往上游的思考档位；小字为客户端声明值">${effortCell(x.effort_declared, x.effort_sent)}</td>
       <td>${esc(prov)}</td>
       <td class="num">${fmtN(x.count)}</td>
       <td class="num" title="平均输出速度；首字为流式平均首字节耗时">${speed}${speedSub ? `<div class="cell-sub">${speedSub}</div>` : ''}</td>
@@ -1613,13 +1627,13 @@ function renderDetail(rows) {
 
   // 按会话：含已过期/已结束的会话（落盘保留 35 天），活跃会话带绿点标记
   if (detailMode === 'session') {
-    head.innerHTML = `<tr><th>日期</th><th>会话 ID</th><th>Key</th><th>Provider</th><th>模型</th>
+    head.innerHTML = `<tr><th>日期</th><th>会话 ID</th><th>Key</th><th>Provider</th><th>模型</th><th>思考</th>
       <th class="num">请求</th><th class="num">输入</th><th class="num">缓存</th><th class="num">输出</th>
       <th class="num">合计</th><th class="num">速度</th><th class="num">首字</th></tr>`;
     const ri = rangeInfo();
     const list = (S.session_usage || []).filter(u => u.date >= ri.from && u.date <= ri.to);
     if (!list.length) {
-      body.innerHTML = `<tr><td colspan="12" class="empty">所选范围内暂无会话用量（请求需带 X-Session-ID 头）</td></tr>`;
+      body.innerHTML = `<tr><td colspan="13" class="empty">所选范围内暂无会话用量（请求需带 X-Session-ID 头）</td></tr>`;
       return;
     }
     const liveIds = new Set((S.sessions || []).map(x => x.id));
@@ -1637,6 +1651,7 @@ function renderDetail(rows) {
         <td>${esc(keyName(u.key_id))}</td>
         <td>${esc(pname(u.provider_id))}</td>
         <td class="mono"><b>${esc(u.model)}</b>${switched ? `<div class="cell-sub">请求 ${esc(u.requested)}</div>` : ''}</td>
+        <td title="该行最近一次请求的思考档位；小字为客户端声明值">${effortCell(u.effort_declared, u.effort_sent)}</td>
         <td class="num">${fmtN(u.requests)}</td>
         <td class="num" title="${exact(u.prompt_tokens)}">${fmtTok(u.prompt_tokens)}</td>
         <td class="num" title="${exact(u.cached_tokens)}">${fmtTok(u.cached_tokens)}</td>

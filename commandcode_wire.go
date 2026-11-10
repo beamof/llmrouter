@@ -60,7 +60,8 @@ type ccDeltaToolCall struct {
 // ── 出站请求 ──────────────────────────────────────────────────────────────
 
 // ccBuildBody 把 chat completions 请求体翻译成 /alpha/generate 的 envelope。
-func ccBuildBody(raw []byte, model string) ([]byte, error) {
+// 第二个返回值是实际下发的思考档位（"off" = 客户端要求关闭，"" = 未声明），供会话记录。
+func ccBuildBody(raw []byte, model string) ([]byte, string, error) {
 	var top struct {
 		Model               string           `json:"model"`
 		Messages            []map[string]any `json:"messages"`
@@ -74,7 +75,7 @@ func ccBuildBody(raw []byte, model string) ([]byte, error) {
 		} `json:"reasoning"`
 	}
 	if err := json.Unmarshal(raw, &top); err != nil {
-		return nil, fmt.Errorf("请求体不是合法 JSON: %w", err)
+		return nil, "", fmt.Errorf("请求体不是合法 JSON: %w", err)
 	}
 	if model == "" {
 		model = top.Model
@@ -197,8 +198,13 @@ func ccBuildBody(raw []byte, model string) ([]byte, error) {
 		effort = top.Reasoning.Effort
 	}
 	// Go 的 /alpha/generate 不认 "none"/"off"：不发档位，用模型默认。
-	if effort != "" && effort != "none" && effort != "off" {
-		params["reasoning_effort"] = ccFitEffort(effort, ccEffortsByModel[model])
+	sent := ""
+	switch {
+	case effort == "none" || effort == "off":
+		sent = "off" // 客户端要求关闭思考
+	case effort != "":
+		sent = ccFitEffort(effort, ccEffortsByModel[model])
+		params["reasoning_effort"] = sent
 	}
 
 	cwd, err := os.Getwd()
@@ -223,7 +229,8 @@ func ccBuildBody(raw []byte, model string) ([]byte, error) {
 		"permissionMode": "standard",
 		"params":         params,
 	}
-	return json.Marshal(out)
+	b, err := json.Marshal(out)
+	return b, sent, err
 }
 
 // ccTextOf 取消息内容里的纯文本（字符串或 text 部件数组）。
@@ -700,13 +707,14 @@ func (s *Server) ccAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 			return err
 		}
 	}
-	body, err := ccBuildBody(src, c.Model.Name)
+	body, effort, err := ccBuildBody(src, c.Model.Name)
 	if err != nil {
 		s.logFail(LogEntry{Level: "error", Kind: kindBadRequest, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
 			Message: "构造 Command Code 出站请求失败", Detail: err.Error()})
 		return err
 	}
+	sm.EffortSent = effort // 实际下发的思考档位（按模型支持档位收敛后）
 	cli, err := s.upstreamClient(c.Provider, 0)
 	if err != nil {
 		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
@@ -829,7 +837,7 @@ func (s *Server) ccRelay(w http.ResponseWriter, r *http.Request, c Candidate, bo
 			w.WriteHeader(http.StatusOK)
 			w.Write(out)
 			if sm != nil {
-				*sm = tm.sample(used, false)
+				sm.applySample(tm.sample(used, false))
 			}
 			return
 		}
@@ -911,13 +919,13 @@ func (s *Server) ccRelay(w http.ResponseWriter, r *http.Request, c Candidate, bo
 			reason := ccFinishReason(ev.FinishReason, tools)
 			finish(reason, u)
 			if sm != nil {
-				*sm = tm.sample(ccUsageOf(u), wantStream)
+				sm.applySample(tm.sample(ccUsageOf(u), wantStream))
 			}
 			return nil
 		case "abort":
 			finish("stop", ccUsage{})
 			if sm != nil {
-				*sm = tm.sample(Usage{}, wantStream)
+				sm.applySample(tm.sample(Usage{}, wantStream))
 			}
 			return nil
 		case "error":
@@ -986,7 +994,7 @@ func (s *Server) ccRelay(w http.ResponseWriter, r *http.Request, c Candidate, bo
 	}
 	finish(reason, ccUsage{})
 	if sm != nil {
-		*sm = tm.sample(Usage{}, true)
+		sm.applySample(tm.sample(Usage{}, true))
 	}
 	return nil
 }

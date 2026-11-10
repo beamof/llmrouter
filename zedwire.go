@@ -28,6 +28,7 @@ import (
 type zedWirePlan struct {
 	provider string // zedProviderOpenAI / zedProviderAnthropic
 	model    string
+	effort   string // 实际下发到 provider_request 的思考档位；"" = 该线路不带档位
 }
 
 // zedUUID 生成 UUIDv4 文本（信封的 thread_id / prompt_id）
@@ -117,6 +118,13 @@ func zedBuildEnvelope(sendBody []byte, responsesMode bool, model string) ([]byte
 		respBody["model"] = model
 		zedNormalizeResponses(respBody)
 		providerRequest = respBody
+		// 实发档位取自归一化后的 provider_request：responses 客户端原样保留
+		// reasoning.effort，chat 客户端转 responses 时已被丢弃（留空即未下发）
+		if r, ok := respBody["reasoning"].(map[string]any); ok {
+			if s, _ := r["effort"].(string); strings.TrimSpace(s) != "" {
+				plan.effort = strings.TrimSpace(s)
+			}
+		}
 	}
 	envelope := map[string]any{
 		"thread_id": zedUUID(), "prompt_id": zedUUID(), "intent": "user_prompt",
@@ -374,6 +382,7 @@ func (s *Server) zedAttempt(w http.ResponseWriter, r *http.Request, c Candidate,
 			Message: "构造 Zed 出站请求失败", Detail: err.Error()})
 		return err
 	}
+	sm.EffortSent = plan.effort // 该线路实际下发的档位（chat→responses/Claude 线路不带）
 	wantStream := wbBodyStream(sendBody)
 	includeUsage := !wantStream || zedBodyIncludeUsage(sendBody)
 	cli, err := s.upstreamClient(c.Provider, 0)
@@ -442,7 +451,7 @@ func (s *Server) zedAttempt(w http.ResponseWriter, r *http.Request, c Candidate,
 	upBody := &firstByteReader{r: resp.Body, t: tm}
 	usage, wrote, rerr := s.zedRelay(upBody, w, plan, model, wantStream, responsesMode, includeUsage)
 	if sm != nil {
-		*sm = tm.sample(usage, wantStream)
+		sm.applySample(tm.sample(usage, wantStream))
 	}
 	if rerr != nil {
 		if wrote {

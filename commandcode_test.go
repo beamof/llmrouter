@@ -391,9 +391,12 @@ func TestCommandCodeBuildBodyFitsEffortAndGoogleSchema(t *testing.T) {
 	body := []byte(`{"model":"google/gemini-3.6-flash","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
 		"reasoning_effort":"max",
 		"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","$defs":{"x":{"type":"object","properties":{"a":{"type":"string"}}}},"properties":{"v":{"$ref":"#/$defs/x/properties/a"}}}}}]}`)
-	out, err := ccBuildBody(body, "google/gemini-3.6-flash")
+	out, sentEffort, err := ccBuildBody(body, "google/gemini-3.6-flash")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if sentEffort != "high" {
+		t.Errorf("回传实发档位 = %q, want high", sentEffort)
 	}
 	var req struct {
 		Params struct {

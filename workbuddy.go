@@ -493,21 +493,6 @@ func wbResolveEffort(requested string, m *wbModelMeta) string {
 	return m.Default
 }
 
-// wbClientEffort 客户端显式给的档位（含别名 reasoningEffort / reasoning.effort）
-func wbClientEffort(body map[string]any) (string, bool) {
-	for _, v := range []any{body["reasoning_effort"], body["reasoningEffort"]} {
-		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-			return strings.TrimSpace(s), true
-		}
-	}
-	if r, ok := body["reasoning"].(map[string]any); ok {
-		if s, ok := r["effort"].(string); ok && strings.TrimSpace(s) != "" {
-			return strings.TrimSpace(s), true
-		}
-	}
-	return "", false
-}
-
 func wbThinkingType(body map[string]any) string {
 	t, _ := body["thinking"].(map[string]any)
 	s, _ := t["type"].(string)
@@ -524,7 +509,8 @@ func wbIsRole(m map[string]any, role string) bool {
 // 未给且未显式关闭 → 注入目录默认档（不硬编码）；
 // thinking.type=disabled → 移除全部档位字段；
 // deepseek 系启用思考时补 thinking.type=enabled、reasoning_summary 与历史 reasoning 回填。
-func wbReasoningNormalize(body map[string]any, m *wbModelMeta, modelID string) {
+// 返回实际写进出站请求的档位（"off" = 关闭思考，"" = 没有档位字段），供会话列表记录。
+func wbReasoningNormalize(body map[string]any, m *wbModelMeta, modelID string) string {
 	isDeepSeek := strings.HasPrefix(strings.ToLower(modelID), "deepseek")
 	if strings.EqualFold(strings.TrimSpace(wbThinkingType(body)), "disabled") {
 		delete(body, "reasoning_effort")
@@ -534,9 +520,9 @@ func wbReasoningNormalize(body map[string]any, m *wbModelMeta, modelID string) {
 			delete(r, "effort")
 		}
 		wbBackfillReasoning(body, isDeepSeek, false)
-		return
+		return "off"
 	}
-	if effort, ok := wbClientEffort(body); ok {
+	if effort, ok := effortArg(body); ok {
 		resolved := wbResolveEffort(effort, m)
 		switch {
 		case wbIsOff(effort):
@@ -581,6 +567,7 @@ func wbReasoningNormalize(body map[string]any, m *wbModelMeta, modelID string) {
 	} else {
 		wbBackfillReasoning(body, isDeepSeek, false)
 	}
+	return final
 }
 
 func wbClearEffortAliases(body map[string]any) {
@@ -1709,11 +1696,12 @@ func wbBodyStream(body []byte) bool {
 }
 
 // wbPrepareBody 出站准备：归一化 → 推理档位 → 注入首条 system → 强制 stream:true
-// （上游不支持非流式，非流式客户端由 wbAttempt 聚合）
-func (s *Server) wbPrepareBody(e *wbEdition, c Candidate, sendBody []byte) ([]byte, error) {
+// （上游不支持非流式，非流式客户端由 wbAttempt 聚合）。第二个返回值是实际下发的
+// 思考档位，用于会话列表展示。
+func (s *Server) wbPrepareBody(e *wbEdition, c Candidate, sendBody []byte) ([]byte, string, error) {
 	var m map[string]any
 	if err := json.Unmarshal(sendBody, &m); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	uid := ""
 	if c.Provider.WB != nil {
@@ -1721,10 +1709,11 @@ func (s *Server) wbPrepareBody(e *wbEdition, c Candidate, sendBody []byte) ([]by
 	}
 	wbNormalizeOutbound(m, uid)
 	cat := s.wbCatalogFor(c.Provider)
-	wbReasoningNormalize(m, cat.meta(c.Model.Name), c.Model.Name)
+	effort := wbReasoningNormalize(m, cat.meta(c.Model.Name), c.Model.Name)
 	wbEnsureLeadingSystem(m)
 	m["stream"] = true
-	return json.Marshal(m)
+	out, err := json.Marshal(m)
+	return out, effort, err
 }
 
 // wbAttempt 处理一个 WorkBuddy 候选的完整生命周期：懒续期 → 出站准备 → 专用请求头
@@ -1759,13 +1748,14 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 			return err
 		}
 	}
-	body, err := s.wbPrepareBody(e, c, src)
+	body, effort, err := s.wbPrepareBody(e, c, src)
 	if err != nil {
 		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
 			Message: "构造 WorkBuddy 出站请求失败", Detail: err.Error()})
 		return err
 	}
+	sm.EffortSent = effort // 实际下发的思考档位（含目录默认注入）
 	cli, err := s.upstreamClient(c.Provider, 0)
 	if err != nil {
 		s.logFail(LogEntry{Level: "error", Kind: kindUpstream, KeyID: keyID,
@@ -1850,7 +1840,7 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 			_, cerr := io.Copy(rs, upBody)
 			usage := rs.finish(cerr)
 			if sm != nil {
-				*sm = tm.sample(usage, true)
+				sm.applySample(tm.sample(usage, true))
 			}
 			if cerr != nil {
 				s.logFail(LogEntry{Level: "warn", Kind: kindUpstream, KeyID: keyID,
@@ -1863,7 +1853,7 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 		_, cerr := io.Copy(sn, upBody)
 		usage := extractStreamUsage(sn.tail)
 		if sm != nil {
-			*sm = tm.sample(usage, true)
+			sm.applySample(tm.sample(usage, true))
 		}
 		if cerr != nil {
 			// 响应头已发出，无法换候选；记一条日志便于排查截断
@@ -1894,7 +1884,7 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 	w.WriteHeader(resp.StatusCode)
 	w.Write(out)
 	if sm != nil {
-		*sm = tm.sample(usage, false)
+		sm.applySample(tm.sample(usage, false))
 	}
 	return nil
 }

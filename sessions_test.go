@@ -410,3 +410,53 @@ func TestSessionTTLChangeAppliesImmediately(t *testing.T) {
 		t.Fatalf("缩短 TTL 后旧绑定应过期, got %d", got)
 	}
 }
+
+// 思考等级：客户端声明值与实际出站值都落进活跃会话与历史会话用量。
+// 标准上游字节透传，两个值相同。
+func TestSessionsRecordEffortLevel(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}`)
+	}))
+	defer up.Close()
+	s, app := newTestServer(t)
+	p := &Provider{Name: "P", BaseURL: up.URL}
+	s.store.UpsertProvider(p)
+	s.store.UpsertModel(&Model{Name: "glm", ProviderID: p.ID})
+
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions",
+		`{"model":"glm","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`,
+		"X-Session-ID", "eff-1")
+
+	// 活跃会话
+	resp, err := app.Client().Get(app.URL + "/api/sessions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var list struct {
+		Sessions []sessionInfo `json:"sessions"`
+	}
+	if b, _ := io.ReadAll(resp.Body); json.Unmarshal(b, &list) != nil || len(list.Sessions) != 1 {
+		t.Fatalf("活跃会话列表不对: %s", b)
+	}
+	if got := list.Sessions[0]; got.EffortDeclared != "medium" || got.EffortSent != "medium" {
+		t.Fatalf("活跃会话思考等级 = 声明 %q / 实发 %q, want medium / medium", got.EffortDeclared, got.EffortSent)
+	}
+
+	// 历史会话用量（/api/state 里的 session_usage）
+	resp2, err := app.Client().Get(app.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	var st struct {
+		SessionUsage []SessionStat `json:"session_usage"`
+	}
+	if b, _ := io.ReadAll(resp2.Body); json.Unmarshal(b, &st) != nil || len(st.SessionUsage) != 1 {
+		t.Fatalf("session_usage 不对: %s", b)
+	}
+	if row := st.SessionUsage[0]; row.EffortDeclared != "medium" || row.EffortSent != "medium" {
+		t.Fatalf("历史用量思考等级 = 声明 %q / 实发 %q, want medium / medium", row.EffortDeclared, row.EffortSent)
+	}
+}

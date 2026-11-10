@@ -49,6 +49,11 @@ type session struct {
 	ttftNanos     int64         // 累计首字节耗时（仅流式）
 	ttftSamples   int           // 有首字节计时的请求数（仅流式）
 	lastTTFT      time.Duration // 最近一次流式请求的首字节耗时
+
+	// 思考等级：最近一次成功请求的客户端声明值与实际出站值（网关可能注入默认档
+	// 或按模型能力收敛，"off" 表示关闭思考，空 = 未声明/未下发）
+	effortDeclared string
+	effortSent     string
 }
 
 const sessionTTL = time.Hour
@@ -93,6 +98,7 @@ func (s *Server) setSession(key, modelID, keyID, requested string) {
 		lastAt: now, expires: now.Add(ttl),
 		outTokens: old.outTokens, genNanos: old.genNanos, lastTokPerSec: old.lastTokPerSec,
 		ttftNanos: old.ttftNanos, ttftSamples: old.ttftSamples, lastTTFT: old.lastTTFT,
+		effortDeclared: old.effortDeclared, effortSent: old.effortSent,
 	}
 	if sess.firstAt.IsZero() {
 		sess.firstAt = now
@@ -157,6 +163,10 @@ type sessionInfo struct {
 	LastTokPerSec float64 `json:"last_tok_per_sec,omitempty"` // 最近一次请求的输出速度
 	TTFTMs        int64   `json:"ttft_ms,omitempty"`          // 平均首字节耗时（毫秒，仅流式）
 	LastTTFTMs    int64   `json:"last_ttft_ms,omitempty"`     // 最近一次流式请求的首字节耗时
+
+	// 思考等级：客户端声明值（可能为空）与实际出站值（含网关默认注入/能力收敛）
+	EffortDeclared string `json:"effort_declared,omitempty"`
+	EffortSent     string `json:"effort_sent,omitempty"`
 }
 
 // activeSessions 当前活跃（未过期）的会话绑定，按最近活跃倒序
@@ -178,7 +188,8 @@ func (s *Server) activeSessions() []sessionInfo {
 			ID: id, KeyID: v.keyID, ModelID: v.modelID, Requested: v.requested,
 			Count: v.count, FirstAt: v.firstAt, LastAt: v.lastAt, Expires: v.expires,
 			OutTokens: v.outTokens, LastTokPerSec: v.lastTokPerSec,
-			LastTTFTMs: int64(v.lastTTFT / time.Millisecond),
+			LastTTFTMs:     int64(v.lastTTFT / time.Millisecond),
+			EffortDeclared: v.effortDeclared, EffortSent: v.effortSent,
 		}
 		if v.genNanos > 0 {
 			info.TokPerSec = float64(v.outTokens) / (float64(v.genNanos) / float64(time.Second))
@@ -214,7 +225,44 @@ func (s *Server) addSessionUsage(key string, sm usageSample) {
 		sess.ttftSamples++
 		sess.lastTTFT = sm.TTFT
 	}
+	// 思考等级按「最近一次请求」写：同会话中途改档位时列表显示最新的值
+	sess.effortDeclared = sm.EffortDeclared
+	sess.effortSent = sm.EffortSent
 	s.sessions[key] = sess
+}
+
+// effortArg 客户端显式给的思考等级：reasoning_effort / reasoningEffort /
+// reasoning.effort 三种写法都认（Responses 协议用 reasoning.effort）。
+func effortArg(body map[string]any) (string, bool) {
+	for _, v := range []any{body["reasoning_effort"], body["reasoningEffort"]} {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s), true
+		}
+	}
+	if r, ok := body["reasoning"].(map[string]any); ok {
+		if s, ok := r["effort"].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s), true
+		}
+	}
+	return "", false
+}
+
+// requestEffort 客户端声明的思考等级；thinking.type=disabled 记为 "off"。
+// 把请求体解成 map 只是为了让别名/嵌套写法走同一套解析。
+func requestEffort(body []byte) string {
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil || m == nil {
+		return ""
+	}
+	if t, _ := m["thinking"].(map[string]any); t != nil {
+		if s, _ := t["type"].(string); strings.EqualFold(strings.TrimSpace(s), "disabled") {
+			return "off"
+		}
+	}
+	if s, ok := effortArg(m); ok {
+		return s
+	}
+	return ""
 }
 
 // handleProxy 生成 /chat/completions 与 /responses 共用的透传 handler。
@@ -254,6 +302,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 
 		// 路由组：组名即对外虚拟模型名，命中组时只在组内按优先级挑选实际模型
 		group, isGroup := s.store.GroupByName(req.Model)
+		effort := requestEffort(body) // 客户端声明的思考等级，随会话记录（实际出站值由适配层覆盖）
 		protocol := "chat"
 		if suffix == "/responses" {
 			protocol = "responses"
@@ -392,6 +441,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 					sendBody = withModel(body, c.Model.Name)
 				}
 				var sm usageSample
+				sm.EffortDeclared, sm.EffortSent = effort, effort
 				if err := s.wbAttempt(w, r, c, sendBody, keyID, suffix == "/responses", tm, &sm); err != nil {
 					lastErr = err.Error()
 					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
@@ -415,6 +465,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 					sendBody = withModel(body, c.Model.Name)
 				}
 				var sm usageSample
+				sm.EffortDeclared, sm.EffortSent = effort, effort
 				if err := s.zedAttempt(w, r, c, sendBody, keyID, suffix == "/responses", tm, &sm); err != nil {
 					lastErr = err.Error()
 					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
@@ -438,6 +489,7 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 					sendBody = withModel(body, c.Model.Name)
 				}
 				var sm usageSample
+				sm.EffortDeclared, sm.EffortSent = effort, effort
 				if err := s.ccAttempt(w, r, c, sendBody, keyID, suffix == "/responses", tm, &sm); err != nil {
 					lastErr = err.Error()
 					failures = append(failures, fmt.Sprintf("%s: %v", c.Provider.Name, err))
@@ -536,7 +588,8 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 				continue
 			}
 			bind(c, resp.StatusCode)
-			sm := s.relay(w, resp, c.Model, tm) // relay 返回前会释放名额
+			sm := s.relay(w, resp, c.Model, tm)               // relay 返回前会释放名额
+			sm.EffortDeclared, sm.EffortSent = effort, effort // 标准上游字节透传，声明即实发
 			s.store.AddCallUsage(sid, req.Model, &c.Model, keyID, sm)
 			s.addSessionUsage(sessKey, sm)
 			return
@@ -730,6 +783,11 @@ type usageSample struct {
 	TTFT   time.Duration // 首字节耗时
 	Gen    time.Duration // 生成耗时
 	Total  time.Duration // 端到端耗时
+
+	// 思考等级：EffortDeclared 是客户端请求体里的声明值，EffortSent 是实际写进
+	// 出站请求的档位（适配层解析后覆盖；标准上游字节透传，两者相同）
+	EffortDeclared string
+	EffortSent     string
 }
 
 // tokPerSec 输出速度；没有输出 token 或耗时时返回 0
@@ -738,6 +796,13 @@ func (u usageSample) tokPerSec() float64 {
 		return 0
 	}
 	return float64(u.Completion) / u.Gen.Seconds()
+}
+
+// applySample 用本次计时聚合结果更新用量，同时保留适配层已写入的思考等级
+// （tm.sample 只负责 usage/计时，整体赋值会抹掉档位信息）。
+func (u *usageSample) applySample(s usageSample) {
+	s.EffortDeclared, s.EffortSent = u.EffortDeclared, u.EffortSent
+	*u = s
 }
 
 // firstByteReader 在首次从上游读到字节时给 requestTiming 打点，不改变字节流。

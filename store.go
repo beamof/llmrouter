@@ -206,6 +206,10 @@ type SessionStat struct {
 	TTFTSamples      int64     `json:"ttft_samples,omitempty"`
 	FirstAt          time.Time `json:"first_at"`
 	LastAt           time.Time `json:"last_at"`
+
+	// 思考等级：最近一次请求的客户端声明值 / 实际出站值（含网关默认注入与能力收敛）
+	EffortDeclared string `json:"effort_declared,omitempty"`
+	EffortSent     string `json:"effort_sent,omitempty"`
 }
 
 // Store 全部状态：内存为准，变更即落盘
@@ -1000,6 +1004,7 @@ func (s *Store) addSessionStatLocked(sessionID, requested string, m *Model, keyI
 				st.TTFTSamples++
 			}
 			st.LastAt = now
+			st.EffortDeclared, st.EffortSent = us.EffortDeclared, us.EffortSent
 			return
 		}
 	}
@@ -1008,6 +1013,7 @@ func (s *Store) addSessionStatLocked(sessionID, requested string, m *Model, keyI
 		ProviderID: m.ProviderID, Model: m.Name, Requested: requested,
 		Requests: 1, PromptTokens: us.Prompt, CachedTokens: us.Cached, CompletionTokens: us.Completion,
 		FirstAt: now, LastAt: now,
+		EffortDeclared: us.EffortDeclared, EffortSent: us.EffortSent,
 	}
 	if us.Completion > 0 {
 		st.GenNanos = int64(us.Gen)

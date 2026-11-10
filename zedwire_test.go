@@ -14,7 +14,8 @@ import (
 // ── 信封装配 ───────────────────────────────────────────────────────────────
 
 func TestZedBuildEnvelopeGPTChat(t *testing.T) {
-	body := `{"model":"gpt-5.4","stream":false,"messages":[{"role":"system","content":"sys"},{"role":"user","content":"你好"}],"max_tokens":100}`
+	// chat 客户端转 responses 时 reasoning_effort 被丢弃：plan.effort 应为空
+	body := `{"model":"gpt-5.4","stream":false,"reasoning_effort":"high","messages":[{"role":"system","content":"sys"},{"role":"user","content":"你好"}],"max_tokens":100}`
 	raw, plan, err := zedBuildEnvelope([]byte(body), false, "gpt-5.4")
 	if err != nil {
 		t.Fatal(err)
@@ -43,6 +44,9 @@ func TestZedBuildEnvelopeGPTChat(t *testing.T) {
 	if n, _ := zedInt(pr["max_output_tokens"]); n != 100 {
 		t.Fatalf("max_output_tokens 保留: %v", pr["max_output_tokens"])
 	}
+	if plan.effort != "" {
+		t.Fatalf("chat→responses 丢弃档位，实发应为空: %q", plan.effort)
+	}
 }
 
 func TestZedBuildEnvelopeGPTResponsesPassthrough(t *testing.T) {
@@ -65,6 +69,9 @@ func TestZedBuildEnvelopeGPTResponsesPassthrough(t *testing.T) {
 	}
 	if zedStr(zedMap(pr["reasoning"])["effort"]) != "high" {
 		t.Fatalf("reasoning 应保留: %s", mustJSON(pr))
+	}
+	if plan.effort != "high" {
+		t.Fatalf("实发档位应记为客户端的 high: %q", plan.effort)
 	}
 	if pr["stream"] != true {
 		t.Fatal("应强制流式")

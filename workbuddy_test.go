@@ -230,7 +230,9 @@ func TestWBReasoningNormalize(t *testing.T) {
 
 	// 客户端给档位 → 解析到档位表，别名清掉
 	m := mk(`{"model":"glm-5.0","reasoningEffort":"HIGH","messages":[]}`)
-	wbReasoningNormalize(m, meta, "glm-5.0")
+	if sent := wbReasoningNormalize(m, meta, "glm-5.0"); sent != "high" {
+		t.Fatalf("回传实发档位 = %q, want high", sent)
+	}
 	if m["reasoning_effort"] != "high" {
 		t.Fatalf("客户端档位应解析写入: %#v", m["reasoning_effort"])
 	}
@@ -240,7 +242,9 @@ func TestWBReasoningNormalize(t *testing.T) {
 
 	// 客户端 off → 原样透传，不注入其他档位字段
 	m = mk(`{"model":"glm-5.0","reasoning_effort":"off","messages":[]}`)
-	wbReasoningNormalize(m, meta, "glm-5.0")
+	if sent := wbReasoningNormalize(m, meta, "glm-5.0"); sent != "off" {
+		t.Fatalf("回传实发档位 = %q, want off", sent)
+	}
 	if m["reasoning_effort"] != "off" {
 		t.Fatalf("off 应原样透传: %#v", m["reasoning_effort"])
 	}
@@ -250,7 +254,9 @@ func TestWBReasoningNormalize(t *testing.T) {
 
 	// 未给档位 → 注入目录默认
 	m = mk(`{"model":"glm-5.0","messages":[]}`)
-	wbReasoningNormalize(m, meta, "glm-5.0")
+	if sent := wbReasoningNormalize(m, meta, "glm-5.0"); sent != "medium" {
+		t.Fatalf("回传实发档位 = %q, want medium（目录默认）", sent)
+	}
 	if m["reasoning_effort"] != "medium" {
 		t.Fatalf("应注入目录默认档: %#v", m["reasoning_effort"])
 	}
@@ -260,7 +266,9 @@ func TestWBReasoningNormalize(t *testing.T) {
 
 	// thinking.type=disabled → 档位字段全清
 	m = mk(`{"model":"glm-5.0","reasoning_effort":"high","reasoning_summary":"auto","thinking":{"type":"disabled"},"messages":[]}`)
-	wbReasoningNormalize(m, meta, "glm-5.0")
+	if sent := wbReasoningNormalize(m, meta, "glm-5.0"); sent != "off" {
+		t.Fatalf("关闭思考时回传 %q, want off", sent)
+	}
 	if _, ok := m["reasoning_effort"]; ok {
 		t.Fatal("disabled 应清除 reasoning_effort")
 	}
@@ -304,7 +312,9 @@ func TestWBReasoningNormalize(t *testing.T) {
 
 	// deepseek 无目录默认 → 官方 CLI 行为兜底 high + thinking.type=enabled
 	m = mk(`{"model":"deepseek-v4-pro","messages":[]}`)
-	wbReasoningNormalize(m, nil, "deepseek-v4-pro")
+	if sent := wbReasoningNormalize(m, nil, "deepseek-v4-pro"); sent != "high" {
+		t.Fatalf("回传实发档位 = %q, want high（deepseek 兜底）", sent)
+	}
 	if m["reasoning_effort"] != "high" {
 		t.Fatalf("deepseek 无目录默认应兜底 high: %#v", m["reasoning_effort"])
 	}
@@ -313,7 +323,9 @@ func TestWBReasoningNormalize(t *testing.T) {
 	}
 	// 非 deepseek 无目录默认 → 不注入档位
 	m = mk(`{"model":"glm-5.0","messages":[]}`)
-	wbReasoningNormalize(m, nil, "glm-5.0")
+	if sent := wbReasoningNormalize(m, nil, "glm-5.0"); sent != "" {
+		t.Fatalf("无档位信息时应回传空，得到 %q", sent)
+	}
 	if _, ok := m["reasoning_effort"]; ok {
 		t.Fatalf("非 deepseek 不应兜底档位: %#v", m["reasoning_effort"])
 	}
@@ -1286,5 +1298,30 @@ func TestWBLazyRefreshNearExpiry(t *testing.T) {
 	}
 	if refreshes.Load() != 1 {
 		t.Fatalf("应恰好懒续期一次: %d", refreshes.Load())
+	}
+}
+
+// 会话列表记录思考等级：客户端未声明时实际下发目录默认档（声明值留空），
+// 便于区分「客户端要求」与「网关注入」。
+func TestWBSessionEffortRecorded(t *testing.T) {
+	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\ndata: [DONE]\n\n")
+	})
+	s, app := newTestServer(t)
+	cred := &WorkBuddyCred{UID: "uid-1", AccessToken: "at-1", ExpiresAt: wbTimePtr(time.Now().Add(time.Hour))}
+	addWBProviderModel(t, s, up.URL, "glm-5.0", cred)
+
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions",
+		`{"model":"glm-5.0","messages":[{"role":"user","content":"hi"}]}`,
+		"X-Session-ID", "wb-eff")
+
+	sess := s.activeSessions()
+	if len(sess) != 1 {
+		t.Fatalf("应有 1 个活跃会话: %#v", sess)
+	}
+	if sess[0].EffortDeclared != "" || sess[0].EffortSent != "medium" {
+		t.Fatalf("思考等级 = 声明 %q / 实发 %q, want \"\" / medium（目录默认注入）",
+			sess[0].EffortDeclared, sess[0].EffortSent)
 	}
 }
