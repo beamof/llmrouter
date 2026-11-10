@@ -121,16 +121,28 @@ func (s *Server) wbBillingPost(p Provider, path string, body []byte) (map[string
 
 // wbCheckin 国内版个人账号每日签到。already=true 表示当天已签过（幂等成功）。
 // 企业账号不走个人签到（上游拒绝），由调用方分流。
+// 成功与「上游说已签过」都会把当天记为已签到，当天后续时点不再请求签到接口。
 func (s *Server) wbCheckin(p Provider) (already bool, err error) {
 	_, err = s.wbBillingPost(p, "/v2/billing/meter/daily-checkin", []byte("{}"))
 	if err == nil {
+		s.store.UpdateWBCheckinDay(p.ID, wbCheckinDay(time.Now()))
 		return false, nil
 	}
 	var ae *wbAPIError
 	if errors.As(err, &ae) && ae.Code == wbCheckinBusinessCode && strings.Contains(ae.Msg, wbCheckinAlreadyMarker) {
+		// 上游说今天已签过（可能来自官方客户端）：同样记为今天已签
+		s.store.UpdateWBCheckinDay(p.ID, wbCheckinDay(time.Now()))
 		return true, nil
 	}
 	return false, err
+}
+
+// wbCheckinDay 签到的日期口径（服务器本地时间的年月日）
+func wbCheckinDay(now time.Time) string { return now.Format("2006-01-02") }
+
+// wbCheckedInToday 当天是否已签到成功（本地记录，用于跳过后面的签到时点）
+func wbCheckedInToday(cred *WorkBuddyCred, now time.Time) bool {
+	return cred != nil && cred.LastCheckinDay == wbCheckinDay(now)
 }
 
 // wbUserResource 查询余额：企业账号走企业积分接口，其余走个人资源包接口。
@@ -241,32 +253,36 @@ func (s *Server) wbEnterpriseUsage(p Provider) (*WBUsage, error) {
 
 // ── 定时签到 ──────────────────────────────────────────────────────────────
 
-// wbCheckinHours 每日自动签到的时点（服务器本地时间，与 ccLoad 一致）
-var wbCheckinHours = []int{9, 21}
+// wbCheckinHour 每日自动签到时点：每天 09:00 一次（服务器本地时间）
+const wbCheckinHour = 9
 
-// wbNextCheckinAt 下一个自动签到时点（本地时间 09:00 / 21:00）
+// wbNextCheckinAt 下一个自动签到时点（本地时间 09:00；今天已过则取明天 09:00）
 func wbNextCheckinAt(now time.Time) time.Time {
-	for _, h := range wbCheckinHours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-		if now.Before(t) {
-			return t
-		}
+	t := time.Date(now.Year(), now.Month(), now.Day(), wbCheckinHour, 0, 0, 0, now.Location())
+	if now.Before(t) {
+		return t
 	}
-	return time.Date(now.Year(), now.Month(), now.Day(), wbCheckinHours[0], 0, 0, 0, now.Location()).AddDate(0, 0, 1)
+	return t.AddDate(0, 0, 1)
 }
 
-// wbCheckinLoop 后台定时签到：国内版个人账号（有凭证、非企业）每天 09:00/21:00
-// 签到并刷新余额快照；国际版不支持签到，企业账号由管理员手动查积分。失败只记
-// 日志，等下个时点再来。
+// wbCheckinLoop 后台定时签到：每天 09:00 跑一轮。
 func (s *Server) wbCheckinLoop() {
 	for {
-		next := wbNextCheckinAt(time.Now())
-		time.Sleep(time.Until(next))
-		for _, p := range s.store.AllProviders() {
-			e, cred := wbOf(p)
-			if e == nil || e.intl || cred == nil || cred.AccessToken == "" || cred.EnterpriseID != "" {
-				continue
-			}
+		time.Sleep(time.Until(wbNextCheckinAt(time.Now())))
+		s.wbCheckinRound(time.Now())
+	}
+}
+
+// wbCheckinRound 一轮签到：国内版个人账号（有凭证、非企业）签到并刷新余额快照。
+// 当天已签过的账号（如管理员手动签过）不再请求签到接口，只刷新余额快照。国际版
+// 不支持签到，企业账号由管理员手动查积分。失败只记日志，等次日再来。
+func (s *Server) wbCheckinRound(now time.Time) {
+	for _, p := range s.store.AllProviders() {
+		e, cred := wbOf(p)
+		if e == nil || e.intl || cred == nil || cred.AccessToken == "" || cred.EnterpriseID != "" {
+			continue
+		}
+		if !wbCheckedInToday(cred, now) {
 			already, err := s.wbCheckin(p)
 			entry := LogEntry{Level: "info", Kind: kindCheckin, ProviderID: p.ID,
 				Message: fmt.Sprintf("WorkBuddy %s 自动签到：%s", p.Name,
@@ -277,10 +293,10 @@ func (s *Server) wbCheckinLoop() {
 				entry.Detail = err.Error()
 			}
 			s.logFail(entry)
-			if _, uerr := s.wbUserResource(p); uerr != nil {
-				s.logFail(LogEntry{Level: "warn", Kind: kindCheckin, ProviderID: p.ID,
-					Message: fmt.Sprintf("WorkBuddy %s 签到后余额刷新失败", p.Name), Detail: uerr.Error()})
-			}
+		}
+		if _, uerr := s.wbUserResource(p); uerr != nil {
+			s.logFail(LogEntry{Level: "warn", Kind: kindCheckin, ProviderID: p.ID,
+				Message: fmt.Sprintf("WorkBuddy %s 余额刷新失败", p.Name), Detail: uerr.Error()})
 		}
 	}
 }

@@ -323,7 +323,7 @@ func main() {
 	if !store.HasAPIKeys() && s.apiToken == "" {
 		log.Println("提示：未配置任何 API Key，代理入口不鉴权；可在后台 Keys 页生成")
 	}
-	go s.wbCheckinLoop() // WorkBuddy 国内版个人账号：每天 09:00/21:00 自动签到 + 余额快照
+	go s.wbCheckinLoop() // WorkBuddy 国内版个人账号：每天 09:00 自动签到 + 余额快照（当天已签过则只刷余额）
 	log.Printf("LLM Router %s 已启动：管理后台 http://%s | 代理入口 /v1/chat/completions /v1/responses /v1/models", appVersion, *addr)
 	log.Fatal(http.ListenAndServe(*addr, s.routes()))
 }

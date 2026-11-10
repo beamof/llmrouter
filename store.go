@@ -61,6 +61,7 @@ type WorkBuddyCred struct {
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`         // accessToken 过期时刻，nil = 未知
 	RefreshExpiresAt *time.Time `json:"refresh_expires_at,omitempty"` // refreshToken 过期时刻，nil = 未知
 	Usage            *WBUsage   `json:"usage,omitempty"`              // 最近一次余额快照（签到/查询时更新）
+	LastCheckinDay   string     `json:"last_checkin_day,omitempty"`   // 最近一次签到成功的本地日期（2006-01-02），当天不再重复签到
 }
 
 // expires 取 accessToken 过期时刻（nil 安全）
@@ -507,6 +508,22 @@ func (s *Store) UpdateWBUsage(providerID string, u *WBUsage) bool {
 	}
 	cp := *p.WB
 	cp.Usage = u
+	p.WB = &cp
+	s.save()
+	return true
+}
+
+// UpdateWBCheckinDay 记录当天已签到（本地日期 2006-01-02），同日不再重复签到。
+// 与 UpdateWBUsage 同样从当前凭证复制后仅改这一个字段，不覆盖并发写入的新 token。
+func (s *Store) UpdateWBCheckinDay(providerID, day string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.WB == nil {
+		return false
+	}
+	cp := *p.WB
+	cp.LastCheckinDay = day
 	p.WB = &cp
 	s.save()
 	return true

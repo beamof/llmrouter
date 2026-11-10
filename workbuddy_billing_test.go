@@ -84,6 +84,65 @@ func TestWBCheckinSemantics(t *testing.T) {
 	}
 }
 
+// 当天已签过（手动签过或重启后重跑）不再请求签到接口，只刷新余额快照
+func TestWBCheckinRoundSkipsSameDayRepeat(t *testing.T) {
+	up, hits := wbBillingUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":0,"data":{}}`)
+	}, `{"code":0,"data":{}}`, `{"code":0,"data":{}}`)
+	s, _ := newTestServer(t)
+	p, _ := addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
+	now := time.Now()
+	s.wbCheckinRound(now)
+	s.wbCheckinRound(now) // 同日重跑：已签过，只刷余额
+	if got := (*hits)["daily-checkin"].Load(); got != 1 {
+		t.Fatalf("当天应只签到一次，实际 %d 次", got)
+	}
+	if got := (*hits)["get-user-resource"].Load(); got != 2 {
+		t.Fatalf("每轮都应刷新余额，实际 %d 次", got)
+	}
+	if st, _ := s.store.Provider(p.ID); st.WB.LastCheckinDay != wbCheckinDay(now) {
+		t.Fatalf("签到日期应随凭证落盘，得到 %q", st.WB.LastCheckinDay)
+	}
+}
+
+// 签到失败不记当天已签，下一轮继续重试
+func TestWBCheckinRoundRetriesAfterFailure(t *testing.T) {
+	up, hits := wbBillingUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		fmt.Fprint(w, `{"code":10001,"msg":"企业账号不支持该操作"}`)
+	}, `{"code":0,"data":{}}`, `{"code":0,"data":{}}`)
+	s, _ := newTestServer(t)
+	p, _ := addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
+	now := time.Now()
+	s.wbCheckinRound(now)
+	s.wbCheckinRound(now)
+	if got := (*hits)["daily-checkin"].Load(); got != 2 {
+		t.Fatalf("签到失败应留到下一个时点重试，实际 %d 次", got)
+	}
+	if st, _ := s.store.Provider(p.ID); st.WB.LastCheckinDay != "" {
+		t.Fatalf("失败不应记录签到日期，得到 %q", st.WB.LastCheckinDay)
+	}
+}
+
+// 上游回「今天已签到」（如官方客户端已签）同样算当天已签，同日重跑不再请求
+func TestWBCheckinRoundHonorsUpstreamAlready(t *testing.T) {
+	up, hits := wbBillingUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		fmt.Fprint(w, `{"code":10001,"msg":"今天已签到，请明天再来"}`)
+	}, `{"code":0,"data":{}}`, `{"code":0,"data":{}}`)
+	s, _ := newTestServer(t)
+	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
+	now := time.Now()
+	s.wbCheckinRound(now)
+	s.wbCheckinRound(now)
+	if got := (*hits)["daily-checkin"].Load(); got != 1 {
+		t.Fatalf("上游幂等命中后当天不应再请求签到，实际 %d 次", got)
+	}
+}
+
 func TestWBPersonalUsageAggregation(t *testing.T) {
 	// 周期口径优先、缺周期回退总剩余、负值截零、缺总额不凑 total（对齐 ccLoad 实测口径）
 	mixed := `{"code":0,"data":{"Response":{"Data":{"Accounts":[
@@ -246,10 +305,10 @@ func TestWBNextCheckinAt(t *testing.T) {
 	cases := []struct {
 		now, want time.Time
 	}{
-		{day(6, 0), day(9, 0)},
-		{day(9, 0), day(21, 0)},                   // 9 点整已到，等 21 点
-		{day(12, 30), day(21, 0)},                 //
-		{day(21, 0), day(9, 0).AddDate(0, 0, 1)},  // 21 点整已到，等明天 9 点
+		{day(6, 0), day(9, 0)},                    // 未到 9 点：今天 9 点
+		{day(9, 0), day(9, 0).AddDate(0, 0, 1)},   // 9 点整已到：明天 9 点
+		{day(12, 30), day(9, 0).AddDate(0, 0, 1)}, //
+		{day(21, 0), day(9, 0).AddDate(0, 0, 1)},  // 每天只有 9 点一个时点
 		{day(23, 59), day(9, 0).AddDate(0, 0, 1)}, //
 	}
 	for _, c := range cases {
