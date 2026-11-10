@@ -46,15 +46,17 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 参数 | 环境变量 | 默认 | 说明 |
 |---|---|---|---|
 | `-addr` | `LLMROUTER_ADDR` | `127.0.0.1:8080` | 监听地址 |
-| `-data` | `LLMROUTER_DATA` | `data.json` | 状态文件路径 |
+| `-data` | `LLMROUTER_DATA` | `data.json` | 状态文件路径；用量/会话统计/日志写入同目录的 `data.json.usage` |
 | `-admin-token` | `LLMROUTER_ADMIN_TOKEN` | 空 | 后台令牌；空则后台不鉴权（仅建议本机使用） |
 | `-api-token` | `LLMROUTER_API_TOKEN` | 空 | 额外的固定代理令牌（始终有效，与 Keys 页互不影响） |
 | `-trust-proxy` | `LLMROUTER_TRUST_PROXY` | 关 | 部署在反向代理之后时开启：按 `X-Forwarded-For` 判定来源 IP。默认只取 TCP 对端，避免客户端伪造头绕过失败计数 |
-| `-version` | — | — | 打印当前版本号后退出（发布版为 tag，如 `v0.18.0`；源码构建为 `dev`） |
+| `-version` | — | — | 打印当前版本号后退出（发布版为 tag；源码构建为 `dev`） |
+
+状态文件分两层：`data.json` 只存配置（Provider/模型/路由组/Key/设置），变更同步落盘；高频的用量、会话统计与日志写入 `data.json.usage`，默认按 2 秒窗口合并落盘，进程收到 SIGINT/SIGTERM 或执行自动升级前会强制 flush。崩溃最多丢失最近 2 秒的用量，配置永不延迟。
 
 ## 版本检测与自动升级
 
-发布流水线用 `-X main.appVersion=vX.Y.Z` 把 tag 注入二进制；后台「设置 → 常规 → 版本与更新」据此比对 GitHub 最新 Release：
+发布流水线用 `-X llmrouter/internal/app.appVersion=vX.Y.Z` 把 tag 注入二进制；后台「设置 → 常规 → 版本与更新」据此比对 GitHub 最新 Release：
 
 - **检测更新**：读取 [GitHub Release](https://github.com/beamof/llmrouter/releases) 的最新版本与发布说明。未认证的 GitHub API 有 60 次/小时限制，检测结果缓存 5 分钟，点按钮可强制刷新
 - **立即升级**：下载与当前平台匹配的发布资产（`llmrouter-{windows,linux}-{x86_64,arm64}`），用 Release 附带的 `SHA256SUMS.txt` 校验 SHA256，通过后替换当前可执行文件并按**原命令行参数**重启
@@ -175,31 +177,56 @@ WorkBuddy、Zed 与 Command Code 三个适配器遵循同一套骨架：**Provid
 
 ### 总体约定
 
-- **单包平铺、零外部依赖**：所有代码在 `package main`，新适配器做成 `xxx.go` 前缀的平铺文件（参照 `workbuddy*.go` / `zed*.go`），不建子包
-- **内部中间形态是 chat/completions**：两种客户端协议（chat / responses）与任意上游线协议之间的转换都经过 chat 中间形态，转换器按「chat ↔ 上游线协议」成对编写，避免 N×M 组合爆炸。已有可复用资产：`wbResponsesToChat`（responses 请求 → chat）、`wbRespStream`（chat 分片 → responses 事件流）、`wbAgg`（chat 分片 → 聚合对象）、`zedconv.go` 的四个转换器（chat ↔ Responses 线协议、chat ↔ Anthropic 线协议）
+- **零外部依赖、按领域分包**：根包只保留启动入口（`main.go`），其余代码在 `internal/` 下按职责分层：
+
+  ```
+  internal/domain              实体类型、协议/日志常量（零依赖）
+  internal/store               JSON 持久化、CRUD、用量、日志、容量
+  internal/wire                chat 中间形态：usage/SSE/聚合器/协议转换
+  internal/session             会话粘性绑定
+  internal/auth                API Key 与后台令牌鉴权（含防爆破）
+  internal/httpx               统一 JSON 响应/解码
+  internal/upstream            Adapter 契约、Registry、标准适配器、客户端工厂
+  internal/upstream/workbuddy  WorkBuddy / CodeBuddy 适配器
+  internal/upstream/zed        Zed 适配器
+  internal/upstream/commandcode Command Code 适配器
+  internal/app                 HTTP 编排：代理入口、后台 API、自升级
+  ```
+
+  新适配器只需在 `internal/upstream/<name>/` 新建包并实现 `upstream.Adapter`，在 `internal/app` 注册；候选循环不再出现按 `Kind` 的分支。
+- **内部中间形态是 chat/completions**：两种客户端协议（chat / responses）与任意上游线协议之间的转换都经过 chat 中间形态，转换器按「chat ↔ 上游线协议」成对编写，避免 N×M 组合爆炸。已有可复用资产：`wire.ResponsesToChat`（responses 请求 → chat）、`wire.ResponsesStream`（chat 分片 → responses 事件流）、`wire.Aggregator`（chat 分片 → 聚合对象）、`internal/upstream/zed/conv.go` 的四个转换器（chat ↔ Responses 线协议、chat ↔ Anthropic 线协议）
 - **会话粘性、优先级、故障转移、每日/并行上限、用量记账对适配器免费**：这些都作用在模型条目层，适配器只需按契约（见下）处理单个候选
 
 ### 接入清单（七步）
 
 | # | 改动 | 位置 | 参照 |
 |---|---|---|---|
-| 1 | `Provider` 增加 `Kind` 值与凭证字段（如 `Zed *ZedCred`），过期时刻用 `*time.Time`（`omitempty` 对零值 time 不生效） | `store.go` | `WorkBuddyCred` / `ZedCred` |
-| 2 | 凭证读写方法：`UpdateXxxAuth`（**换指针拷贝**回写，绝不原地改字段——`Candidate` 里的 Provider 是浅拷贝，共享指针会产生数据竞争）与 `ProviderByXxx`（按账号唯一键去重，重复导入/登录原地更新） | `store.go` | `UpdateWBAuth` / `ProviderByZedUser` |
-| 3 | Kind 校验：`handleProviderUpsert` 的 switch 加分支；**基址固定为官方端点、不接受自定义**（凭证随请求发出，允许改基址等于允许把凭证发往任意主机）；校验凭证字段存在（编辑时勿丢） | `admin.go` | workbuddy / zed 分支 |
-| 4 | `Server` 增加该类型的单飞锁表（`xxMu` + `xxLocks map[string]*sync.Mutex`，键 = provider ID）与登录会话表（浏览器授权流程才需要），`main.go` 注册 `/api/...` 路由与 admin handler；`handleProviderDelete` 里调用 `xxForgetProvider` 清锁 | `main.go` / `admin.go` / 适配器文件 | `zedMu` / `zedLogins` / `zedForgetProvider` |
-| 5 | 凭证获取入口：登录（浏览器授权/回环回调/粘贴兜底）、扫描本机客户端、或粘贴导入；成功后 `UpsertProvider` + 同步模型条目（**只增不删**，不覆盖用户调整过的优先级/上限） | 适配器文件 | `zedlogin.go` / `workbuddyscan.go` |
-| 6 | 代理候选循环加分流分支（紧跟 `wbOf` / `zedOf` 判定处）：命中即调用 `s.xxAttempt(...)`，签名对齐 `wbAttempt`；`candidateSupportsProtocol` 声明该类型能否承接 `/v1/responses` | `proxy.go` | zed 分支 |
-| 7 | 适配器本体 `xxAttempt`：按下面的契约实现 | 适配器文件 | `workbuddy.go` / `zedwire.go` |
+| 1 | `Provider` 增加 `Kind` 值与凭证字段（如 `Zed *ZedCred`），过期时刻用 `*time.Time`（`omitempty` 对零值 time 不生效） | `internal/domain/types.go` | `WorkBuddyCred` / `ZedCred` |
+| 2 | 凭证读写方法：`UpdateXxxAuth`（**换指针拷贝**回写，绝不原地改字段——`Candidate` 里的 Provider 是浅拷贝，共享指针会产生数据竞争）与 `ProviderByXxx`（按账号唯一键去重） | `internal/store/` | `UpdateWBAuth` / `ProviderByZedUser` |
+| 3 | 实现 `ValidateProvider`：**基址固定为官方端点、不接受自定义**（凭证随请求发出，允许改基址等于允许把凭证发往任意主机），并校验凭证字段存在 | 适配器包 | 三类适配器的 `ValidateProvider` |
+| 4 | 适配器自身持有 per-provider 单飞锁、目录缓存与登录会话（不再放进 `Server`） | 适配器包 | `workbuddy.Adapter` / `zed.Adapter` |
+| 5 | 凭证获取入口：登录（浏览器授权/回环回调/粘贴兜底）、扫描本机客户端、或粘贴导入；成功后 `UpsertProvider` + 同步模型条目（**只增不删**） | 适配器包 | `zed/login.go` / `workbuddy/scan.go` |
+| 6 | 在 `internal/app` 的 `registry()` 里 `Register(adapter)`；`Kinds()` 声明接管的 Kind，`CanServe()` 声明协议能力——候选循环无需改动 | `internal/app/runtime.go` | `registry()` |
+| 7 | 适配器本体 `Attempt`：按下面的契约实现 | 适配器包 | `workbuddy` / `zed` / `commandcode` |
 
-### `xxAttempt` 契约
+### `Attempt` 契约
 
+```go
+func (a *Adapter) Attempt(att *upstream.Attempt) error
+
+type Attempt struct {
+	Writer    http.ResponseWriter
+	Request   *http.Request
+	Candidate domain.Candidate
+	Body      []byte
+	KeyID     string
+	Protocol  domain.Protocol
+	Timing    *upstream.Timing
+	Usage     *domain.CallSample
+}
 ```
-func (s *Server) xxAttempt(w http.ResponseWriter, r *http.Request,
-	c Candidate, sendBody []byte, keyID string,
-	responsesMode bool, tm *requestTiming, sm *usageSample) error
-```
 
-1. **名额与日志**：入口 `defer s.store.Release(c.Model.ID)`（名额在 `TryAcquire` 已占）；失败路径用 `s.logFail(LogEntry{...})` 记日志后返回 `error`，候选循环会换下一候选并汇总失败原因——不要自己写响应给客户端（返回错误即可）
+1. **名额与日志**：入口 `defer a.rt.Store.Release(att.Candidate.Model.ID)`（名额在 `TryAcquire` 已占）；失败路径用 `a.rt.Logf(domain.LogEntry{...})` 记日志后返回 `error`，候选循环会换下一候选并汇总失败原因——不要自己写响应给客户端（返回错误即可）
 2. **凭证生命周期**：
    - 懒刷新：距过期不足窗口（WorkBuddy 5 分钟 / Zed 2 分钟）时刷新一次，**失败不阻断**，沿用旧 token 继续发请求
    - 强制刷新：请求被上游判定凭据失效（如 401）时强制刷新并**原候选重试一次**，用 `refreshed` 标志防循环；刷新也失败则报「请重新登录/导入」

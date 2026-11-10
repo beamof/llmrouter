@@ -1,0 +1,31 @@
+package workbuddy
+
+// WorkBuddy 计费测试：签到幂等语义、个人资源包聚合、企业积分、handler 分流
+//（国内/国际/企业）、余额快照落盘与自动签到时点计算。
+
+import (
+	"testing"
+	"time"
+)
+
+// wbBillingUpstream 起一个带计费端点的伪造上游：checkin 控制签到行为，personal /
+// enterprise 分别是两个余额端点的响应；返回各端点命中计数。
+
+func TestWBNextCheckinAt(t *testing.T) {
+	loc := time.FixedZone("t", 8*3600)
+	day := func(h, m int) time.Time { return time.Date(2026, 11, 8, h, m, 0, 0, loc) }
+	cases := []struct {
+		now, want time.Time
+	}{
+		{day(6, 0), day(9, 0)},                    // 未到 9 点：今天 9 点
+		{day(9, 0), day(9, 0).AddDate(0, 0, 1)},   // 9 点整已到：明天 9 点
+		{day(12, 30), day(9, 0).AddDate(0, 0, 1)}, //
+		{day(21, 0), day(9, 0).AddDate(0, 0, 1)},  // 每天只有 9 点一个时点
+		{day(23, 59), day(9, 0).AddDate(0, 0, 1)}, //
+	}
+	for _, c := range cases {
+		if got := wbNextCheckinAt(c.now); !got.Equal(c.want) {
+			t.Fatalf("wbNextCheckinAt(%v) = %v, want %v", c.now, got, c.want)
+		}
+	}
+}

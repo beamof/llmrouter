@@ -1,5 +1,7 @@
 data.json
 data.json.tmp
+data.json.usage
+data.json.usage.tmp
 *.exe
 *.exe~
 .zcode/

@@ -45,7 +45,7 @@ jobs:
           VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           out="llmrouter-${{ matrix.suffix }}"
-          go build -trimpath -ldflags "-s -w -X main.appVersion=$VERSION" -o "$out" .
+          go build -trimpath -ldflags "-s -w -X llmrouter/internal/app.appVersion=$VERSION" -o "$out" .
           ls -lh "$out"
 
       - uses: actions/upload-artifact@v4
