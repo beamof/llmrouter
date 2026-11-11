@@ -335,6 +335,17 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	names := s.store.ModelNames()
+	// modelItem 一条对外模型：组名与真实模型名形状一致。声明过上下文窗口时同时输出
+	// context_length（OpenRouter 口径）与 max_model_len（vLLM 口径），认识哪个的客户端
+	// 都能读到；未声明的条目不带这两个字段，客户端回退到自身默认值。
+	modelItem := func(name string) map[string]any {
+		item := map[string]any{"id": name, "object": "model", "owned_by": "llmrouter"}
+		if n := s.store.ContextLength(name); n > 0 {
+			item["context_length"] = n
+			item["max_model_len"] = n
+		}
+		return item
+	}
 	data := []map[string]any{}
 	seen := map[string]bool{}
 	for _, g := range s.store.GroupsList() { // 路由组名始终可见
@@ -342,14 +353,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[g.Name] = true
-		data = append(data, map[string]any{"id": g.Name, "object": "model", "owned_by": "llmrouter"})
+		data = append(data, modelItem(g.Name))
 	}
 	for _, n := range names {
 		if seen[n] { // 已有同名路由组时避免重复
 			continue
 		}
 		seen[n] = true
-		data = append(data, map[string]any{"id": n, "object": "model", "owned_by": "llmrouter"})
+		data = append(data, modelItem(n))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }

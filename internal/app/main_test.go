@@ -316,6 +316,96 @@ func TestModelsList(t *testing.T) {
 	}
 }
 
+// /v1/models 的上下文声明：真实模型名用自身值，路由组名取成员最小值，
+// 未声明（0）的条目不带这两个字段。
+func TestModelsListContextLength(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer up.Close()
+
+	s, app := newTestServer(t)
+	mBig := addProviderModel(t, s, up.URL, "big", func(m *Model) { m.ContextLength = 200000 })
+	addProviderModel(t, s, up.URL, "small", func(m *Model) { m.ContextLength = 64000 })
+	mUnknown := addProviderModel(t, s, up.URL, "unknown", nil) // 未声明上下文
+
+	items := func() map[string]map[string]any {
+		t.Helper()
+		r, err := app.Client().Get(app.URL + "/v1/models")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		var v struct {
+			Data []map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(b, &v); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]map[string]any{}
+		for _, d := range v.Data {
+			out[d["id"].(string)] = d
+		}
+		return out
+	}
+	num := func(m map[string]any, k string) (int64, bool) {
+		f, ok := m[k].(float64)
+		return int64(f), ok
+	}
+
+	// 组名 auto：成员 big/small/unknown → 取已声明的最小值 64000
+	got := items()["auto"]
+	for _, k := range []string{"context_length", "max_model_len"} {
+		if n, ok := num(got, k); !ok || n != 64000 {
+			t.Errorf("auto.%s = %v（ok=%v），want 64000", k, got[k], ok)
+		}
+	}
+
+	// 路由组的「上下文大小」手动配置优先于成员最小值，清空后回到成员最小值
+	g := s.store.GroupsList()[0]
+	setGroupCtx := func(n int64) {
+		t.Helper()
+		body := fmt.Sprintf(`{"name":%q,"note":%q,"context_length":%d}`, g.Name, g.Note, n)
+		req, _ := http.NewRequest(http.MethodPut, app.URL+"/api/groups/"+g.ID, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("更新路由组失败: %d", resp.StatusCode)
+		}
+	}
+	setGroupCtx(32000)
+	if n, _ := num(items()["auto"], "context_length"); n != 32000 {
+		t.Errorf("组配置应覆盖成员最小值，got %d", n)
+	}
+	setGroupCtx(0)
+	if n, _ := num(items()["auto"], "context_length"); n != 64000 {
+		t.Errorf("清空组配置后应回落到成员最小值 64000，got %d", n)
+	}
+
+	// 暴露真实模型名：各用自己的值；未声明的不输出这两个字段
+	if resp, body := postJSON(t, app, "/api/models/"+mBig.ID+"/expose", `{"expose":true}`); resp.StatusCode != 200 {
+		t.Fatalf("设置 expose 失败: %d %s", resp.StatusCode, body)
+	}
+	if resp, body := postJSON(t, app, "/api/models/"+mUnknown.ID+"/expose", `{"expose":true}`); resp.StatusCode != 200 {
+		t.Fatalf("设置 expose 失败: %d %s", resp.StatusCode, body)
+	}
+	all := items()
+	if n, ok := num(all["big"], "context_length"); !ok || n != 200000 {
+		t.Errorf("big.context_length = %v，want 200000", all["big"]["context_length"])
+	}
+	if n, ok := num(all["big"], "max_model_len"); !ok || n != 200000 {
+		t.Errorf("big.max_model_len = %v，want 200000", all["big"]["max_model_len"])
+	}
+	for _, k := range []string{"context_length", "max_model_len"} {
+		if v, ok := all["unknown"][k]; ok {
+			t.Errorf("未声明的模型不应输出 %s，got %v", k, v)
+		}
+	}
+}
+
 func TestAutoModel(t *testing.T) {
 	var gotA, gotB string
 	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

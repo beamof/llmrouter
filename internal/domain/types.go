@@ -23,6 +23,10 @@ type RouteGroup struct {
 	Name    string        `json:"name"`           // 对外模型名，客户端请求体 model 填这个名字
 	Note    string        `json:"note,omitempty"` // 备注，仅后台展示
 	Members []GroupMember `json:"members"`        // 成员模型及组内优先级
+	// ContextLength 组外上下文窗口（tokens）的手动覆盖，0 = 自动取成员中已声明的最小值。
+	// 只用于 /v1/models 对外声明（context_length / max_model_len），不参与路由。
+	// 有些场景需要报小一些（给输出留余量）或报成员里最小值以外的值。
+	ContextLength int64 `json:"context_length,omitempty"`
 }
 
 // Provider 一个上游服务商
@@ -147,6 +151,9 @@ type Model struct {
 	DailyLimit    int64        `json:"daily_limit"`    // 每日 token 上限，0 = 不限（全局共享）
 	MaxConcurrent int          `json:"max_concurrent"` // 最大并行请求数，0 = 不限；全局共享
 	Mutes         []MuteWindow `json:"mutes,omitempty"`
+	// ContextLength 上下文窗口（tokens），0 = 未声明。仅用于 /v1/models 向客户端
+	// 声明（同时输出 context_length 与 max_model_len），不参与路由，也不改变透传行为。
+	ContextLength int64 `json:"context_length,omitempty"`
 
 	// Expose 该模型名是否出现在 /v1/models 列表里。
 	Expose bool `json:"expose,omitempty"`

@@ -141,29 +141,31 @@ func (s *Server) handleGroupDetachModel(w http.ResponseWriter, r *http.Request) 
 // handleGroupCreate 新建路由组：组名即对外虚拟模型名，请求该名字时只在组内选路
 func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name string `json:"name"`
-		Note string `json:"note"`
+		Name          string `json:"name"`
+		Note          string `json:"note"`
+		ContextLength int64  `json:"context_length"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	if _, err := s.store.AddGroup(req.Name, req.Note); err != nil {
+	if _, err := s.store.AddGroup(req.Name, req.Note, req.ContextLength); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	s.replyState(w, r)
 }
 
-// handleGroupUpdate 重命名路由组 / 修改备注
+// handleGroupUpdate 重命名路由组 / 修改备注 / 改上下文声明
 func (s *Server) handleGroupUpdate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name string `json:"name"`
-		Note string `json:"note"`
+		Name          string `json:"name"`
+		Note          string `json:"note"`
+		ContextLength int64  `json:"context_length"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	if _, err := s.store.UpdateGroup(r.PathValue("id"), req.Name, req.Note); err != nil {
+	if _, err := s.store.UpdateGroup(r.PathValue("id"), req.Name, req.Note, req.ContextLength); err != nil {
 		status := http.StatusBadRequest
 		if _, ok := s.store.GroupByID(r.PathValue("id")); !ok {
 			status = http.StatusNotFound

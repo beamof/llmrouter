@@ -1140,7 +1140,7 @@ func (s *Store) DefaultGroupID() string {
 }
 
 // AddGroup 新建路由组，名字在组间必须唯一。
-func (s *Store) AddGroup(name, note string) (RouteGroup, error) {
+func (s *Store) AddGroup(name, note string, contextLength int64) (RouteGroup, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return RouteGroup{}, fmt.Errorf("路由组名不能为空")
@@ -1155,14 +1155,14 @@ func (s *Store) AddGroup(name, note string) (RouteGroup, error) {
 			return RouteGroup{}, fmt.Errorf("路由组名 %q 已存在", name)
 		}
 	}
-	g := &RouteGroup{ID: s.newID("g"), Name: name, Note: strings.TrimSpace(note), Members: []GroupMember{}}
+	g := &RouteGroup{ID: s.newID("g"), Name: name, Note: strings.TrimSpace(note), Members: []GroupMember{}, ContextLength: max(contextLength, 0)}
 	s.Groups = append(s.Groups, g)
 	s.save()
 	return cloneGroup(g), nil
 }
 
-// UpdateGroup 重命名/改备注；名字同样在组间唯一。
-func (s *Store) UpdateGroup(id, name, note string) (RouteGroup, error) {
+// UpdateGroup 重命名/改备注/改上下文声明；名字同样在组间唯一。
+func (s *Store) UpdateGroup(id, name, note string, contextLength int64) (RouteGroup, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return RouteGroup{}, fmt.Errorf("路由组名不能为空")
@@ -1184,6 +1184,7 @@ func (s *Store) UpdateGroup(id, name, note string) (RouteGroup, error) {
 	}
 	target.Name = name
 	target.Note = strings.TrimSpace(note)
+	target.ContextLength = max(contextLength, 0)
 	if s.Groups[0] == target {
 		s.AutoModel = target.Name
 	}
@@ -1483,6 +1484,40 @@ func (s *Store) overLimit(m *Model, today string) bool {
 		}
 	}
 	return false
+}
+
+// ContextLength 对外模型名声明的上下文窗口（tokens），0 = 未声明。
+// 路由组：手动配置优先；未配置时取成员中已配置的最小值（保守，组内任一模型装不下
+// 就不虚报）。同名多条模型配置同样取最小值。调用方只在返回值 > 0 时输出该字段。
+func (s *Store) ContextLength(name string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	min := int64(0)
+	take := func(v int64) {
+		if v > 0 && (min == 0 || v < min) {
+			min = v
+		}
+	}
+	for _, g := range s.Groups { // 组名优先：同名时客户端请求的是组
+		if g.Name != name {
+			continue
+		}
+		if g.ContextLength > 0 {
+			return g.ContextLength
+		}
+		for _, mem := range g.Members {
+			if m := s.modelByIDLocked(mem.ModelID); m != nil {
+				take(m.ContextLength)
+			}
+		}
+		return min
+	}
+	for _, m := range s.Models {
+		if m.Name == name {
+			take(m.ContextLength)
+		}
+	}
+	return min
 }
 
 // ModelNames 去重后的对外模型名列表（仅统计开启了 Expose 的路由）

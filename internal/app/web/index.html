@@ -909,6 +909,9 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
     <div class="field"><label>并行上限</label>
       <div class="inline"><input id="m-concurrent" type="number" min="0" step="1" value="0" style="max-width:110px"><span class="hint">同时处理的最大请求数，0 = 不限；满了新请求自动走后续候选</span></div>
     </div>
+    <div class="field"><label>上下文大小</label>
+      <div class="inline"><input id="m-context" type="number" min="0" step="1000" value="0" style="max-width:130px"><span class="hint">tokens，0 = 不声明。仅用于 /v1/models 向客户端声明（context_length 与 max_model_len），不参与路由；路由组取成员最小值</span></div>
+    </div>
     <div class="field"><label>暴露</label>
       <div class="inline">
         <label class="switch"><input id="m-expose" type="checkbox"><i></i></label>
@@ -942,6 +945,9 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
     <div class="field"><label>组名 *</label><input id="g-name" class="mono" placeholder="例如 auto / coding / cheap" style="width:100%"></div>
     <p class="hint" style="margin:-2px 0 12px">组名就是客户端请求体里的 model 名：填它时只在本组模型里按优先级选路。</p>
     <div class="field"><label>备注</label><input id="g-note" placeholder="可选，如：日常编码 / 便宜模型" style="width:100%"></div>
+    <div class="field"><label>上下文大小</label>
+      <div class="inline"><input id="g-context" type="number" min="0" step="1000" value="0" style="max-width:130px"><span class="hint">tokens，0 = 自动取成员最小值。填了就以本组为准；只影响 /v1/models 的对外声明（context_length / max_model_len），不参与路由</span></div>
+    </div>
   </div>
   <div class="dlg-foot">
     <button class="btn" onclick="dlgGroup.close()">取消</button>
@@ -1744,6 +1750,18 @@ const groupModels = () => {
     .sort((a, b) => (b.priority - a.priority) || a.id.localeCompare(b.id));
 };
 
+// 当前组对外的上下文窗口（与服务端 /v1/models 口径一致）：组手动配置优先，
+// 否则取成员中已声明的最小值；0 = 未声明
+function groupContext() {
+  const g = activeGroupObj();
+  if (!g) return 0;
+  if (g.context_length > 0) return g.context_length;
+  return groupModels().reduce((acc, m) => {
+    const v = m.context_length || 0;
+    return v > 0 && (acc === 0 || v < acc) ? v : acc;
+  }, 0);
+}
+
 // 左侧路由组列表 + 当前组标题与操作
 function renderGroups() {
   const gs = S.groups || [];
@@ -1762,8 +1780,9 @@ function renderGroups() {
 
   $('group-title').textContent = cur ? cur.name : '—';
   $('group-default-badge').hidden = !cur || !gs.length || gs[0].id !== cur.id;
+  const ctx = groupContext();
   $('group-sub').innerHTML = cur
-    ? `对外模型名 <code class="mono">${esc(cur.name)}</code>${cur.note ? ' · ' + esc(cur.note) : ''}`
+    ? `对外模型名 <code class="mono">${esc(cur.name)}</code>${cur.note ? ' · ' + esc(cur.note) : ''}${ctx ? ` · 上下文 ${fmtTok(ctx)}${cur.context_length > 0 ? '（组配置）' : '（成员最小值）'}` : ''}`
     : '';
   $('group-actions').innerHTML = cur ? `
     <button class="btn mini" onclick="openGroup('${cur.id}')">组设置</button>
@@ -1963,6 +1982,7 @@ function editModel(id) {
   $('m-priority').value = curMem ? curMem.priority : ((groupModels()[0]?.priority || 0) + 1);
   $('m-limit').value = editingModel?.daily_limit ? editingModel.daily_limit / 10000 : 0;
   $('m-concurrent').value = editingModel?.max_concurrent || 0;
+  $('m-context').value = editingModel?.context_length || 0;
   $('m-expose').checked = !!editingModel?.expose;
   $('mutes').innerHTML = '';
   (editingModel?.mutes || []).forEach(w => addMuteRow(w.from, w.to));
@@ -2010,6 +2030,7 @@ async function saveModel() {
     priority: parseInt($('m-priority').value) || 0,
     daily_limit: Math.round((parseFloat($('m-limit').value) || 0) * 10000), // 界面单位：万 tokens
     max_concurrent: Math.max(0, parseInt($('m-concurrent').value) || 0),
+    context_length: Math.max(0, parseInt($('m-context').value) || 0),
     expose: $('m-expose').checked,
     mutes,
   };
@@ -2081,11 +2102,16 @@ function openGroup(id) {
   $('dlg-group-title').textContent = id ? '编辑路由组' : '新建路由组';
   $('g-name').value = editingGroup?.name || '';
   $('g-note').value = editingGroup?.note || '';
+  $('g-context').value = editingGroup?.context_length || 0;
   dlgGroup.showModal();
 }
 
 async function saveGroup() {
-  const body = {name: $('g-name').value.trim(), note: $('g-note').value.trim()};
+  const body = {
+    name: $('g-name').value.trim(),
+    note: $('g-note').value.trim(),
+    context_length: Math.max(0, parseInt($('g-context').value) || 0),
+  };
   if (!body.name) { alert('组名必填'); return; }
   try {
     S = await api(editingGroup ? 'PUT' : 'POST', editingGroup ? '/api/groups/' + editingGroup.id : '/api/groups', body);

@@ -106,11 +106,11 @@ func TestRouteGroupSharedModelMembership(t *testing.T) {
 	s, app := newTestServer(t)
 	p := &Provider{Name: "up", BaseURL: "http://up"}
 	s.store.UpsertProvider(p)
-	coding, err := s.store.AddGroup("coding", "")
+	coding, err := s.store.AddGroup("coding", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cheap, err := s.store.AddGroup("cheap", "")
+	cheap, err := s.store.AddGroup("cheap", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,8 +208,8 @@ func TestRouteGroupDeleteKeepsSharedModels(t *testing.T) {
 	s, app := newTestServer(t)
 	p := &Provider{Name: "up", BaseURL: "http://up"}
 	s.store.UpsertProvider(p)
-	g1, _ := s.store.AddGroup("g1", "")
-	g2, _ := s.store.AddGroup("g2", "")
+	g1, _ := s.store.AddGroup("g1", "", 0)
+	g2, _ := s.store.AddGroup("g2", "", 0)
 
 	shared := &Model{Name: "shared", ProviderID: p.ID, Priority: 1}
 	if err := s.store.UpsertModelInGroup(shared, g1.ID, 1); err != nil {
@@ -265,8 +265,8 @@ func TestRouteGroupRoutingUsesMemberPriority(t *testing.T) {
 	s.store.UpsertProvider(pA)
 	s.store.UpsertProvider(pB)
 	s.store.UpsertProvider(pS)
-	groupA, _ := s.store.AddGroup("group-a", "")
-	groupB, _ := s.store.AddGroup("group-b", "")
+	groupA, _ := s.store.AddGroup("group-a", "", 0)
+	groupB, _ := s.store.AddGroup("group-b", "", 0)
 
 	// shared 模型同时属于 A/B；在 A 组优先级低，在 B 组优先级高
 	shared := &Model{Name: "shared", ProviderID: pS.ID}
@@ -314,8 +314,8 @@ func TestRouteGroupRuntimeConfigShared(t *testing.T) {
 	s, _ := newTestServer(t)
 	p := &Provider{Name: "up", BaseURL: "http://up"}
 	s.store.UpsertProvider(p)
-	g1, _ := s.store.AddGroup("g1", "")
-	g2, _ := s.store.AddGroup("g2", "")
+	g1, _ := s.store.AddGroup("g1", "", 0)
+	g2, _ := s.store.AddGroup("g2", "", 0)
 	m := &Model{Name: "m", ProviderID: p.ID, MaxConcurrent: 1, DailyLimit: 100}
 	if err := s.store.UpsertModelInGroup(m, g1.ID, 1); err != nil {
 		t.Fatal(err)
@@ -351,7 +351,7 @@ func TestRouteGroupReorderPriority(t *testing.T) {
 	s, app := newTestServer(t)
 	p := &Provider{Name: "up", BaseURL: "http://up"}
 	s.store.UpsertProvider(p)
-	g, _ := s.store.AddGroup("g", "")
+	g, _ := s.store.AddGroup("g", "", 0)
 	m1 := &Model{Name: "same", ProviderID: p.ID}
 	m2 := &Model{Name: "same", ProviderID: p.ID}
 	if err := s.store.UpsertModelInGroup(m1, g.ID, 1); err != nil {
@@ -381,8 +381,8 @@ func TestRouteGroupAttachExistingModelAPI(t *testing.T) {
 	s, app := newTestServer(t)
 	p := &Provider{Name: "up", BaseURL: "http://up"}
 	s.store.UpsertProvider(p)
-	g1, _ := s.store.AddGroup("g1", "")
-	g2, _ := s.store.AddGroup("g2", "")
+	g1, _ := s.store.AddGroup("g1", "", 0)
+	g2, _ := s.store.AddGroup("g2", "", 0)
 	m := &Model{Name: "m", ProviderID: p.ID, DailyLimit: 500}
 	if err := s.store.UpsertModelInGroup(m, g1.ID, 3); err != nil {
 		t.Fatal(err)
