@@ -73,8 +73,12 @@ func (s *Server) handleProxy(suffix string) http.HandlerFunc {
 
 		// 会话绑定的候选排最前（不套用静音/上限规则），规则候选作为 fallback 池。
 		// 绑定键含接入协议：同一会话混用两种协议时各自绑定，避免因协议能力不同来回换模型。
+		// 未声明 X-Session-ID 时按客户端 IP + 源端口派生会话 ID，同一连接内的请求仍粘同一模型。
 		sessKey := ""
 		sid := r.Header.Get("X-Session-ID")
+		if sid == "" {
+			sid = derivedSessionID(r)
+		}
 		if sid != "" {
 			sessKey = sid + "\x00" + protocol + "\x00" + req.Model
 		}

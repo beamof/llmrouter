@@ -164,10 +164,12 @@ func TestDailyLimit(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", func(m *Model) { m.DailyLimit = 10 })
 
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+	// 未带会话头的请求会按客户端 IP + 端口派生会话并粘住绑定（绑定不套用上限），
+	// 这里用不同会话 ID 让每次请求都重新按规则评估。
+	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "X-Session-ID", "limit-1"); resp.StatusCode != 200 {
 		t.Fatalf("第一次应成功（10 tokens 未超限）, got %d", resp.StatusCode)
 	}
-	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`)
+	resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "X-Session-ID", "limit-2")
 	if resp.StatusCode != 404 || !strings.Contains(body, "每日上限") {
 		t.Fatalf("第二次应超 token 上限: %d %s", resp.StatusCode, body)
 	}
@@ -339,8 +341,9 @@ func TestAutoModel(t *testing.T) {
 	s.store.UpsertModel(&Model{Name: "model-b", ProviderID: pB.ID, Priority: 1})
 
 	// auto → 选优先级最高的 A；上游收到的 model 已替换为 model-a，其余字段原样
+	// 未带会话头的请求会自动派生会话并粘住绑定，这里每次用不同会话 ID 让规则重新生效。
 	reqBody := `{"model":"auto","messages":[{"role":"user","content":"hi"}],"temperature":0.5}`
-	if _, body := postJSON(t, app, "/v1/chat/completions", reqBody); body != `{"ok":"A"}` {
+	if _, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", reqBody, "X-Session-ID", "auto-1"); body != `{"ok":"A"}` {
 		t.Fatalf("auto 应选 A: %s", body)
 	}
 	if !strings.Contains(gotA, `"model":"model-a"`) {
@@ -354,7 +357,7 @@ func TestAutoModel(t *testing.T) {
 	now := time.Now()
 	mA.Mutes = []MuteWindow{{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")}}
 	s.store.UpsertModel(mA)
-	if _, body := postJSON(t, app, "/v1/chat/completions", reqBody); body != `{"ok":"B"}` {
+	if _, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", reqBody, "X-Session-ID", "auto-2"); body != `{"ok":"B"}` {
 		t.Fatalf("A 静音后 auto 应选 B: %s", body)
 	}
 	if !strings.Contains(gotB, `"model":"model-b"`) {

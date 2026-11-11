@@ -1397,7 +1397,7 @@ function renderHome() {
   renderDetail(rows);
 }
 
-// 活跃会话面板：带 X-Session-ID 的粘性绑定，TTL 内无请求自动解绑（仅内存，重启即清）
+// 活跃会话面板：粘性绑定（X-Session-ID，或按客户端 IP + 源端口自动派生），TTL 内无请求自动解绑（仅内存，重启即清）
 function renderSessions() {
   const head = $('sess-head'), body = $('sess-body');
   head.innerHTML = `<tr><th>会话 ID</th><th>Key</th><th>请求模型</th><th>绑定模型</th><th>思考</th><th>Provider</th>
@@ -1405,9 +1405,9 @@ function renderSessions() {
   const list = S.sessions || [];
   $('sess-sub').textContent = list.length
     ? `${list.length} 个会话 · 速度 = 输出 tokens / 生成耗时（流式从首字节算）· ${ttlLabel()}无请求自动解绑 · 过期会话可在下方「用量明细 → 按会话」查看`
-    : `客户端带 X-Session-ID 头的粘性会话 · ${ttlLabel()}无请求自动解绑 · 历史会话见下方「用量明细 → 按会话」`;
+    : `客户端带 X-Session-ID 头的粘性会话（未带时按客户端 IP + 源端口派生）· ${ttlLabel()}无请求自动解绑 · 历史会话见下方「用量明细 → 按会话」`;
   if (!list.length) {
-    body.innerHTML = `<tr><td colspan="11" class="empty">暂无活跃会话：客户端带 X-Session-ID 头请求成功后在此显示</td></tr>`;
+    body.innerHTML = `<tr><td colspan="11" class="empty">暂无活跃会话：请求成功后在此显示（带 X-Session-ID，或由客户端 IP + 源端口派生）</td></tr>`;
     return;
   }
   body.innerHTML = list.map(x => {

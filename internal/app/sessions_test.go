@@ -3,6 +3,8 @@ package app
 // 活跃会话列表（GET /api/sessions）：绑定、计数、auto 标记、排序与过期剔除。
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -349,6 +352,104 @@ func TestEndSession(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("缺 id 应 400, got %d", resp.StatusCode)
+	}
+}
+
+// 未带 X-Session-ID 时按客户端 IP + 源端口算 md5 派生会话 ID：同地址内粘同一绑定
+// （无视规则变化），不同源端口即不同会话，显式头仍然优先。
+func TestDerivedSessionFromRemoteAddr(t *testing.T) {
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"ok":"A"}`)
+	}))
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"ok":"B"}`)
+	}))
+	defer upA.Close()
+	defer upB.Close()
+
+	s, _ := newTestServer(t)
+	pA := &Provider{Name: "A", BaseURL: upA.URL}
+	pB := &Provider{Name: "B", BaseURL: upB.URL}
+	s.store.UpsertProvider(pA)
+	s.store.UpsertProvider(pB)
+	s.store.UpsertModel(&Model{Name: "m", ProviderID: pA.ID, Priority: 9})
+	s.store.UpsertModel(&Model{Name: "m", ProviderID: pB.ID, Priority: 1})
+	modelA := s.store.Models[0].ID
+
+	// 直接投递 routes，便于指定 RemoteAddr（httptest 客户端无法控制源端口）
+	h := s.routes()
+	call := func(addr, sid string) string {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+		req.RemoteAddr = addr
+		if sid != "" {
+			req.Header.Set("X-Session-ID", sid)
+		}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s 请求失败: %d %s", addr, rr.Code, rr.Body.String())
+		}
+		return rr.Body.String()
+	}
+
+	const addr = "10.7.0.5:41234"
+	wantID := md5ID(addr)
+
+	// 1) 首请求按规则选 A，并以派生 ID 绑定
+	if got := call(addr, ""); got != `{"ok":"A"}` {
+		t.Fatalf("首请求应走 A: %s", got)
+	}
+	list := s.activeSessions()
+	if len(list) != 1 || list[0].ID != wantID || list[0].ModelID != modelA || list[0].Requested != "m" {
+		t.Fatalf("应以 md5(%s) 建立会话: %#v", addr, list)
+	}
+
+	// 2) A 被静音：同地址仍走 A（绑定优先），换个源端口则按规则走 B
+	mA := s.store.Models[0]
+	now := time.Now()
+	mA.Mutes = []MuteWindow{{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")}}
+	s.store.UpsertModel(mA)
+	if got := call(addr, ""); got != `{"ok":"A"}` {
+		t.Fatalf("同源地址应粘在绑定 A: %s", got)
+	}
+	if got := call("10.7.0.5:41235", ""); got != `{"ok":"B"}` {
+		t.Fatalf("不同源端口应按规则走 B: %s", got)
+	}
+
+	// 3) 显式 X-Session-ID 优先，不再派生
+	if got := call("10.7.0.5:41236", "explicit-1"); got != `{"ok":"B"}` {
+		t.Fatalf("显式会话应按规则走 B: %s", got)
+	}
+	printed := map[string]bool{}
+	for _, x := range s.activeSessions() {
+		printed[x.ID] = true
+	}
+	if !printed["explicit-1"] || printed[md5ID("10.7.0.5:41236")] {
+		t.Fatalf("显式头应覆盖派生 ID: %#v", printed)
+	}
+}
+
+// md5ID 派生会话 ID 的期望值：md5(ip:port) 的十六进制。
+func md5ID(addr string) string {
+	sum := md5.Sum([]byte(addr))
+	return hex.EncodeToString(sum[:])
+}
+
+// 派生会话 ID 的取值：md5(ip:port) 的十六进制，源端口不同则不同，RemoteAddr 为空则不建会话。
+func TestDerivedSessionID(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.RemoteAddr = "10.7.0.5:41234"
+	if got, want := derivedSessionID(req), md5ID("10.7.0.5:41234"); got != want {
+		t.Fatalf("派生 ID 应为 md5(ip:port) = %s, got %s", want, got)
+	}
+	req.RemoteAddr = "10.7.0.5:41235"
+	if derivedSessionID(req) == md5ID("10.7.0.5:41234") {
+		t.Fatal("源端口不同应得到不同会话 ID")
+	}
+	req.RemoteAddr = ""
+	if got := derivedSessionID(req); got != "" {
+		t.Fatalf("RemoteAddr 为空应不派生会话, got %q", got)
 	}
 }
 
