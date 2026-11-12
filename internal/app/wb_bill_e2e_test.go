@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"llmrouter/internal/upstream/workbuddy"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,12 +22,17 @@ import (
 func wbBillingUpstream(t *testing.T, checkin func(w http.ResponseWriter), personal, enterprise string) (*httptest.Server, *map[string]*atomic.Int32) {
 	t.Helper()
 	hits := map[string]*atomic.Int32{
-		"daily-checkin": {}, "get-user-resource": {}, "get-enterprise-user-usage": {},
+		"daily-checkin": {}, "get-user-resource": {}, "get-enterprise-user-usage": {}, "refresh": {},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v2/billing/meter/daily-checkin", func(w http.ResponseWriter, r *http.Request) {
 		hits["daily-checkin"].Add(1)
 		checkin(w)
+	})
+	mux.HandleFunc("POST /v2/plugin/auth/token/refresh", func(w http.ResponseWriter, r *http.Request) {
+		hits["refresh"].Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":0,"data":{"accessToken":"at-new","refreshToken":"rt-new","expiresIn":3600}}`)
 	})
 	mux.HandleFunc("POST /v2/billing/meter/get-user-resource", func(w http.ResponseWriter, r *http.Request) {
 		hits["get-user-resource"].Add(1)
@@ -85,6 +91,35 @@ func TestWBCheckinSemantics(t *testing.T) {
 	}
 }
 
+// HTTP 层 500 但信封里没业务码（或不是 JSON）时不能当成功吞掉
+
+func TestWBCheckinBareHTTPErrorIsFailure(t *testing.T) {
+	for name, body := range map[string]string{
+		"JSON 缺 code": `{"message":"upstream panic"}`,
+		"HTML 风控页":    `<html><body>blocked</body></html>`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			up, _ := wbBillingUpstream(t, func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(500)
+				fmt.Fprint(w, body)
+			}, `{"code":0,"data":{}}`, `{"code":0,"data":{}}`)
+			s, _ := newTestServer(t)
+			p, _ := addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
+			already, err := s.wbAdapter().Checkin(*p)
+			if err == nil || already {
+				t.Fatalf("HTTP 500 应报错: already=%v err=%v", already, err)
+			}
+			if !strings.Contains(err.Error(), "HTTP 500") {
+				t.Fatalf("错误应带状态码: %v", err)
+			}
+			if st, _ := s.store.Provider(p.ID); st.WB.LastCheckinDay != "" {
+				t.Fatalf("失败不应记录签到日期，得到 %q", st.WB.LastCheckinDay)
+			}
+		})
+	}
+}
+
 // 当天已签过（手动签过或重启后重跑）不再请求签到接口，只刷新余额快照
 
 func TestWBCheckinRoundSkipsSameDayRepeat(t *testing.T) {
@@ -103,14 +138,18 @@ func TestWBCheckinRoundSkipsSameDayRepeat(t *testing.T) {
 	if got := (*hits)["get-user-resource"].Load(); got != 2 {
 		t.Fatalf("每轮都应刷新余额，实际 %d 次", got)
 	}
-	if st, _ := s.store.Provider(p.ID); st.WB.LastCheckinDay != now.Format("2006-01-02") {
-		t.Fatalf("签到日期应随凭证落盘，得到 %q", st.WB.LastCheckinDay)
+	if st, _ := s.store.Provider(p.ID); st.WB.LastCheckinDay != workbuddy.CheckinDay(now) {
+		t.Fatalf("签到日期应按北京时间落盘，得到 %q", st.WB.LastCheckinDay)
 	}
 }
 
-// 签到失败不记当天已签，下一轮继续重试
+// 首次签到失败后一分钟只重试一次；再失败即结束，不连环重试
 
-func TestWBCheckinRoundRetriesAfterFailure(t *testing.T) {
+func TestWBCheckinRoundRetriesOnceAfterFailure(t *testing.T) {
+	old := workbuddy.CheckinRetryDelay
+	workbuddy.CheckinRetryDelay = 0 // 测试不等一分钟
+	t.Cleanup(func() { workbuddy.CheckinRetryDelay = old })
+
 	up, hits := wbBillingUpstream(t, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
@@ -120,12 +159,77 @@ func TestWBCheckinRoundRetriesAfterFailure(t *testing.T) {
 	p, _ := addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 	now := time.Now()
 	s.wbAdapter().CheckinRound(now)
-	s.wbAdapter().CheckinRound(now)
 	if got := (*hits)["daily-checkin"].Load(); got != 2 {
-		t.Fatalf("签到失败应留到下一个时点重试，实际 %d 次", got)
+		t.Fatalf("失败后应重试一次（共 2 次请求），实际 %d 次", got)
 	}
 	if st, _ := s.store.Provider(p.ID); st.WB.LastCheckinDay != "" {
 		t.Fatalf("失败不应记录签到日期，得到 %q", st.WB.LastCheckinDay)
+	}
+}
+
+// 首次失败、一分钟后重试成功：记为当天已签，同日不再请求签到接口
+
+func TestWBCheckinRoundRetrySucceeds(t *testing.T) {
+	old := workbuddy.CheckinRetryDelay
+	workbuddy.CheckinRetryDelay = 0
+	t.Cleanup(func() { workbuddy.CheckinRetryDelay = old })
+
+	var calls atomic.Int32
+	up, hits := wbBillingUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			w.WriteHeader(500)
+			fmt.Fprint(w, `{"code":10001,"msg":"服务繁忙"}`)
+			return
+		}
+		fmt.Fprint(w, `{"code":0,"data":{}}`)
+	}, `{"code":0,"data":{}}`, `{"code":0,"data":{}}`)
+	s, _ := newTestServer(t)
+	p, _ := addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
+	now := time.Now()
+	s.wbAdapter().CheckinRound(now)
+	if got := (*hits)["daily-checkin"].Load(); got != 2 {
+		t.Fatalf("首次 500 后应重试成功（共 2 次），实际 %d 次", got)
+	}
+	if st, _ := s.store.Provider(p.ID); st.WB.LastCheckinDay != workbuddy.CheckinDay(now) {
+		t.Fatalf("重试成功应记录签到日期，得到 %q", st.WB.LastCheckinDay)
+	}
+	s.wbAdapter().CheckinRound(now) // 同日再跑：已签过，不再请求签到
+	if got := (*hits)["daily-checkin"].Load(); got != 2 {
+		t.Fatalf("重试成功当天不应再签到，实际 %d 次", got)
+	}
+}
+
+// 签到遇 401/12153 时强制续期一次并重试（走手动签到同一条 checkin 路径）
+
+func TestWBCheckinRefreshExpiredTokenAndRetries(t *testing.T) {
+	var calls atomic.Int32
+	up, hits := wbBillingUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			w.WriteHeader(401)
+			fmt.Fprint(w, `{"code":12153,"msg":"token expired"}`)
+			return
+		}
+		fmt.Fprint(w, `{"code":0,"data":{}}`)
+	}, `{"code":0,"data":{}}`, `{"code":0,"data":{}}`)
+	s, _ := newTestServer(t)
+	p, _ := addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{
+		UID: "u", AccessToken: "at-old", RefreshToken: "rt-old",
+		ExpiresAt: workbuddy.TimePtr(time.Now().Add(time.Hour)),
+	})
+	already, err := s.wbAdapter().Checkin(*p)
+	if err != nil || already {
+		t.Fatalf("续期重试后应签到成功: already=%v err=%v", already, err)
+	}
+	if got := (*hits)["refresh"].Load(); got != 1 {
+		t.Fatalf("凭证失效应强制续期一次，实际 %d 次", got)
+	}
+	if got := (*hits)["daily-checkin"].Load(); got != 2 {
+		t.Fatalf("续期后应重试签到（共 2 次），实际 %d 次", got)
+	}
+	if st, _ := s.store.Provider(p.ID); st.WB == nil || st.WB.AccessToken != "at-new" {
+		t.Fatalf("续期结果应回写凭证: %#v", st.WB)
 	}
 }
 
@@ -259,6 +363,14 @@ func TestWBCheckinHandlerRouting(t *testing.T) {
 	}
 	if checkinHdr.Get("Authorization") != "Bearer at-1" || checkinHdr.Get("X-User-Id") != "uid-9" || checkinHdr.Get("X-Refresh-Token") != "" {
 		t.Fatalf("计费请求头不对: %v", checkinHdr)
+	}
+	// 计费请求也要带官方客户端来源指纹，否则容易被上游风控当成脚本
+	if checkinHdr.Get("User-Agent") != workbuddy.CLIUserAgent() ||
+		checkinHdr.Get("Origin") != "https://www.codebuddy.cn" ||
+		checkinHdr.Get("Referer") != "https://www.codebuddy.cn/" ||
+		checkinHdr.Get("X-Requested-With") != "XMLHttpRequest" ||
+		checkinHdr.Get("X-CodeBuddy-Request") != "1" {
+		t.Fatalf("计费请求应带官方客户端指纹: %v", checkinHdr)
 	}
 	if resourceBody["ProductCode"] != "p_tcaca" || resourceBody["PageNumber"] != float64(1) || resourceBody["PageSize"] != float64(100) {
 		t.Fatalf("余额请求筛选条件不对: %v", resourceBody)

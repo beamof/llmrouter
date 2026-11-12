@@ -16,8 +16,8 @@ package workbuddy
 //     user-usage（空 JSON）。credit=周期已用积分、limitNum=成员周期总额度，剩余 =
 //     max(0, limitNum-credit)，limitNum=-1 表示无限额度；积分保留小数，个人资源包
 //     的空 Accounts 不能当零余额。
-// 计费头族比对话/控制面更窄：鉴权 + 账号身份即可；refresh token 只允许出现在续期
-// 接口，签到/余额请求绝不携带。
+// 计费请求沿用控制面（续期/目录）的官方客户端来源指纹：上游对无 UA/Origin 的裸请求
+// 风控更严，计费前先补齐。refresh token 只允许出现在续期接口，签到/余额请求绝不携带。
 
 import (
 	"bytes"
@@ -27,6 +27,7 @@ import (
 	"io"
 	"llmrouter/internal/domain"
 	"math"
+	rand "math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -54,13 +55,10 @@ func (e *wbAPIError) Error() string {
 	return fmt.Sprintf("上游 HTTP %d（code %d）", e.Status, e.Code)
 }
 
-// wbBillingHeader 计费接口的请求头（比对话/控制面窄：鉴权 + 账号身份）
-func wbBillingHeader(cred *WorkBuddyCred) http.Header {
-	h := http.Header{}
-	h.Set("Accept", "application/json")
-	h.Set("Content-Type", "application/json")
-	wbAuthHeaders(h, cred)
-	return h
+// wbBillingHeader 计费接口的请求头：官方客户端来源指纹 + 鉴权/账号身份。
+// 与续期/目录共用控制面头族；refresh token 只出现在续期接口，这里不带。
+func wbBillingHeader(e *wbEdition, cred *WorkBuddyCred) http.Header {
+	return wbFrameworkHeader(e, cred)
 }
 
 // billingPost 发一个计费 POST 并解开 {code, msg, data} 信封；code 非 0 时返回
@@ -71,15 +69,19 @@ func (a *Adapter) billingPost(p Provider, path string, body []byte) (map[string]
 		return nil, fmt.Errorf("未导入 WorkBuddy 凭证")
 	}
 	if cred.RefreshToken != "" && wbTokenExpiring(cred.Expires()) {
-		if nc, err := a.refreshToken(p, false); err == nil {
+		if nc, rerr := a.refreshToken(p, false); rerr == nil {
 			cred = nc
+		} else {
+			// 不能静默：临期续期失败后仍会拿旧 token 发计费请求，上游多半回 401/5xx。
+			a.rt.Logf(LogEntry{Level: "warn", Kind: domain.KindUpstream, ProviderID: p.ID,
+				Message: "WorkBuddy token 临期续期失败（沿用现有 token）", Detail: rerr.Error()})
 		}
 	}
 	req, err := http.NewRequest(http.MethodPost, wbEndpoint(p)+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header = wbBillingHeader(cred)
+	req.Header = wbBillingHeader(e, cred)
 	cli, cerr := a.rt.Clients.For(p, 20*time.Second)
 	if cerr != nil {
 		return nil, cerr
@@ -97,12 +99,35 @@ func (a *Adapter) billingPost(p Provider, path string, body []byte) (map[string]
 		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(b, &v); err != nil {
-		return nil, fmt.Errorf("计费响应不是合法 JSON（HTTP %d）", resp.StatusCode)
+		// 非 JSON 响应（WAF/代理 HTML、空体）带上开头片段，便于区分风控页与上游故障。
+		if resp.StatusCode >= 400 {
+			return nil, &wbAPIError{Status: resp.StatusCode, Code: -1,
+				Msg: "非 JSON 响应: " + wbBodySnippet(b)}
+		}
+		return nil, fmt.Errorf("计费响应不是合法 JSON（HTTP %d）: %s", resp.StatusCode, wbBodySnippet(b))
+	}
+	// HTTP 层已报错但信封里没有可用的业务码（code 缺失或为 0）：不能当成功吞掉。
+	if resp.StatusCode >= 400 && (v.Code == nil || *v.Code == 0) {
+		msg := v.Msg
+		if msg == "" {
+			msg = v.Message
+		}
+		if msg == "" {
+			msg = wbBodySnippet(b)
+		}
+		code := int64(-1)
+		if v.Code != nil {
+			code = int64(*v.Code)
+		}
+		return nil, &wbAPIError{Status: resp.StatusCode, Code: code, Msg: msg}
 	}
 	if v.Code != nil && *v.Code != 0 {
 		msg := v.Msg
 		if msg == "" {
 			msg = v.Message
+		}
+		if msg == "" && resp.StatusCode >= 500 {
+			msg = wbBodySnippet(b)
 		}
 		return nil, &wbAPIError{Status: resp.StatusCode, Code: int64(*v.Code), Msg: msg}
 	}
@@ -113,10 +138,36 @@ func (a *Adapter) billingPost(p Provider, path string, body []byte) (map[string]
 	return map[string]any{}, nil
 }
 
+// wbBodySnippet 截取响应体开头，最多 300 个字符（按 rune 截断，不会切坏中文）。
+func wbBodySnippet(b []byte) string {
+	return fmt.Sprintf("%.300s", strings.TrimSpace(string(b)))
+}
+
 // checkin 国内版个人账号每日签到。already=true 表示当天已签过（幂等成功）。
 // 企业账号不走个人签到（上游拒绝），由调用方分流。
 // 成功与「上游说已签过」都会把当天记为已签到，当天后续时点不再请求签到接口。
+// 凭证失效（401 / 12153）时强制续期一次并重试，避免过期 token 让签到直接失败。
 func (a *Adapter) checkin(p Provider) (already bool, err error) {
+	already, err = a.checkinOnce(p)
+	if err == nil {
+		return already, nil
+	}
+	var ae *wbAPIError
+	if !errors.As(err, &ae) || !wbCheckinAuthError(ae) {
+		return already, err
+	}
+	if _, rerr := a.refreshToken(p, true); rerr != nil {
+		a.rt.Logf(LogEntry{Level: "warn", Kind: domain.KindCheckin, ProviderID: p.ID,
+			Message: "WorkBuddy 签到凭证失效，续期失败", Detail: rerr.Error()})
+		return already, err
+	}
+	a.rt.Logf(LogEntry{Level: "warn", Kind: domain.KindCheckin, ProviderID: p.ID,
+		Message: "WorkBuddy 签到凭证已失效，已自动续期并重试"})
+	return a.checkinOnce(p)
+}
+
+// checkinOnce 发一次签到请求并按上游文案判定幂等。
+func (a *Adapter) checkinOnce(p Provider) (already bool, err error) {
 	_, err = a.billingPost(p, "/v2/billing/meter/daily-checkin", []byte("{}"))
 	if err == nil {
 		a.rt.Store.UpdateWBCheckinDay(p.ID, checkinDay(time.Now()))
@@ -131,8 +182,13 @@ func (a *Adapter) checkin(p Provider) (already bool, err error) {
 	return false, err
 }
 
-// checkinDay 签到的日期口径（服务器本地时间的年月日）
-func checkinDay(now time.Time) string { return now.Format("2006-01-02") }
+// wbCheckinAuthError 签到响应是否属于「凭证失效」（需要强制续期后重试）。
+func wbCheckinAuthError(ae *wbAPIError) bool {
+	return ae != nil && (ae.Status == http.StatusUnauthorized || ae.Code == 12153)
+}
+
+// checkinDay 签到的日期口径：北京时间（WorkBuddy 按 UTC+8 计一天，不随服务器时区漂移）
+func checkinDay(now time.Time) string { return now.In(wbCheckinLoc).Format("2006-01-02") }
 
 // wbCheckedInToday 当天是否已签到成功（本地记录，用于跳过后面的签到时点）
 func wbCheckedInToday(cred *WorkBuddyCred, now time.Time) bool {
@@ -247,19 +303,65 @@ func (a *Adapter) enterpriseUsage(p Provider) (*WBUsage, error) {
 
 // ── 定时签到 ──────────────────────────────────────────────────────────────
 
-// checkinHour, checkinMinute 每日自动签到时点：每天 09:45 一次（服务器本地时间）
+// checkinHour, checkinMinute 每日自动签到基线时点：每天 09:45（北京时间）
 const checkinHour, checkinMinute = 9, 45
 
-// wbNextCheckinAt 下一个自动签到时点（本地时间 09:45；今天已过则取明天 09:45）
-func wbNextCheckinAt(now time.Time) time.Time {
-	t := time.Date(now.Year(), now.Month(), now.Day(), checkinHour, checkinMinute, 0, 0, now.Location())
-	if now.Before(t) {
-		return t
+// wbCheckinLoc 签到日与签到时刻的固定口径：北京时间（不随服务器时区漂移）
+var wbCheckinLoc = time.FixedZone("CST", 8*60*60)
+
+// 自动签到的时间参数。测试可置 0 关闭等待，生产默认值见下。
+var (
+	// CheckinJitterMax 每日时点的随机抖动上限；抖动按日期固定，同一天重启不会改变时点。
+	CheckinJitterMax = 15 * time.Minute
+	// CheckinRetryDelay 首次失败后到唯一一次重试之间的间隔。
+	CheckinRetryDelay = time.Minute
+	// CheckinAccountGapMin/Max 多账号之间的随机间隔，避免同一毫秒批量签到。
+	CheckinAccountGapMin = time.Minute
+	CheckinAccountGapMax = 3 * time.Minute
+)
+
+// wbDailyJitter 按北京日期生成的固定抖动：同一天内无论重启多少次，签到时刻都一样。
+func wbDailyJitter(day time.Time) time.Duration {
+	if CheckinJitterMax <= 0 {
+		return 0
 	}
-	return t.AddDate(0, 0, 1)
+	y, m, d := day.In(wbCheckinLoc).Date()
+	seed := uint64(y)<<32 | uint64(m)<<16 | uint64(d)
+	r := rand.New(rand.NewPCG(seed, 0x9e3779b97f4a7c15))
+	seconds := int64(CheckinJitterMax / time.Second)
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(r.Int64N(seconds+1)) * time.Second
 }
 
-// checkinLoop 后台定时签到：每天 09:45 跑一轮。
+// wbAccountGap 多账号签到之间的随机间隔。
+func wbAccountGap() time.Duration {
+	lo, hi := CheckinAccountGapMin, CheckinAccountGapMax
+	if lo < 0 {
+		lo = 0
+	}
+	if hi <= lo {
+		return lo
+	}
+	return lo + time.Duration(rand.Int64N(int64(hi-lo)))
+}
+
+// wbNextCheckinAt 下一个自动签到时点：北京时间 09:45 + 当日固定抖动；今天已过则取
+// 明天。返回值带北京时间时区，Sleep/Until 仍按绝对时刻计算。
+func wbNextCheckinAt(now time.Time) time.Time {
+	bj := now.In(wbCheckinLoc)
+	at := func(day time.Time) time.Time {
+		base := time.Date(day.Year(), day.Month(), day.Day(), checkinHour, checkinMinute, 0, 0, wbCheckinLoc)
+		return base.Add(wbDailyJitter(base))
+	}
+	if t := at(bj); bj.Before(t) {
+		return t
+	}
+	return at(bj.AddDate(0, 0, 1))
+}
+
+// checkinLoop 后台定时签到：每天 09:45（北京时间）+ 当日抖动跑一轮。
 func (a *Adapter) checkinLoop() {
 	for {
 		time.Sleep(time.Until(wbNextCheckinAt(time.Now())))
@@ -267,27 +369,65 @@ func (a *Adapter) checkinLoop() {
 	}
 }
 
+// wbCheckinOutcome 签到结果的展示文案。
+func wbCheckinOutcome(already bool) string {
+	if already {
+		return "今天已签到（幂等）"
+	}
+	return "签到成功"
+}
+
 // checkinRound 一轮签到：国内版个人账号（有凭证、非企业）签到并刷新余额快照。
 // 当天已签过的账号（如管理员手动签过）不再请求签到接口，只刷新余额快照。国际版
-// 不支持签到，企业账号由管理员手动查积分。失败只记日志，等次日再来。
+// 不支持签到，企业账号由管理员手动查积分。
+// 首次签到失败后等待 CheckinRetryDelay 重试一次；无论重试成败都到此为止（下一次是
+// 明天的定时任务），避免失败时对上游连环重试。多账号之间留随机间隔。
 func (a *Adapter) checkinRound(now time.Time) {
+	var failed []Provider
+	processed := 0
 	for _, p := range a.rt.Store.AllProviders() {
 		e, cred := wbOf(p)
 		if e == nil || e.intl || cred == nil || cred.AccessToken == "" || cred.EnterpriseID != "" {
 			continue
 		}
+		if processed > 0 {
+			time.Sleep(wbAccountGap())
+		}
+		processed++
 		if !wbCheckedInToday(cred, now) {
 			already, err := a.checkin(p)
 			entry := LogEntry{Level: "info", Kind: domain.KindCheckin, ProviderID: p.ID,
-				Message: fmt.Sprintf("WorkBuddy %s 自动签到：%s", p.Name,
-					map[bool]string{true: "今天已签到（幂等）", false: "签到成功"}[already])}
+				Message: fmt.Sprintf("WorkBuddy %s 自动签到：%s", p.Name, wbCheckinOutcome(already))}
 			if err != nil {
-				entry.Level, entry.Message = "warn",
-					fmt.Sprintf("WorkBuddy %s 自动签到失败", p.Name)
+				entry.Level = "warn"
+				entry.Message = fmt.Sprintf("WorkBuddy %s 自动签到失败（稍后重试一次）", p.Name)
 				entry.Detail = err.Error()
+				failed = append(failed, p)
 			}
 			a.rt.Logf(entry)
 		}
+		if _, uerr := a.userResource(p); uerr != nil {
+			a.rt.Logf(LogEntry{Level: "warn", Kind: domain.KindCheckin, ProviderID: p.ID,
+				Message: fmt.Sprintf("WorkBuddy %s 余额刷新失败", p.Name), Detail: uerr.Error()})
+		}
+	}
+	if len(failed) == 0 {
+		return
+	}
+	// 唯一一次重试：等一分钟再试；无论成败都不再重试。
+	if CheckinRetryDelay > 0 {
+		time.Sleep(CheckinRetryDelay)
+	}
+	for _, p := range failed {
+		already, err := a.checkin(p)
+		if err != nil {
+			a.rt.Logf(LogEntry{Level: "warn", Kind: domain.KindCheckin, ProviderID: p.ID,
+				Message: fmt.Sprintf("WorkBuddy %s 自动签到重试失败（今天不再尝试）", p.Name),
+				Detail:  err.Error()})
+			continue
+		}
+		a.rt.Logf(LogEntry{Level: "info", Kind: domain.KindCheckin, ProviderID: p.ID,
+			Message: fmt.Sprintf("WorkBuddy %s 自动签到重试成功：%s", p.Name, wbCheckinOutcome(already))})
 		if _, uerr := a.userResource(p); uerr != nil {
 			a.rt.Logf(LogEntry{Level: "warn", Kind: domain.KindCheckin, ProviderID: p.ID,
 				Message: fmt.Sprintf("WorkBuddy %s 余额刷新失败", p.Name), Detail: uerr.Error()})

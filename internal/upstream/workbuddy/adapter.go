@@ -136,6 +136,9 @@ func (a *Adapter) CheckinLoop() { a.checkinLoop() }
 // CheckinRound 执行一轮签到/余额刷新（测试可直接调用）。
 func (a *Adapter) CheckinRound(now time.Time) { a.checkinRound(now) }
 
+// CheckinDay 签到日口径（北京时间 2006-01-02），供测试与诊断。
+func CheckinDay(now time.Time) string { return checkinDay(now) }
+
 // Edition 地区身份（对外只读视图）。
 type Edition = wbEdition
 
