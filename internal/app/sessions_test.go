@@ -355,8 +355,8 @@ func TestEndSession(t *testing.T) {
 	}
 }
 
-// 未带 X-Session-ID 时按客户端 IP + 源端口算 md5 派生会话 ID：同地址内粘同一绑定
-// （无视规则变化），不同源端口即不同会话，显式头仍然优先。
+// 未带 X-Session-ID 时按客户端 IP 算 UUID v3 派生会话 ID：同一 IP 内粘同一绑定
+// （无视规则变化与源端口），不同 IP 即不同会话，显式头仍然优先。
 func TestDerivedSessionFromRemoteAddr(t *testing.T) {
 	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"ok":"A"}`)
@@ -394,7 +394,7 @@ func TestDerivedSessionFromRemoteAddr(t *testing.T) {
 	}
 
 	const addr = "10.7.0.5:41234"
-	wantID := md5ID(addr)
+	wantID := uuidForIP("10.7.0.5")
 
 	// 1) 首请求按规则选 A，并以派生 ID 绑定
 	if got := call(addr, ""); got != `{"ok":"A"}` {
@@ -402,10 +402,10 @@ func TestDerivedSessionFromRemoteAddr(t *testing.T) {
 	}
 	list := s.activeSessions()
 	if len(list) != 1 || list[0].ID != wantID || list[0].ModelID != modelA || list[0].Requested != "m" {
-		t.Fatalf("应以 md5(%s) 建立会话: %#v", addr, list)
+		t.Fatalf("应以 UUIDv3(10.7.0.5) 建立会话: %#v", list)
 	}
 
-	// 2) A 被静音：同地址仍走 A（绑定优先），换个源端口则按规则走 B
+	// 2) A 被静音：同 IP 仍走 A（绑定优先，源端口变化不影响），换个 IP 则按规则走 B
 	mA := s.store.Models[0]
 	now := time.Now()
 	mA.Mutes = []MuteWindow{{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")}}
@@ -413,39 +413,63 @@ func TestDerivedSessionFromRemoteAddr(t *testing.T) {
 	if got := call(addr, ""); got != `{"ok":"A"}` {
 		t.Fatalf("同源地址应粘在绑定 A: %s", got)
 	}
-	if got := call("10.7.0.5:41235", ""); got != `{"ok":"B"}` {
-		t.Fatalf("不同源端口应按规则走 B: %s", got)
+	if got := call("10.7.0.5:41235", ""); got != `{"ok":"A"}` {
+		t.Fatalf("同 IP 换源端口应仍粘在绑定 A: %s", got)
+	}
+	if got := call("10.7.0.6:41234", ""); got != `{"ok":"B"}` {
+		t.Fatalf("不同 IP 应按规则走 B: %s", got)
 	}
 
 	// 3) 显式 X-Session-ID 优先，不再派生
-	if got := call("10.7.0.5:41236", "explicit-1"); got != `{"ok":"B"}` {
+	if got := call("10.7.0.9:41236", "explicit-1"); got != `{"ok":"B"}` {
 		t.Fatalf("显式会话应按规则走 B: %s", got)
 	}
 	printed := map[string]bool{}
 	for _, x := range s.activeSessions() {
 		printed[x.ID] = true
 	}
-	if !printed["explicit-1"] || printed[md5ID("10.7.0.5:41236")] {
+	if !printed["explicit-1"] || printed[uuidForIP("10.7.0.9")] {
 		t.Fatalf("显式头应覆盖派生 ID: %#v", printed)
 	}
 }
 
-// md5ID 派生会话 ID 的期望值：md5(ip:port) 的十六进制。
-func md5ID(addr string) string {
-	sum := md5.Sum([]byte(addr))
-	return hex.EncodeToString(sum[:])
+// uuidForIP 派生会话 ID 的期望值：UUID v3（md5(IP)），与 derivedSessionID 同算法。
+func uuidForIP(ip string) string {
+	sum := md5.Sum([]byte(ip))
+	sum[6] = (sum[6] & 0x0f) | 0x30
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	s := hex.EncodeToString(sum[:])
+	return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
 }
 
-// 派生会话 ID 的取值：md5(ip:port) 的十六进制，源端口不同则不同，RemoteAddr 为空则不建会话。
+// 派生会话 ID 的取值：UUID v3（md5(IP)），同 IP 不论源端口都相同，不同 IP 不同，
+// IPv6 只取方括号内的 IP 部分，RemoteAddr 为空则不建会话。
 func TestDerivedSessionID(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	req.RemoteAddr = "10.7.0.5:41234"
-	if got, want := derivedSessionID(req), md5ID("10.7.0.5:41234"); got != want {
-		t.Fatalf("派生 ID 应为 md5(ip:port) = %s, got %s", want, got)
+	if got, want := derivedSessionID(req), uuidForIP("10.7.0.5"); got != want {
+		t.Fatalf("派生 ID 应为 UUIDv3(IP) = %s, got %s", want, got)
 	}
+	// 同 IP、不同源端口：同一固定 UUID
 	req.RemoteAddr = "10.7.0.5:41235"
-	if derivedSessionID(req) == md5ID("10.7.0.5:41234") {
-		t.Fatal("源端口不同应得到不同会话 ID")
+	if got := derivedSessionID(req); got != uuidForIP("10.7.0.5") {
+		t.Fatalf("同 IP 换源端口应得到同一会话 ID, got %q", got)
+	}
+	// 不同 IP：不同 UUID
+	req.RemoteAddr = "10.7.0.6:41234"
+	if got := derivedSessionID(req); got == uuidForIP("10.7.0.5") {
+		t.Fatal("不同 IP 应得到不同会话 ID")
+	}
+	// IPv6：只取方括号内的 IP 部分
+	req.RemoteAddr = "[2409:8a55:33d0:b100:1202:b5ff:fe86:54]:41234"
+	if got, want := derivedSessionID(req), uuidForIP("2409:8a55:33d0:b100:1202:b5ff:fe86:54"); got != want {
+		t.Fatalf("IPv6 派生 ID 应为 UUIDv3(IP) = %s, got %s", want, got)
+	}
+	// UUID 格式：36 字符，8-4-4-4-12，版本位为 3，变体位为 8/9/a/b
+	id := uuidForIP("10.7.0.5")
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[14] != '3' || id[18] != '-' || id[23] != '-' ||
+		(id[19] != '8' && id[19] != '9' && id[19] != 'a' && id[19] != 'b') {
+		t.Fatalf("派生 ID 应为 UUID 格式（版本 3）, got %q", id)
 	}
 	req.RemoteAddr = ""
 	if got := derivedSessionID(req); got != "" {
