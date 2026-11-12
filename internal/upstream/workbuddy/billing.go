@@ -247,19 +247,19 @@ func (a *Adapter) enterpriseUsage(p Provider) (*WBUsage, error) {
 
 // ── 定时签到 ──────────────────────────────────────────────────────────────
 
-// checkinHour 每日自动签到时点：每天 09:00 一次（服务器本地时间）
-const checkinHour = 9
+// checkinHour, checkinMinute 每日自动签到时点：每天 09:45 一次（服务器本地时间）
+const checkinHour, checkinMinute = 9, 45
 
-// wbNextCheckinAt 下一个自动签到时点（本地时间 09:00；今天已过则取明天 09:00）
+// wbNextCheckinAt 下一个自动签到时点（本地时间 09:45；今天已过则取明天 09:45）
 func wbNextCheckinAt(now time.Time) time.Time {
-	t := time.Date(now.Year(), now.Month(), now.Day(), checkinHour, 0, 0, 0, now.Location())
+	t := time.Date(now.Year(), now.Month(), now.Day(), checkinHour, checkinMinute, 0, 0, now.Location())
 	if now.Before(t) {
 		return t
 	}
 	return t.AddDate(0, 0, 1)
 }
 
-// checkinLoop 后台定时签到：每天 09:00 跑一轮。
+// checkinLoop 后台定时签到：每天 09:45 跑一轮。
 func (a *Adapter) checkinLoop() {
 	for {
 		time.Sleep(time.Until(wbNextCheckinAt(time.Now())))

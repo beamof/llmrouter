@@ -17,11 +17,12 @@ func TestWBNextCheckinAt(t *testing.T) {
 	cases := []struct {
 		now, want time.Time
 	}{
-		{day(6, 0), day(9, 0)},                    // 未到 9 点：今天 9 点
-		{day(9, 0), day(9, 0).AddDate(0, 0, 1)},   // 9 点整已到：明天 9 点
-		{day(12, 30), day(9, 0).AddDate(0, 0, 1)}, //
-		{day(21, 0), day(9, 0).AddDate(0, 0, 1)},  // 每天只有 9 点一个时点
-		{day(23, 59), day(9, 0).AddDate(0, 0, 1)}, //
+		{day(6, 0), day(9, 45)},                    // 未到 9:45：今天 9:45
+		{day(9, 45), day(9, 45).AddDate(0, 0, 1)},  // 9:45 整已到：明天 9:45
+		{day(9, 44), day(9, 45)},                   // 差一分钟仍取今天
+		{day(12, 30), day(9, 45).AddDate(0, 0, 1)}, //
+		{day(21, 0), day(9, 45).AddDate(0, 0, 1)},  // 每天只有 9:45 一个时点
+		{day(23, 59), day(9, 45).AddDate(0, 0, 1)}, //
 	}
 	for _, c := range cases {
 		if got := wbNextCheckinAt(c.now); !got.Equal(c.want) {
