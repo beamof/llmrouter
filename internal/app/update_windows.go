@@ -3,9 +3,32 @@
 package app
 
 import (
+	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
 )
+
+// prepareUpdateRestart 复制自身到临时目录并启动升级助手：
+// Windows 不允许改动运行中的 exe，轮换必须等主进程退出后由助手完成。
+func prepareUpdateRestart(newPath, exe string) error {
+	helper, err := copySelfToTemp()
+	if err != nil {
+		return err
+	}
+	args := append([]string{updateHelperArg, strconv.Itoa(os.Getpid()), newPath, exe}, os.Args[1:]...)
+	cmd := exec.Command(helper, args...)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	detachCommand(cmd)
+	if err := cmd.Start(); err != nil {
+		os.Remove(helper)
+		return err
+	}
+	return nil
+}
+
+// finishUpdateRestart 退出主进程，把轮换与重启交给已就位的升级助手。
+func finishUpdateRestart(_, _ string) { os.Exit(0) }
 
 // detachCommand 让新进程独立于当前控制台进程组：
 // 升级助手/重启后的服务不会随原进程的 Ctrl+C 一起退出，但仍沿用同一控制台输出日志。

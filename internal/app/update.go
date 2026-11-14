@@ -6,9 +6,15 @@ package app
 // 升级：下载当前平台对应的发布资产，用 Release 附带的 SHA256SUMS.txt 校验，
 // 替换正在运行的二进制，并按原命令行参数重启。
 //
-// 替换运行中的可执行文件不能由自己完成（Windows 下运行中的 exe 无法改名或覆盖），
-// 所以先把当前二进制复制一份到临时目录，用副本当「升级助手」：等主进程退出后
-// 轮换文件、启动新版本。助手是旧版本的代码，即使新版本有问题也能完成替换。
+// 替换策略按平台区分（prepareUpdateRestart / finishUpdateRestart）：
+//
+//   - Unix：运行中的可执行文件允许被改名，直接在本进程内轮换文件，然后用
+//     exec 换成新版本，同一 PID 继续运行。systemd（Type=simple）视角服务从未
+//     停止；绝不能退出主进程再让子进程接力——主进程一退出，整个 cgroup 里的
+//     剩余进程会被 systemd 清理，升级直接中断且服务不会重启。
+//   - Windows：运行中的 exe 无法改名或覆盖，先把当前二进制复制一份到临时目录，
+//     用副本当「升级助手」：等主进程退出后轮换文件、启动新版本。助手是旧版本
+//     的代码，即使新版本有问题也能完成替换。
 
 import (
 	"context"
@@ -356,22 +362,10 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusInternalServerError, "定位当前可执行文件失败: "+err.Error())
 		return
 	}
-	helper, err := copySelfToTemp()
-	if err != nil {
-		os.Remove(newPath)
-		fail(http.StatusInternalServerError, "准备升级助手失败: "+err.Error())
-		return
-	}
-
 	s.store.Flush() // 升级会替换并退出进程，先把热数据写盘
-	args := append([]string{updateHelperArg, strconv.Itoa(os.Getpid()), newPath, exe}, os.Args[1:]...)
-	cmd := exec.Command(helper, args...)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	detachCommand(cmd)
-	if err := cmd.Start(); err != nil {
+	if err := prepareUpdateRestart(newPath, exe); err != nil {
 		os.Remove(newPath)
-		os.Remove(helper)
-		fail(http.StatusInternalServerError, "启动升级助手失败: "+err.Error())
+		fail(http.StatusInternalServerError, "准备升级失败: "+err.Error())
 		return
 	}
 
@@ -388,7 +382,7 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush() // 先把响应发出去，再退出进程
 	}
-	time.AfterFunc(700*time.Millisecond, func() { os.Exit(0) })
+	time.AfterFunc(700*time.Millisecond, func() { finishUpdateRestart(newPath, exe) })
 }
 
 // executablePath 返回当前可执行文件的真实绝对路径（跟随符号链接，避免替换到链接本身）。
