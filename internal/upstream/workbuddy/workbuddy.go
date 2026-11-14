@@ -1617,7 +1617,7 @@ func (a *Adapter) attempt(w http.ResponseWriter, r *http.Request, c Candidate, s
 		}
 		eb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		class, ferr := a.failResponse(c, keyID, resp.StatusCode, eb)
+		class, ferr := a.failResponse(c, keyID, resp.StatusCode, resp.Header, eb)
 		if class != wbErrTokenExpired {
 			return ferr
 		}
@@ -1729,8 +1729,9 @@ func wbCopyRespHeaders(w http.ResponseWriter, h http.Header, stream bool) {
 }
 
 // failResponse 分类上游错误并做相应处置（限流静音/日志），返回分类与给候选循环的错误。
+// 错误携带原始状态码/响应头/响应体，直连模型请求会原样透传给客户端。
 // 调用方据分类决定是否续期重试（wbErrTokenExpired）。
-func (a *Adapter) failResponse(c Candidate, keyID string, status int, body []byte) (wbErrClass, error) {
+func (a *Adapter) failResponse(c Candidate, keyID string, status int, header http.Header, body []byte) (wbErrClass, error) {
 	class, code, msg, resetAt := wbClassify(status, body)
 	switch class {
 	case wbErrQuota:
@@ -1748,7 +1749,7 @@ func (a *Adapter) failResponse(c Candidate, keyID string, status int, body []byt
 	case wbErrContentBlocked:
 		a.rt.Logf(LogEntry{Level: "warn", Kind: domain.KindUpstream, Status: status, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
-			Message: fmt.Sprintf("WorkBuddy 拒绝请求（code %d），已换下一候选", code), Detail: upstream.ErrSnippet(body)})
+			Message: fmt.Sprintf("WorkBuddy 拒绝请求（code %d）", code), Detail: upstream.ErrSnippet(body)})
 	case wbErrTokenExpired:
 		// 日志由调用方按「续期重试是否成功」决定级别，这里不记
 	default:
@@ -1756,5 +1757,19 @@ func (a *Adapter) failResponse(c Candidate, keyID string, status int, body []byt
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
 			Message: fmt.Sprintf("WorkBuddy 上游返回 HTTP %d", status), Detail: upstream.ErrSnippet(body)})
 	}
-	return class, fmt.Errorf("上游返回 %d: %s", status, msg)
+	clientStatus := status
+	if clientStatus < 400 || clientStatus > 599 {
+		clientStatus = http.StatusBadGateway // 200 里包着的错误信封不能按 200 回给客户端
+	}
+	out := body
+	if len(bytes.TrimSpace(out)) == 0 {
+		out, _ = json.Marshal(map[string]any{
+			"error": map[string]string{"message": msg, "type": "llmrouter_error"},
+		})
+	}
+	var h http.Header
+	if header != nil {
+		h = header.Clone()
+	}
+	return class, &upstream.StatusError{Status: clientStatus, Header: h, Body: out}
 }

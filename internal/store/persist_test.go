@@ -1,6 +1,8 @@
 package store
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -43,4 +45,41 @@ func TestAsyncHotWritesAndFlush(t *testing.T) {
 		t.Fatalf("会话用量不对: %#v", reloaded.SessionUsage[0])
 	}
 	_ = time.Second
+}
+
+// provider 名是直连模型对外名的前缀：加载旧数据与新建时都要规范化成
+// 非空、不含 "/"、全局唯一。
+func TestProviderNameNormalization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.json")
+	raw := `{
+		"providers": [
+			{"id":"p1","name":"","base_url":"http://a"},
+			{"id":"p2","name":"a/b","base_url":"http://b"},
+			{"id":"p3","name":"a-b","base_url":"http://c"}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"p1": "p1", "p2": "a-b", "p3": "a-b (2)"}
+	for id, name := range want {
+		p, ok := st.Provider(id)
+		if !ok {
+			t.Fatalf("缺少 provider %s", id)
+		}
+		if p.Name != name {
+			t.Errorf("provider %s 名 = %q, want %q", id, p.Name, name)
+		}
+	}
+
+	// 新建时重名自动追加序号
+	st.UpsertProvider(&domain.Provider{Name: "same", BaseURL: "http://d"})
+	st.UpsertProvider(&domain.Provider{Name: "same", BaseURL: "http://e"})
+	if got := st.Providers[len(st.Providers)-1].Name; got != "same (2)" {
+		t.Errorf("重名 provider 应自动加序号, got %q", got)
+	}
 }

@@ -427,7 +427,7 @@ func (a *Adapter) attempt(w http.ResponseWriter, r *http.Request, c Candidate, s
 				a.rt.Logf(LogEntry{Level: "error", Kind: domain.KindUpstream, Status: resp.StatusCode, KeyID: keyID,
 					ProviderID: c.Provider.ID, Model: c.Model.Name,
 					Message: "Zed 凭据被拒且重铸失败，请重新登录", Detail: rerr.Error()})
-				return fmt.Errorf("上游返回 HTTP %d: %s", resp.StatusCode, upstream.ErrSnippet(eb))
+				return &upstream.StatusError{Status: resp.StatusCode, Header: resp.Header.Clone(), Body: eb}
 			}
 			a.rt.Logf(LogEntry{Level: "warn", Kind: domain.KindUpstream, Status: resp.StatusCode, KeyID: keyID,
 				ProviderID: c.Provider.ID, Model: c.Model.Name,
@@ -442,12 +442,12 @@ func (a *Adapter) attempt(w http.ResponseWriter, r *http.Request, c Candidate, s
 				ProviderID: c.Provider.ID, Model: c.Model.Name,
 				Message: fmt.Sprintf("Zed 套餐不含该模型，已静音至 %s", until.Local().Format("01-02 15:04")),
 				Detail:  upstream.ErrSnippet(eb)})
-			return fmt.Errorf("上游返回 HTTP %d: %s", resp.StatusCode, upstream.ErrSnippet(eb))
+			return &upstream.StatusError{Status: resp.StatusCode, Header: resp.Header.Clone(), Body: eb}
 		}
 		a.rt.Logf(LogEntry{Level: "error", Kind: domain.KindUpstream, Status: resp.StatusCode, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
 			Message: fmt.Sprintf("Zed 上游返回 HTTP %d", resp.StatusCode), Detail: upstream.ErrSnippet(eb)})
-		return fmt.Errorf("上游返回 HTTP %d: %s", resp.StatusCode, upstream.ErrSnippet(eb))
+		return &upstream.StatusError{Status: resp.StatusCode, Header: resp.Header.Clone(), Body: eb}
 	}
 	defer resp.Body.Close()
 	// 首字节在翻译之前打点：上游发出的第一个 SSE 分片即算响应到达

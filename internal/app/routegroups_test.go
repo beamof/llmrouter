@@ -346,14 +346,14 @@ func TestRouteGroupRuntimeConfigShared(t *testing.T) {
 	}
 }
 
-// 组内重排只改该组成员优先级；直连优先级取各组成员优先级最大值。
+// 组内重排只改该组成员优先级；候选顺序跟随组内优先级。
 func TestRouteGroupReorderPriority(t *testing.T) {
 	s, app := newTestServer(t)
 	p := &Provider{Name: "up", BaseURL: "http://up"}
 	s.store.UpsertProvider(p)
 	g, _ := s.store.AddGroup("g", "", 0)
-	m1 := &Model{Name: "same", ProviderID: p.ID}
-	m2 := &Model{Name: "same", ProviderID: p.ID}
+	m1 := &Model{Name: "same-1", ProviderID: p.ID}
+	m2 := &Model{Name: "same-2", ProviderID: p.ID}
 	if err := s.store.UpsertModelInGroup(m1, g.ID, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -370,9 +370,9 @@ func TestRouteGroupReorderPriority(t *testing.T) {
 	if p, _ := groupMemberPriority(t, s.store, g.ID, m2.ID); p != 1 {
 		t.Errorf("m2 组内优先级 = %d, want 1", p)
 	}
-	cands := s.store.Candidates("same", time.Now())
+	cands, _ := s.store.GroupCandidatesDetailed(g.ID, time.Now())
 	if len(cands) != 2 || cands[0].Model.ID != m1.ID || cands[0].Model.Priority != 2 {
-		t.Errorf("直连候选排序应跟随成员优先级: %+v", cands)
+		t.Errorf("组内候选排序应跟随成员优先级: %+v", cands)
 	}
 }
 

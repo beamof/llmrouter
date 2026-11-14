@@ -68,7 +68,7 @@ func TestCommandCodeChatNonStream(t *testing.T) {
 	addCCProviderModel(t, s, "deepseek/deepseek-v4-pro")
 
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}],"max_tokens":500000,"stream":false}`)
+		`{"model":"cc/deepseek/deepseek-v4-pro","messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}],"max_tokens":500000,"stream":false}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
@@ -154,7 +154,7 @@ func TestCommandCodeChatStreaming(t *testing.T) {
 	addCCProviderModel(t, s, "m")
 
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+		`{"model":"cc/m","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
@@ -175,7 +175,7 @@ func TestCommandCodeResponses(t *testing.T) {
 	addCCProviderModel(t, s, "m")
 
 	// 非流式：responses 对象
-	resp, body := postJSON(t, app, "/v1/responses", `{"model":"m","input":"hi"}`)
+	resp, body := postJSON(t, app, "/v1/responses", `{"model":"cc/m","input":"hi"}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
@@ -184,7 +184,7 @@ func TestCommandCodeResponses(t *testing.T) {
 	}
 
 	// 流式：responses 事件流
-	resp, body = postJSON(t, app, "/v1/responses", `{"model":"m","input":"hi","stream":true}`)
+	resp, body = postJSON(t, app, "/v1/responses", `{"model":"cc/m","input":"hi","stream":true}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("stream status = %d, body = %s", resp.StatusCode, body)
 	}
@@ -205,7 +205,7 @@ func TestCommandCodeToolCall(t *testing.T) {
 	addCCProviderModel(t, s, "m")
 
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"m","messages":[{"role":"user","content":"read"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],"stream":false}`)
+		`{"model":"cc/m","messages":[{"role":"user","content":"read"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],"stream":false}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
@@ -224,14 +224,14 @@ func TestCommandCodeCutShort(t *testing.T) {
 
 	// 流式：已写出内容 → 补说明并收尾
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+		`{"model":"cc/m","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	if resp.StatusCode != 200 || !strings.Contains(body, "半句") || !strings.Contains(body, "cut short") || !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("截断流 = %d %s", resp.StatusCode, body)
 	}
 
 	// 非流式：尚未提交 → 502
 	resp, body = postJSON(t, app, "/v1/chat/completions",
-		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+		`{"model":"cc/m","messages":[{"role":"user","content":"hi"}],"stream":false}`)
 	if resp.StatusCode != 502 || !strings.Contains(body, "ended before it was complete") {
 		t.Errorf("截断非流式 = %d %s", resp.StatusCode, body)
 	}
@@ -245,9 +245,9 @@ func TestCommandCode429Mutes(t *testing.T) {
 	m := addCCProviderModel(t, s, "m")
 
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
-	if resp.StatusCode != 502 || !strings.Contains(body, "429") {
-		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+		`{"model":"cc/m","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != 429 || !strings.Contains(body, "RATE_LIMITED") {
+		t.Fatalf("应透传上游 429: status = %d, body = %s", resp.StatusCode, body)
 	}
 	got, _ := s.store.Model(m.ID)
 	if got.MutedUntil.IsZero() {

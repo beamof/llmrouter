@@ -137,7 +137,7 @@ func TestChatThroughHTTPProxy(t *testing.T) {
 	p := &Provider{Name: "m1-p", BaseURL: up.URL, APIKey: "sk-up", Proxy: proxy.URL}
 	s.store.UpsertProvider(p)
 	s.store.UpsertModel(&Model{Name: "m1", ProviderID: p.ID, Priority: 10})
-	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`)
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m1-p/m1","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("应 200，得到 %d: %s", resp.StatusCode, body)
 	}
@@ -150,9 +150,9 @@ func TestChatThroughHTTPProxy(t *testing.T) {
 	// provider 配置非法代理时 fail-closed：不直连上游，返回错误
 	p.Proxy = "http://" // 缺主机
 	s.store.UpsertProvider(p)
-	resp, body = postJSON(t, app, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`)
+	resp, body = postJSON(t, app, "/v1/chat/completions", `{"model":"m1-p/m1","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("非法代理应失败换候选最终 502，得到 %d: %s", resp.StatusCode, body)
+		t.Fatalf("非法代理应失败返回 502，得到 %d: %s", resp.StatusCode, body)
 	}
 	if n := upstreamHits.Load(); n != 1 {
 		t.Errorf("非法代理不应绕过代理直连上游（上游命中 %d 次）", n)

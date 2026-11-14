@@ -100,7 +100,7 @@ func TestWBChatHeadersAndBody(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "glm-5.0", cred)
 
 	resp, body := postJSON(t, app, "/v1/chat/completions", `{
-		"model":"glm-5.0","stream":true,"max_completion_tokens":1234,
+		"model":"wb-p/glm-5.0","stream":true,"max_completion_tokens":1234,
 		"tool_choice":{"type":"function","function":{"name":"fx"}},
 		"messages":[
 			{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":"https://x/y.png"}]},
@@ -232,7 +232,7 @@ func TestWBStreamBeatsFiltered(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"glm-5.0","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		`{"model":"wb-p/glm-5.0","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
 	}
@@ -271,7 +271,7 @@ func TestWBNonStreamAggregation(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"glm-5.0","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+		`{"model":"wb-p/glm-5.0","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
 	}
@@ -336,7 +336,7 @@ func TestWBRefreshOn401(t *testing.T) {
 		ExpiresAt: workbuddy.TimePtr(time.Now().Add(time.Hour)), // 未临期：懒刷新不触发，只有 401 强制刷新
 	})
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"glm-5.0","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		`{"model":"wb-p/glm-5.0","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("401 后应续期重试成功: %d %s", resp.StatusCode, body)
 	}
@@ -356,7 +356,7 @@ func TestWBRefreshOn401(t *testing.T) {
 	}
 }
 
-func TestWBRefreshInvalidFailsOver(t *testing.T) {
+func TestWBRefreshInvalidGroupFailover(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v2/plugin/auth/token/refresh":
@@ -370,7 +370,7 @@ func TestWBRefreshInvalidFailsOver(t *testing.T) {
 	}))
 	defer up.Close()
 	s, app := newTestServer(t)
-	// wb 候选失败后应落到普通候选
+	// 路由组内 wb 候选失败后应落到普通候选
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-old", RefreshToken: "rt-old"})
 	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -380,7 +380,7 @@ func TestWBRefreshInvalidFailsOver(t *testing.T) {
 	addProviderModel(t, s, fallback.URL, "glm-5.0", func(m *Model) { m.Priority = 1 })
 
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"glm-5.0","messages":[{"role":"user","content":"hi"}]}`)
+		`{"model":"auto","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != 200 || !strings.Contains(body, "备用") {
 		t.Fatalf("凭证失效应故障转移到下一候选: %d %s", resp.StatusCode, body)
 	}
@@ -397,9 +397,9 @@ func TestWB429MuteWithResetTime(t *testing.T) {
 	_, m := addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"glm-5.0","messages":[{"role":"user","content":"hi"}]}`)
-	if resp.StatusCode != 502 {
-		t.Fatalf("全候选失败应 502: %d %s", resp.StatusCode, body)
+		`{"model":"wb-p/glm-5.0","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != 429 {
+		t.Fatalf("直连应透传上游 429: %d %s", resp.StatusCode, body)
 	}
 	cur, _ := s.store.Model(m.ID)
 	if cur.MutedUntil.IsZero() {
@@ -409,11 +409,11 @@ func TestWB429MuteWithResetTime(t *testing.T) {
 	if d := time.Until(cur.MutedUntil) - time.Until(want); d < -time.Minute || d > time.Minute {
 		t.Fatalf("静音应到上游告知的恢复时刻: %v vs %v", cur.MutedUntil, want)
 	}
-	// 静音期间：无候选
+	// 静音期间：直连直接返回不可用
 	resp, body = postJSON(t, app, "/v1/chat/completions",
-		`{"model":"glm-5.0","messages":[{"role":"user","content":"hi"}]}`)
-	if resp.StatusCode != 404 {
-		t.Fatalf("静音期间应 404 无候选: %d %s", resp.StatusCode, body)
+		`{"model":"wb-p/glm-5.0","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != 429 || !strings.Contains(body, "不可用") {
+		t.Fatalf("静音期间应 429: %d %s", resp.StatusCode, body)
 	}
 }
 
@@ -425,7 +425,7 @@ func TestWBJSONEnvelopeOn200(t *testing.T) {
 	s, app := newTestServer(t)
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"glm-5.0","messages":[{"role":"user","content":"hi"}]}`)
+		`{"model":"wb-p/glm-5.0","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != 502 || !strings.Contains(body, "NonStreamNotSupported") {
 		t.Fatalf("200+JSON 错误信封应按失败处理: %d %s", resp.StatusCode, body)
 	}
@@ -581,7 +581,7 @@ func TestWBLazyRefreshNearExpiry(t *testing.T) {
 		ExpiresAt: workbuddy.TimePtr(time.Now().Add(2 * time.Minute)), // 临期窗口（<5min）内
 	})
 	resp, body := postJSON(t, app, "/v1/chat/completions",
-		`{"model":"glm-5.0","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		`{"model":"wb-p/glm-5.0","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("临期应自动续期后成功: %d %s", resp.StatusCode, body)
 	}
@@ -603,7 +603,7 @@ func TestWBSessionEffortRecorded(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "glm-5.0", cred)
 
 	postJSONWithHeader(t, app, "POST", "/v1/chat/completions",
-		`{"model":"glm-5.0","messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"wb-p/glm-5.0","messages":[{"role":"user","content":"hi"}]}`,
 		"X-Session-ID", "wb-eff")
 
 	sess := s.activeSessions()

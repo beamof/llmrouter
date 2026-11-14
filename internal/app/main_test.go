@@ -64,7 +64,7 @@ func TestPassthroughChat(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m1", nil)
 
-	reqBody := `{"model":"m1","messages":[{"role":"user","content":"hi 你好"}],"temperature":0.7,"stream":false}`
+	reqBody := `{"model":"m1-p/m1","messages":[{"role":"user","content":"hi 你好"}],"temperature":0.7,"stream":false}`
 	req, _ := http.NewRequest("POST", app.URL+"/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer client-secret")
@@ -82,8 +82,12 @@ func TestPassthroughChat(t *testing.T) {
 	if string(b) != respBody {
 		t.Errorf("响应被改动:\n got: %s\nwant: %s", b, respBody)
 	}
-	if gotBody != reqBody {
-		t.Errorf("请求体被改动:\n got: %s\nwant: %s", gotBody, reqBody)
+	// 直连请求会把 model 改写为上游模型名；其余字段的值保持不变（JSON 重新编码后键顺序可变）
+	if !strings.Contains(gotBody, `"model":"m1"`) {
+		t.Errorf("上游收到的 model 应改写为 m1: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `hi 你好`) || !strings.Contains(gotBody, `"temperature":0.7`) {
+		t.Errorf("其余字段应保留: %s", gotBody)
 	}
 	if gotAuth != "Bearer sk-up" {
 		t.Errorf("上游 Authorization = %q, 应为 provider 密钥", gotAuth)
@@ -103,7 +107,8 @@ func TestPassthroughChat(t *testing.T) {
 	}
 }
 
-func TestFailover(t *testing.T) {
+// 路由组内仍按优先级故障转移：A 500、N 404 → 最终落到 B。
+func TestRouteGroupFailover(t *testing.T) {
 	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		fmt.Fprint(w, `{"error":"A is down"}`)
@@ -130,14 +135,16 @@ func TestFailover(t *testing.T) {
 	s.store.UpsertModel(&Model{Name: "m", ProviderID: pN.ID, Priority: 5})
 	s.store.UpsertModel(&Model{Name: "m", ProviderID: pB.ID, Priority: 1})
 
-	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m","messages":[]}`)
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"auto","messages":[]}`)
 	if resp.StatusCode != 200 || body != `{"ok":"from-B"}` {
-		t.Fatalf("故障转移失败: %d %s", resp.StatusCode, body)
+		t.Fatalf("组内故障转移失败: %d %s", resp.StatusCode, body)
 	}
 }
 
-func TestFailoverAllFailed(t *testing.T) {
+// 直连模型失败不兜底：上游 400 的状态码与响应体原样回给客户端。
+func TestDirectUpstreamErrorPassthrough(t *testing.T) {
 	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
 		fmt.Fprint(w, `{"error":{"message":"max tokens too small"}}`)
 	}))
@@ -145,13 +152,15 @@ func TestFailoverAllFailed(t *testing.T) {
 
 	s, app := newTestServer(t)
 	addProviderModel(t, s, upA.URL, "m", nil)
-	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`)
-	if resp.StatusCode != 502 {
-		t.Fatalf("全部失败应 502: %d", resp.StatusCode)
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`)
+	if resp.StatusCode != 400 {
+		t.Fatalf("应透传上游 400, got %d %s", resp.StatusCode, body)
 	}
-	// 502 信息里应带上上游 400 与其错误内容
-	if !strings.Contains(body, "HTTP 400") || !strings.Contains(body, "max tokens too small") {
-		t.Errorf("失败信息应包含上游错误详情: %s", body)
+	if body != `{"error":{"message":"max tokens too small"}}` {
+		t.Errorf("响应体应原样透传: %s", body)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type 应透传: %q", ct)
 	}
 }
 
@@ -164,18 +173,18 @@ func TestDailyLimit(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", func(m *Model) { m.DailyLimit = 10 })
 
-	// 未带会话头的请求会按客户端 IP + 端口派生会话并粘住绑定（绑定不套用上限），
-	// 这里用不同会话 ID 让每次请求都重新按规则评估。
-	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "X-Session-ID", "limit-1"); resp.StatusCode != 200 {
+	// 未带会话头的请求会按客户端 IP + 端口派生会话并粘住绑定；
+	// 直连模型不受会话绑定影响，每次都会重新检查每日上限。
+	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m-p/m"}`, "X-Session-ID", "limit-1"); resp.StatusCode != 200 {
 		t.Fatalf("第一次应成功（10 tokens 未超限）, got %d", resp.StatusCode)
 	}
-	resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "X-Session-ID", "limit-2")
-	if resp.StatusCode != 404 || !strings.Contains(body, "每日上限") {
-		t.Fatalf("第二次应超 token 上限: %d %s", resp.StatusCode, body)
+	resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m-p/m"}`, "X-Session-ID", "limit-2")
+	if resp.StatusCode != 429 || !strings.Contains(body, "每日 token 上限") {
+		t.Fatalf("第二次应超 token 上限并返回 429: %d %s", resp.StatusCode, body)
 	}
 	// 上限不影响其他模型
 	addProviderModel(t, s, up.URL, "other", nil)
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"other"}`); resp.StatusCode != 200 {
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"other-p/other"}`); resp.StatusCode != 200 {
 		t.Fatalf("其他模型不应受影响, got %d", resp.StatusCode)
 	}
 }
@@ -191,12 +200,12 @@ func TestMuteTimeWindow(t *testing.T) {
 			{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")},
 		}
 	})
-	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 404 || !strings.Contains(body, "静音") {
-		t.Fatalf("静音时段内应被拒绝: %d %s", resp.StatusCode, body)
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 429 || !strings.Contains(body, "静音") {
+		t.Fatalf("静音时段内应返回 429: %d %s", resp.StatusCode, body)
 	}
 	m.Mutes = nil
 	s.store.UpsertModel(m)
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 200 {
 		t.Fatalf("解除静音后应成功, got %d", resp.StatusCode)
 	}
 }
@@ -223,7 +232,7 @@ func TestResponsesPathAndTrailingSlash(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL+"/", "r1", nil) // 故意带尾斜杠
 
-	req, _ := http.NewRequest("POST", app.URL+"/v1/responses?beta=true", strings.NewReader(`{"model":"r1","input":"hi"}`))
+	req, _ := http.NewRequest("POST", app.URL+"/v1/responses?beta=true", strings.NewReader(`{"model":"r1-p/r1","input":"hi"}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := app.Client().Do(req)
 	if err != nil {
@@ -250,7 +259,7 @@ func TestStreamPassthrough(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", nil)
 
-	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m","stream":true}`)
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m","stream":true}`)
 	if resp.StatusCode != 200 || !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		t.Fatalf("流式响应异常: %d %s", resp.StatusCode, body)
 	}
@@ -265,7 +274,7 @@ func TestModelsList(t *testing.T) {
 
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "zzz", nil)
-	addProviderModel(t, s, up.URL, "zzz", nil) // 同名去重
+	addProviderModel(t, s, up.URL, "zzz", nil) // provider 重名会被规范化成 "zzz-p (2)"，直连名仍唯一
 	mA := addProviderModel(t, s, up.URL, "aaa", nil)
 
 	if resp, _ := postJSON(t, app, "/v1/models", ""); resp.StatusCode != 405 { // POST 应 405，换 GET
@@ -299,11 +308,11 @@ func TestModelsList(t *testing.T) {
 		t.Errorf("默认应只暴露 auto，got %v", got)
 	}
 
-	// 打开 aaa 的暴露开关后，auto 之后出现 aaa（去重排序）
+	// 打开 aaa 的暴露开关后，auto 之后出现 aaa-p/aaa（直连名带 provider 前缀）
 	if resp, body := postJSON(t, app, "/api/models/"+mA.ID+"/expose", `{"expose":true}`); resp.StatusCode != 200 {
 		t.Fatalf("设置 expose 失败: %d %s", resp.StatusCode, body)
 	}
-	if got := ids(); len(got) != 2 || got[0] != "auto" || got[1] != "aaa" {
+	if got := ids(); len(got) != 2 || got[0] != "auto" || got[1] != "aaa-p/aaa" {
 		t.Errorf("开启暴露后模型列表不正确: %v", got)
 	}
 
@@ -393,16 +402,112 @@ func TestModelsListContextLength(t *testing.T) {
 		t.Fatalf("设置 expose 失败: %d %s", resp.StatusCode, body)
 	}
 	all := items()
-	if n, ok := num(all["big"], "context_length"); !ok || n != 200000 {
-		t.Errorf("big.context_length = %v，want 200000", all["big"]["context_length"])
+	if n, ok := num(all["big-p/big"], "context_length"); !ok || n != 200000 {
+		t.Errorf("big.context_length = %v，want 200000", all["big-p/big"]["context_length"])
 	}
-	if n, ok := num(all["big"], "max_model_len"); !ok || n != 200000 {
-		t.Errorf("big.max_model_len = %v，want 200000", all["big"]["max_model_len"])
+	if n, ok := num(all["big-p/big"], "max_model_len"); !ok || n != 200000 {
+		t.Errorf("big.max_model_len = %v，want 200000", all["big-p/big"]["max_model_len"])
 	}
 	for _, k := range []string{"context_length", "max_model_len"} {
-		if v, ok := all["unknown"][k]; ok {
+		if v, ok := all["unknown-p/unknown"][k]; ok {
 			t.Errorf("未声明的模型不应输出 %s，got %v", k, v)
 		}
+	}
+}
+
+// 直连模型失败时不做任何兜底：同名/同组其他模型不会被尝试。
+func TestDirectModelNoFallback(t *testing.T) {
+	var hitsA, hitsB int32
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hitsA, 1)
+		w.WriteHeader(500)
+		fmt.Fprint(w, `{"error":{"message":"A down"}}`)
+	}))
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hitsB, 1)
+		fmt.Fprint(w, `{"ok":"B"}`)
+	}))
+	defer upA.Close()
+	defer upB.Close()
+
+	s, app := newTestServer(t)
+	addProviderModel(t, s, upA.URL, "m", nil) // provider m-p
+	addProviderModel(t, s, upB.URL, "m", nil) // provider m-p (2)
+
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`)
+	if resp.StatusCode != 500 || !strings.Contains(body, "A down") {
+		t.Fatalf("应透传上游 500: %d %s", resp.StatusCode, body)
+	}
+	if atomic.LoadInt32(&hitsA) != 1 || atomic.LoadInt32(&hitsB) != 0 {
+		t.Fatalf("直连失败不应尝试其他模型: A=%d B=%d", hitsA, hitsB)
+	}
+}
+
+// 裸模型名不再可用，错误里提示改用 provider/model。
+func TestBareModelNameRejected(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{}`) }))
+	defer up.Close()
+	s, app := newTestServer(t)
+	addProviderModel(t, s, up.URL, "m", nil)
+
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`)
+	if resp.StatusCode != 404 || !strings.Contains(body, "provider/model") {
+		t.Fatalf("裸名应 404 并提示 provider/model: %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 200 {
+		t.Fatalf("带前缀的名字应可用, got %d", resp.StatusCode)
+	}
+}
+
+// 同一 provider 下的历史重复配置会让直连名歧义：返回 409，不静默挑一条。
+func TestDirectModelAmbiguousName(t *testing.T) {
+	s, app := newTestServer(t)
+	p := &Provider{Name: "p", BaseURL: "http://x.invalid"}
+	s.store.UpsertProvider(p)
+	s.store.UpsertModel(&Model{Name: "dup", ProviderID: p.ID})
+	s.store.UpsertModel(&Model{Name: "dup", ProviderID: p.ID}) // 绕过 UpsertModelInGroup 的校验
+
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"p/dup"}`)
+	if resp.StatusCode != 409 || !strings.Contains(body, "同名配置") {
+		t.Fatalf("歧义直连名应 409: %d %s", resp.StatusCode, body)
+	}
+}
+
+// 后台保存校验：provider 名唯一、同 provider 下模型名唯一、组名与直连名不能互相遮蔽。
+func TestQualifiedNameValidation(t *testing.T) {
+	s, app := newTestServer(t)
+	resp, body := postJSON(t, app, "/api/providers", `{"name":"p1","base_url":"http://x.invalid"}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("创建 provider 失败: %d %s", resp.StatusCode, body)
+	}
+	pid := s.store.Providers[0].ID
+
+	if resp, body := postJSON(t, app, "/api/providers", `{"name":"p1","base_url":"http://y.invalid"}`); resp.StatusCode != 400 || !strings.Contains(body, "已存在") {
+		t.Fatalf("provider 重名应 400: %d %s", resp.StatusCode, body)
+	}
+	if resp, body := postJSON(t, app, "/api/providers", `{"name":"a/b","base_url":"http://y.invalid"}`); resp.StatusCode != 400 || !strings.Contains(body, "/") {
+		t.Fatalf("provider 名含 / 应 400: %d %s", resp.StatusCode, body)
+	}
+
+	modelBody := fmt.Sprintf(`{"name":"m","provider_id":%q}`, pid)
+	if resp, body := postJSON(t, app, "/api/models", modelBody); resp.StatusCode != 200 {
+		t.Fatalf("创建模型失败: %d %s", resp.StatusCode, body)
+	}
+	if resp, body := postJSON(t, app, "/api/models", modelBody); resp.StatusCode != 400 || !strings.Contains(body, "直连名") {
+		t.Fatalf("同 provider 模型重名应 400: %d %s", resp.StatusCode, body)
+	}
+
+	if resp, body := postJSON(t, app, "/api/groups", `{"name":"p1/m"}`); resp.StatusCode != 400 || !strings.Contains(body, "直连模型") {
+		t.Fatalf("组名与直连名冲突应 400: %d %s", resp.StatusCode, body)
+	}
+
+	// 先建组，再把 provider 改名到会撞组名的前缀
+	if resp, body := postJSON(t, app, "/api/groups", `{"name":"p2/m"}`); resp.StatusCode != 200 {
+		t.Fatalf("创建组失败: %d %s", resp.StatusCode, body)
+	}
+	if resp, body := postJSONWithHeader(t, app, "PUT", "/api/providers/"+pid,
+		`{"name":"p2","base_url":"http://x.invalid"}`, "Content-Type", "application/json"); resp.StatusCode != 400 || !strings.Contains(body, "重名") {
+		t.Fatalf("provider 改名撞组名应 400: %d %s", resp.StatusCode, body)
 	}
 }
 
@@ -890,10 +995,10 @@ func TestPerProtocolURL(t *testing.T) {
 	dual := &Provider{Name: "dual", BaseURL: chatOnly.URL, ResponsesURL: respOnly.URL}
 	s.store.UpsertProvider(dual)
 	s.store.UpsertModel(&Model{Name: "m", ProviderID: dual.ID})
-	if _, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); body != `{"ok":"chat"}` {
+	if _, body := postJSON(t, app, "/v1/chat/completions", `{"model":"dual/m"}`); body != `{"ok":"chat"}` {
 		t.Errorf("chat 请求应走 Chat 基址: %s", body)
 	}
-	if _, body := postJSON(t, app, "/v1/responses", `{"model":"m"}`); body != `{"ok":"responses"}` {
+	if _, body := postJSON(t, app, "/v1/responses", `{"model":"dual/m"}`); body != `{"ok":"responses"}` {
 		t.Errorf("responses 请求应走 Responses 基址: %s", body)
 	}
 
@@ -901,10 +1006,10 @@ func TestPerProtocolURL(t *testing.T) {
 	fallback := &Provider{Name: "fallback", BaseURL: both.URL}
 	s.store.UpsertProvider(fallback)
 	s.store.UpsertModel(&Model{Name: "f", ProviderID: fallback.ID})
-	if _, body := postJSON(t, app, "/v1/chat/completions", `{"model":"f"}`); body != `{"path":"/chat/completions"}` {
+	if _, body := postJSON(t, app, "/v1/chat/completions", `{"model":"fallback/f"}`); body != `{"path":"/chat/completions"}` {
 		t.Errorf("chat 回落错误: %s", body)
 	}
-	if _, body := postJSON(t, app, "/v1/responses", `{"model":"f"}`); body != `{"path":"/responses"}` {
+	if _, body := postJSON(t, app, "/v1/responses", `{"model":"fallback/f"}`); body != `{"path":"/responses"}` {
 		t.Errorf("responses 回落错误: %s", body)
 	}
 }
@@ -917,7 +1022,7 @@ func TestAPIKeys(t *testing.T) {
 	addProviderModel(t, s, up.URL, "m", nil)
 
 	// 未配置任何 Key：开放访问
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 200 {
 		t.Fatalf("无 Key 时应开放访问, got %d", resp.StatusCode)
 	}
 
@@ -935,10 +1040,10 @@ func TestAPIKeys(t *testing.T) {
 	}
 
 	// 有 Key 后：无鉴权 401，带 Key 200 且用量记到该 Key
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 401 {
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 401 {
 		t.Fatalf("配置 Key 后无鉴权应 401, got %d", resp.StatusCode)
 	}
-	r1, b1 := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "Authorization", "Bearer "+k.Key)
+	r1, b1 := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m-p/m"}`, "Authorization", "Bearer "+k.Key)
 	if r1.StatusCode != 200 {
 		t.Fatalf("带 Key 请求失败: %d %s", r1.StatusCode, b1)
 	}
@@ -954,7 +1059,7 @@ func TestAPIKeys(t *testing.T) {
 
 	// 环境变量令牌仍然有效，记为 "env"
 	s.apiToken = "env-tok"
-	if r, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "Authorization", "Bearer env-tok"); r.StatusCode != 200 {
+	if r, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m-p/m"}`, "Authorization", "Bearer env-tok"); r.StatusCode != 200 {
 		t.Fatal("环境变量令牌应可用")
 	}
 
@@ -963,7 +1068,7 @@ func TestAPIKeys(t *testing.T) {
 	if resp, err := app.Client().Do(req); err != nil || resp.StatusCode != 200 {
 		t.Fatalf("删除 Key 失败: %v", err)
 	}
-	if r, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "Authorization", "Bearer "+k.Key); r.StatusCode != 401 {
+	if r, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m-p/m"}`, "Authorization", "Bearer "+k.Key); r.StatusCode != 401 {
 		t.Fatal("删除 Key 后该 Key 应失效")
 	}
 }
@@ -993,10 +1098,10 @@ func TestSessionBinding(t *testing.T) {
 	s.store.UpsertModel(&Model{Name: "m", ProviderID: pB.ID, Priority: 1})
 
 	sess := func() (*http.Response, string) {
-		return postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "X-Session-ID", "conv-1")
+		return postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`, "X-Session-ID", "conv-1")
 	}
 
-	// 1) 会话首请求按规则选 A
+	// 1) 会话首请求按组内优先级选 A
 	if _, b := sess(); b != `{"ok":"A"}` {
 		t.Fatalf("会话首请求应选 A: %s", b)
 	}
@@ -1005,7 +1110,7 @@ func TestSessionBinding(t *testing.T) {
 	now := time.Now()
 	mA.Mutes = []MuteWindow{{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")}}
 	s.store.UpsertModel(mA)
-	if _, b := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); b != `{"ok":"B"}` {
+	if _, b := postJSON(t, app, "/v1/chat/completions", `{"model":"auto"}`); b != `{"ok":"B"}` {
 		t.Fatalf("无会话请求应走 B: %s", b)
 	}
 	if _, b := sess(); b != `{"ok":"A"}` {
@@ -1022,7 +1127,7 @@ func TestSessionBinding(t *testing.T) {
 		t.Fatalf("重绑后会话应继续走 B: %s", b)
 	}
 	// 5) 不同会话头互不影响，按规则走 B（A 仍静音）
-	if _, b := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`, "X-Session-ID", "conv-2"); b != `{"ok":"B"}` {
+	if _, b := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`, "X-Session-ID", "conv-2"); b != `{"ok":"B"}` {
 		t.Fatalf("新会话应按规则走 B: %s", b)
 	}
 }
@@ -1055,7 +1160,7 @@ func TestStreamUsageCounting(t *testing.T) {
 
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", nil)
-	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m","stream":true}`)
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m","stream":true}`)
 	if resp.StatusCode != 200 || body != sse {
 		t.Fatalf("SSE 应原样透传: %d %q", resp.StatusCode, body)
 	}
@@ -1116,7 +1221,7 @@ func TestCachedTokens(t *testing.T) {
 	defer up.Close()
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", nil)
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 200 {
 		t.Fatal("请求失败")
 	}
 	var st struct {
@@ -1151,36 +1256,25 @@ func TestLogUpstreamFailure(t *testing.T) {
 
 	s, app := newTestServer(t)
 	m := addProviderModel(t, s, up.URL, "m", nil)
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 502 {
-		t.Fatalf("应 502, got %d", resp.StatusCode)
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 500 || !strings.Contains(body, "upstream boom") {
+		t.Fatalf("应透传上游 500 与错误体, got %d %s", resp.StatusCode, body)
 	}
 
 	s.store.Lock()
 	logs := append([]*LogEntry(nil), s.store.Logs...)
 	s.store.Unlock()
-	if len(logs) != 2 {
-		t.Fatalf("应记录 2 条（单上游失败 + 全部失败），got %d", len(logs))
+	if len(logs) != 1 {
+		t.Fatalf("直连失败应只记录 1 条上游失败日志，got %d", len(logs))
 	}
-	var up1, all *LogEntry
-	for _, l := range logs {
-		switch l.Kind {
-		case kindUpstream:
-			up1 = l
-		case kindAllFailed:
-			all = l
-		}
-	}
-	if up1 == nil || all == nil {
-		t.Fatalf("缺少预期日志: %+v", logs)
+	up1 := logs[0]
+	if up1.Kind != kindUpstream {
+		t.Fatalf("日志类型应为 upstream: %+v", up1)
 	}
 	if up1.Status != 500 || up1.ProviderID != m.ProviderID || up1.Model != "m" {
 		t.Errorf("上游失败日志字段不对: %+v", up1)
 	}
 	if !strings.Contains(up1.Detail, "upstream boom") {
 		t.Errorf("应含上游错误详情: %q", up1.Detail)
-	}
-	if all.Status != 502 || !strings.Contains(all.Message, "全部失败") {
-		t.Errorf("汇总日志不对: %+v", all)
 	}
 }
 
@@ -1364,7 +1458,7 @@ func TestConcurrentLimitFailover(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`)
+		postJSON(t, app, "/v1/chat/completions", `{"model":"auto"}`)
 	}()
 	// 等 A 的在途数变成 1
 	deadline := time.Now().Add(2 * time.Second)
@@ -1376,7 +1470,7 @@ func TestConcurrentLimitFailover(t *testing.T) {
 	}
 
 	// 此时 A 已满，第二个请求应落到 B
-	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"auto"}`); resp.StatusCode != 200 {
 		t.Fatalf("第二个请求应成功走 B: %d %s", resp.StatusCode, body)
 	}
 	if atomic.LoadInt32(&hitB) == 0 {
@@ -1410,8 +1504,8 @@ func TestConcurrentSlotReleasedOnFailure(t *testing.T) {
 	m := addProviderModel(t, s, up.URL, "m", func(m *Model) { m.MaxConcurrent = 1 })
 
 	for i := 0; i < 3; i++ {
-		if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 502 {
-			t.Fatalf("第 %d 次应 502, got %d", i+1, resp.StatusCode)
+		if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 500 {
+			t.Fatalf("第 %d 次应透传上游 500, got %d", i+1, resp.StatusCode)
 		}
 		if got := s.store.Inflight()[m.ID]; got != 0 {
 			t.Fatalf("第 %d 次失败后名额应已释放, got %d", i+1, got)
@@ -1462,7 +1556,7 @@ func TestSessionLogNewBinding(t *testing.T) {
 	})
 	addProviderModel(t, s, up.URL, "m", func(m *Model) { m.Priority = 10 })
 
-	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
 		"X-Session-ID", "sess-1"); resp.StatusCode != 200 {
 		t.Fatalf("应 200, got %d %s", resp.StatusCode, body)
 	}
@@ -1478,14 +1572,14 @@ func TestSessionLogNewBinding(t *testing.T) {
 	if sess == nil {
 		t.Fatal("应记录一条会话日志")
 	}
-	if sess.Model != "m" || sess.SessionID != "sess-1" || sess.Requested != "m" {
+	if sess.Model != "m" || sess.SessionID != "sess-1" || sess.Requested != "auto" {
 		t.Errorf("会话日志字段不对: %+v", sess)
 	}
 	if sess.Switched {
 		t.Error("首次建立不应标记为会话换模型")
 	}
-	if !strings.Contains(sess.Reason, "按优先级") {
-		t.Errorf("理由应说明按优先级选中: %q", sess.Reason)
+	if !strings.Contains(sess.Reason, "组内优先级") {
+		t.Errorf("理由应说明组内优先级: %q", sess.Reason)
 	}
 	if len(sess.Candidates) != 1 {
 		t.Errorf("候选应只剩 1 个（静音的被剔除）: %v", sess.Candidates)
@@ -1506,7 +1600,7 @@ func TestSessionLogOnlyOncePerSession(t *testing.T) {
 	addProviderModel(t, s, up.URL, "m", nil)
 
 	for i := 0; i < 5; i++ {
-		if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+		if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m-p/m"}`,
 			"X-Session-ID", "sess-once"); resp.StatusCode != 200 {
 			t.Fatalf("第 %d 次应 200, got %d %s", i+1, resp.StatusCode, body)
 		}
@@ -1553,14 +1647,14 @@ func TestSessionLogRecordsSwitch(t *testing.T) {
 
 	// 第一次：A 正常，会话绑定到 A
 	upAHealthy.Store(true)
-	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
 		"X-Session-ID", "sess-sw"); resp.StatusCode != 200 {
 		t.Fatalf("首次应 200, got %d", resp.StatusCode)
 	}
 
 	// 第二次：A 开始报错，会话应切到 B 并记录切换
 	upAHealthy.Store(false)
-	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
 		"X-Session-ID", "sess-sw"); resp.StatusCode != 200 {
 		t.Fatalf("切换后应 200, got %d %s", resp.StatusCode, body)
 	}
@@ -1606,7 +1700,7 @@ func TestSessionLogRecordsAttemptFailures(t *testing.T) {
 	ma := addProviderModel(t, s, upA.URL, "m", func(m *Model) { m.Priority = 20 })
 	addProviderModel(t, s, upB.URL, "m", func(m *Model) { m.Priority = 10 })
 
-	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
 		"X-Session-ID", "sess-failover"); resp.StatusCode != 200 {
 		t.Fatalf("降级后应 200, got %d %s", resp.StatusCode, body)
 	}
@@ -1653,7 +1747,7 @@ func TestSessionLogRecordsConcurrencyYield(t *testing.T) {
 	}
 	defer s.store.Release(ma.ID)
 
-	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
 		"X-Session-ID", "sess-yield"); resp.StatusCode != 200 {
 		t.Fatalf("让位后应 200, got %d %s", resp.StatusCode, body)
 	}
@@ -1728,11 +1822,11 @@ func TestSessionLogProtocol(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", nil)
 
-	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m-p/m"}`,
 		"X-Session-ID", "sess-chat"); resp.StatusCode != 200 {
 		t.Fatalf("chat 应 200, got %d %s", resp.StatusCode, body)
 	}
-	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/responses", `{"model":"m"}`,
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/responses", `{"model":"m-p/m"}`,
 		"X-Session-ID", "sess-resp"); resp.StatusCode != 200 {
 		t.Fatalf("responses 应 200, got %d %s", resp.StatusCode, body)
 	}
@@ -1765,7 +1859,7 @@ func TestSessionLogMentionsFullModel(t *testing.T) {
 	addProviderModel(t, s, up.URL, "m", func(m *Model) { m.Priority = 10 })
 	s.store.TryAcquire(full.ID) // 占满高优先级模型
 
-	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
 		"X-Session-ID", "sess-full"); resp.StatusCode != 200 {
 		t.Fatalf("应 200, got %d %s", resp.StatusCode, body)
 	}
@@ -1854,7 +1948,7 @@ func TestMuteOn429(t *testing.T) {
 	addProviderModel(t, s, upB.URL, "m", func(m *Model) { m.Priority = 10 })
 
 	// 第一次：A 返回 429 → 自动静音，请求改走 B 并成功
-	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"auto"}`); resp.StatusCode != 200 {
 		t.Fatalf("应透过 B 成功, got %d %s", resp.StatusCode, body)
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
@@ -1879,7 +1973,7 @@ func TestMuteOn429(t *testing.T) {
 
 	// 后续多次请求都不应再打到 A
 	for i := 0; i < 3; i++ {
-		if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+		if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"auto"}`); resp.StatusCode != 200 {
 			t.Fatalf("第 %d 次应成功", i+2)
 		}
 	}
@@ -1906,7 +2000,7 @@ func TestMutedModelSkippedBySessionBinding(t *testing.T) {
 	addProviderModel(t, s, upB.URL, "m", func(m *Model) { m.Priority = 10 })
 
 	// 会话绑定到 A
-	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, _ := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
 		"X-Session-ID", "s1"); resp.StatusCode != 200 {
 		t.Fatal("首次应成功")
 	}
@@ -1918,7 +2012,7 @@ func TestMutedModelSkippedBySessionBinding(t *testing.T) {
 	s.store.MuteOn429(a.ID, 5*time.Hour, "test")
 
 	// 同会话再请求：绑定已失效，应改走 B
-	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"m"}`,
+	if resp, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"auto"}`,
 		"X-Session-ID", "s1"); resp.StatusCode != 200 {
 		t.Fatalf("应透过 B 成功, got %d %s", resp.StatusCode, body)
 	}
@@ -2000,8 +2094,8 @@ func TestMuteOn429LogsAndSkips(t *testing.T) {
 	s, app := newTestServer(t)
 	m := addProviderModel(t, s, up.URL, "m", nil)
 
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 502 {
-		t.Fatalf("无备用时应 502, got %d", resp.StatusCode)
+	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 429 || !strings.Contains(body, "quota exceeded") {
+		t.Fatalf("直连应透传上游 429, got %d %s", resp.StatusCode, body)
 	}
 
 	s.store.Lock()
@@ -2080,7 +2174,7 @@ func TestParseUsageObjectCacheFallbacks(t *testing.T) {
 	defer up.Close()
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", nil)
-	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m"}`); resp.StatusCode != 200 {
+	if resp, _ := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 200 {
 		t.Fatal("请求失败")
 	}
 	var st struct {
@@ -2136,7 +2230,7 @@ func TestStreamCachedTokensThroughProxy(t *testing.T) {
 
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "m", nil)
-	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m","stream":true}`)
+	resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m","stream":true}`)
 	if resp.StatusCode != 200 || body != sse {
 		t.Fatalf("SSE 应原样透传: %d %q", resp.StatusCode, body)
 	}

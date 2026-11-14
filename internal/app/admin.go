@@ -32,6 +32,24 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 	if id := r.PathValue("id"); id != "" {
 		p.ID = id
 	}
+	// provider 名是直连模型对外名 "provider/model" 的前缀，必须非空、不含 "/"、全局唯一。
+	p.Name = strings.TrimSpace(p.Name)
+	if p.Name == "" {
+		writeErr(w, http.StatusBadRequest, "provider 名称不能为空（会作为直连模型名的前缀）")
+		return
+	}
+	if strings.Contains(p.Name, "/") {
+		writeErr(w, http.StatusBadRequest, "provider 名称不能包含 /（它是直连模型名的分隔符）")
+		return
+	}
+	if s.store.ProviderNameTaken(p.Name, p.ID) {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("provider 名称 %q 已存在", p.Name))
+		return
+	}
+	if g, ok := s.store.GroupConflictForProvider(p.ID, p.Name); ok {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("改名后模型对外名会与路由组 %q 重名", g))
+		return
+	}
 	if p.Kind != "" {
 		adapter, ok := s.registry().ForKind(p.Kind)
 		if !ok {
@@ -79,6 +97,7 @@ func (s *Server) handleModelUpsert(w http.ResponseWriter, r *http.Request) {
 	if id := r.PathValue("id"); id != "" {
 		m.ID = id
 	}
+	m.Name = strings.TrimSpace(m.Name)
 	if m.Name == "" || m.ProviderID == "" {
 		writeErr(w, http.StatusBadRequest, "name 与 provider_id 不能为空")
 		return
@@ -87,6 +106,8 @@ func (s *Server) handleModelUpsert(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "provider 不存在")
 		return
 	}
+	// 同一 provider 下模型名必须唯一（直连对外名 provider/model 才会唯一）；
+	// 组名与直连名也不能互相遮蔽。这两项由 Store.UpsertModelInGroup 统一校验。
 	// group_id 只是「在哪个组里编辑/创建」的上下文；模型配置本身全局共享，
 	// priority 写入该组的成员优先级，不影响模型在其他组的优先级。
 	groupID := m.GroupID

@@ -53,7 +53,7 @@ func TestActiveSessionsListed(t *testing.T) {
 	}
 	// conv-a 两次 + conv-b 一次；最后活跃的是 conv-b（列表应排最前）
 	for _, sid := range []string{"conv-a", "conv-a", "conv-b"} {
-		postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm"}`, "X-Session-ID", sid)
+		postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"P/glm"}`, "X-Session-ID", sid)
 		// Windows 的时钟粒度约 1ms，连续请求可能取到相同的 LastAt 导致排序断言不稳定
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -65,7 +65,7 @@ func TestActiveSessionsListed(t *testing.T) {
 		t.Fatalf("应按最近活跃倒序: %#v", got)
 	}
 	a := got[1]
-	if a.ModelID != modelID || a.Requested != "glm" || a.Count != 2 {
+	if a.ModelID != modelID || a.Requested != "P/glm" || a.Count != 2 {
 		t.Fatalf("conv-a 字段不对: %#v", a)
 	}
 	if a.FirstAt.IsZero() || a.LastAt.IsZero() || !a.Expires.After(a.LastAt) {
@@ -89,7 +89,7 @@ func TestSessionTTLConfigurable(t *testing.T) {
 	addProviderModel(t, s, up.URL, "glm", nil)
 
 	s.store.SetSessionTTL(1) // 1 秒
-	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm"}`, "X-Session-ID", "ttl-1")
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm-p/glm"}`, "X-Session-ID", "ttl-1")
 
 	list := s.sessionsMgr().List()
 	if len(list) != 1 {
@@ -165,7 +165,7 @@ func TestSessionTokenSpeed(t *testing.T) {
 		return v.Sessions[0]
 	}
 
-	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm","stream":true}`, "X-Session-ID", "speed-1")
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm-p/glm","stream":true}`, "X-Session-ID", "speed-1")
 	got := fetch()
 	if got.OutTokens != 20 || got.Count != 1 {
 		t.Fatalf("首次请求后应累计 20 输出 tokens / 1 次请求: %#v", got)
@@ -177,7 +177,7 @@ func TestSessionTokenSpeed(t *testing.T) {
 		t.Fatalf("流式请求应测到首字节耗时: %#v", got)
 	}
 
-	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm","stream":true}`, "X-Session-ID", "speed-1")
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm-p/glm","stream":true}`, "X-Session-ID", "speed-1")
 	got = fetch()
 	if got.OutTokens != 40 || got.Count != 2 {
 		t.Fatalf("再次请求后应累计 40 输出 tokens / 2 次请求: %#v", got)
@@ -214,7 +214,7 @@ func TestSessionUsageKeptAfterEnd(t *testing.T) {
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "glm", nil)
 
-	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm","stream":true}`, "X-Session-ID", "hist-1")
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm-p/glm","stream":true}`, "X-Session-ID", "hist-1")
 	req, _ := http.NewRequest("DELETE", app.URL+"/api/sessions?id=hist-1", nil)
 	resp, err := app.Client().Do(req)
 	if err != nil {
@@ -306,7 +306,7 @@ func TestEndSession(t *testing.T) {
 
 	// conv-1 产生两条绑定（不同请求模型名），conv-1x 与 conv-2 各一条
 	for _, x := range []struct{ sid, model string }{
-		{"conv-1", "a"}, {"conv-1", "b"}, {"conv-1x", "a"}, {"conv-2", "a"},
+		{"conv-1", "a-p/a"}, {"conv-1", "b-p/b"}, {"conv-1x", "a-p/a"}, {"conv-2", "a-p/a"},
 	} {
 		postJSONWithHeader(t, app, "POST", "/v1/chat/completions",
 			fmt.Sprintf(`{"model":%q}`, x.model), "X-Session-ID", x.sid)
@@ -380,7 +380,7 @@ func TestDerivedSessionFromRemoteAddr(t *testing.T) {
 	h := s.routes()
 	call := func(addr, sid string) string {
 		t.Helper()
-		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"auto"}`))
 		req.RemoteAddr = addr
 		if sid != "" {
 			req.Header.Set("X-Session-ID", sid)
@@ -401,7 +401,7 @@ func TestDerivedSessionFromRemoteAddr(t *testing.T) {
 		t.Fatalf("首请求应走 A: %s", got)
 	}
 	list := s.activeSessions()
-	if len(list) != 1 || list[0].ID != wantID || list[0].ModelID != modelA || list[0].Requested != "m" {
+	if len(list) != 1 || list[0].ID != wantID || list[0].ModelID != modelA || list[0].Requested != "auto" {
 		t.Fatalf("应以 UUIDv3(10.7.0.5) 建立会话: %#v", list)
 	}
 
@@ -512,7 +512,7 @@ func TestSessionTTLChangeAppliesImmediately(t *testing.T) {
 	defer up.Close()
 	s, app := newTestServer(t)
 	addProviderModel(t, s, up.URL, "glm", nil)
-	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm"}`, "X-Session-ID", "shrink")
+	postJSONWithHeader(t, app, "POST", "/v1/chat/completions", `{"model":"glm-p/glm"}`, "X-Session-ID", "shrink")
 
 	if resp, body := postJSONWithHeader(t, app, "PUT", "/api/settings",
 		`{"session_ttl_seconds":1}`, "Content-Type", "application/json"); resp.StatusCode != 200 {
@@ -545,7 +545,7 @@ func TestSessionsRecordEffortLevel(t *testing.T) {
 	s.store.UpsertModel(&Model{Name: "glm", ProviderID: p.ID})
 
 	postJSONWithHeader(t, app, "POST", "/v1/chat/completions",
-		`{"model":"glm","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"P/glm","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`,
 		"X-Session-ID", "eff-1")
 
 	// 活跃会话

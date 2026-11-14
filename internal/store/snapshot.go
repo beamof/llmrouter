@@ -35,7 +35,11 @@ func (s *Store) SnapshotJSON() []byte {
 		v.Logs = s.Logs
 	}
 	for _, m := range s.Models {
-		v.Models = append(v.Models, ModelView{Model: m, UsedToday: used[m.ProviderID+"\x00"+m.Name], Inflight: s.inflight[m.ID]})
+		external := m.Name
+		if p, ok := s.providerLocked(m.ProviderID); ok {
+			external = externalModelName(p, m)
+		}
+		v.Models = append(v.Models, ModelView{Model: m, ExternalName: external, UsedToday: used[m.ProviderID+"\x00"+m.Name], Inflight: s.inflight[m.ID]})
 	}
 	v.Usage = append(v.Usage, s.Usage...)
 	v.SessionUsage = append(v.SessionUsage, s.SessionUsage...)

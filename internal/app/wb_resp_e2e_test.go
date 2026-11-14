@@ -60,7 +60,7 @@ func TestWBResponsesStream(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 
 	resp, body := postJSON(t, app, "/v1/responses",
-		`{"model":"glm-5.0","input":"hi","stream":true}`)
+		`{"model":"wb-p/glm-5.0","input":"hi","stream":true}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
 	}
@@ -144,7 +144,7 @@ func TestWBResponsesNonStream(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 
 	resp, body := postJSON(t, app, "/v1/responses",
-		`{"model":"glm-5.0","input":"hi"}`)
+		`{"model":"wb-p/glm-5.0","input":"hi"}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
 	}
@@ -216,7 +216,7 @@ func TestWBResponsesIncomplete(t *testing.T) {
 
 	// 流式：response.incomplete 事件
 	_, body := postJSON(t, app, "/v1/responses",
-		`{"model":"glm-5.0","input":"hi","stream":true}`)
+		`{"model":"wb-p/glm-5.0","input":"hi","stream":true}`)
 	found := false
 	for _, ev := range sseEvents(t, body) {
 		if ev.Event == "response.incomplete" {
@@ -236,7 +236,7 @@ func TestWBResponsesIncomplete(t *testing.T) {
 	}
 
 	// 非流式：status=incomplete 的 response 对象
-	_, body = postJSON(t, app, "/v1/responses", `{"model":"glm-5.0","input":"hi"}`)
+	_, body = postJSON(t, app, "/v1/responses", `{"model":"wb-p/glm-5.0","input":"hi"}`)
 	var v struct {
 		Status            string `json:"status"`
 		IncompleteDetails struct {
@@ -251,18 +251,21 @@ func TestWBResponsesIncomplete(t *testing.T) {
 	}
 }
 
-func TestWBResponsesFailover(t *testing.T) {
-	// wb 候选在 /responses 下失败（如限流）时仍应换下一个普通候选
+// 直连模型在 /responses 下失败时不兜底：WorkBuddy 的 429 原样回给客户端，
+// 即使同组/其他位置还有可用的普通模型也不切换。
+func TestDirectResponsesNoFallback(t *testing.T) {
 	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(429)
 		fmt.Fprint(w, `{"code":6004,"message":"限流"}`)
 	})
 	s, app := newTestServer(t)
-	s.store.SetResponsesConvert(true) // 开启转换后 wb 候选才参与 responses 路由
+	s.store.SetResponsesConvert(true) // 开启转换后 wb 模型才支持 responses
 	addWBProviderModel(t, s, up.URL, "glm-5.0", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
+	nativeHit := false
 	fallback := http.NewServeMux()
 	fallback.HandleFunc("/responses", func(w http.ResponseWriter, r *http.Request) {
+		nativeHit = true
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"id":"resp_1","object":"response","status":"completed","output":[]}`)
 	})
@@ -271,16 +274,18 @@ func TestWBResponsesFailover(t *testing.T) {
 	addProviderModel(t, s, fb.URL, "glm-5.0", func(m *Model) { m.Priority = 1 })
 
 	resp, body := postJSON(t, app, "/v1/responses",
-		`{"model":"glm-5.0","input":"hi"}`)
-	if resp.StatusCode != 200 || !strings.Contains(body, "resp_1") {
-		t.Fatalf("/responses 应故障转移到普通候选: %d %s", resp.StatusCode, body)
+		`{"model":"wb-p/glm-5.0","input":"hi"}`)
+	if resp.StatusCode != 429 || !strings.Contains(body, "限流") {
+		t.Fatalf("直连应透传上游 429: %d %s", resp.StatusCode, body)
+	}
+	if nativeHit {
+		t.Fatal("直连失败不应切换到其他模型")
 	}
 }
 
-// responses 协议转换默认关闭：/v1/responses 会跳过仅支持 chat 的同名 WorkBuddy
-// 候选，改用原生支持 responses 的模型（不尝试转换，也不因 404 再故障转移）。
-
-func TestResponsesSkipsChatOnlyCandidate(t *testing.T) {
+// responses 协议转换默认关闭：路由组会跳过仅支持 chat 的 WorkBuddy 成员，
+// 改用组内原生支持 responses 的模型。
+func TestResponsesGroupSkipsChatOnlyCandidate(t *testing.T) {
 	wbCalled := false
 	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		wbCalled = true
@@ -300,25 +305,26 @@ func TestResponsesSkipsChatOnlyCandidate(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "shared", &WorkBuddyCred{UID: "u", AccessToken: "at-1"}) // 优先级 10
 	addProviderModel(t, s, native.URL, "shared", func(m *Model) { m.Priority = 1 })
 
-	resp, body := postJSON(t, app, "/v1/responses", `{"model":"shared","input":"hi"}`)
+	resp, body := postJSON(t, app, "/v1/responses", `{"model":"auto","input":"hi"}`)
 	if resp.StatusCode != 200 || !strings.Contains(body, "resp_native") {
-		t.Fatalf("应改走原生 responses 模型: %d %s", resp.StatusCode, body)
+		t.Fatalf("组内应改走原生 responses 模型: %d %s", resp.StatusCode, body)
 	}
 	if wbCalled {
 		t.Fatal("转换默认关闭时不应把 responses 请求发给 WorkBuddy")
 	}
 }
 
-// 请求指定的模型全部是仅支持 chat 的上游时，回落到其他支持 responses 的模型。
-
-func TestResponsesFallsBackToOtherModel(t *testing.T) {
+// 直连一个仅支持 chat 的模型时，/v1/responses 直接报错，不切换到其他模型。
+func TestDirectResponsesUnsupportedNoFallback(t *testing.T) {
 	wbCalled := false
 	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		wbCalled = true
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"wb\"}}]}\n\ndata: [DONE]\n\n")
 	})
+	nativeHit := false
 	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nativeHit = true
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"id":"resp_other","object":"response","status":"completed","output":[]}`)
 	}))
@@ -328,17 +334,17 @@ func TestResponsesFallsBackToOtherModel(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "wb-only", &WorkBuddyCred{UID: "u", AccessToken: "at-1"})
 	addProviderModel(t, s, native.URL, "native-model", func(m *Model) { m.Priority = 1 })
 
-	resp, body := postJSON(t, app, "/v1/responses", `{"model":"wb-only","input":"hi"}`)
-	if resp.StatusCode != 200 || !strings.Contains(body, "resp_other") {
-		t.Fatalf("应回落到其他支持 responses 的模型: %d %s", resp.StatusCode, body)
+	resp, body := postJSON(t, app, "/v1/responses", `{"model":"wb-p/wb-only","input":"hi"}`)
+	if resp.StatusCode != 400 || !strings.Contains(body, "不支持当前接入协议") {
+		t.Fatalf("应直接返回协议不支持: %d %s", resp.StatusCode, body)
 	}
-	if wbCalled {
-		t.Fatal("转换默认关闭时不应把 responses 请求发给 WorkBuddy")
+	if wbCalled || nativeHit {
+		t.Fatal("协议不支持时不应调用任何上游")
 	}
 }
 
-// 打开转换开关后，WorkBuddy 候选按优先级正常参与 responses 路由并渲染回 responses 形态。
-
+// 打开转换开关后，路由组内 WorkBuddy 成员按组内优先级参与 responses 路由，
+// 并渲染回 responses 形态。
 func TestResponsesConvertSwitchRoutesToWorkBuddy(t *testing.T) {
 	up, _ := wbFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -356,12 +362,12 @@ func TestResponsesConvertSwitchRoutesToWorkBuddy(t *testing.T) {
 	addWBProviderModel(t, s, up.URL, "shared", &WorkBuddyCred{UID: "u", AccessToken: "at-1"}) // 优先级 10
 	addProviderModel(t, s, native.URL, "shared", func(m *Model) { m.Priority = 1 })
 
-	resp, body := postJSON(t, app, "/v1/responses", `{"model":"shared","input":"hi"}`)
+	resp, body := postJSON(t, app, "/v1/responses", `{"model":"auto","input":"hi"}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
 	}
 	if nativeHit {
-		t.Fatal("开启转换后应优先使用高优先级的 WorkBuddy 候选")
+		t.Fatal("开启转换后应优先使用高优先级的 WorkBuddy 成员")
 	}
 	if !strings.Contains(body, `"object":"response"`) || !strings.Contains(body, "你好") {
 		t.Fatalf("应把 chat 流渲染为 response 对象: %s", body)

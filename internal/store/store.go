@@ -111,8 +111,43 @@ func LoadStore(path string) (*Store, error) {
 	if s.Balances == nil {
 		s.Balances = map[string]*Balance{}
 	}
+	// Provider 名是直连模型对外名（provider/model）的前缀，加载时统一修复：
+	// 去空白、不允许 "/"、空名回退 ID、重名自动加序号。
+	s.normalizeProvidersLocked()
 	s.normalizeGroupsLocked() // 旧状态文件没有组：按原 auto_model 建默认组，模型全部归入
 	return s, nil
+}
+
+// normalizeProvidersLocked 规范化 provider 显示名，保证其可作为直连模型名的唯一前缀。
+// 调用方需持锁（LoadStore 为单线程，可直接调用）。
+func (s *Store) normalizeProvidersLocked() {
+	out := s.Providers[:0]
+	seen := make(map[string]bool, len(s.Providers))
+	for _, p := range s.Providers {
+		if p == nil {
+			continue
+		}
+		p.Name = providerNameBase(p.Name, p.ID)
+		base := p.Name
+		for i := 2; seen[p.Name]; i++ {
+			p.Name = fmt.Sprintf("%s (%d)", base, i)
+		}
+		seen[p.Name] = true
+		out = append(out, p)
+	}
+	s.Providers = out
+}
+
+// providerNameBase 把任意名字规范成可用作对外模型名前缀的形式。
+func providerNameBase(name, id string) string {
+	name = strings.TrimSpace(strings.ReplaceAll(name, "/", "-"))
+	if name == "" {
+		name = strings.TrimSpace(id)
+	}
+	if name == "" {
+		name = "provider"
+	}
+	return name
 }
 
 // normalizeGroupsLocked 修复/迁移路由组数据：至少保留一个组；把旧版「模型归属单个组」
@@ -241,7 +276,8 @@ func (s *Store) anyMembershipLocked(modelID string) bool {
 	return false
 }
 
-// recomputeModelPriorityLocked 直连优先级 = 所有成员优先级的最大值（调用方需持锁）
+// recomputeModelPriorityLocked 维护兼容字段 Priority = 所有组成员优先级的最大值
+// （直连选路已不使用该字段）。调用方需持锁。
 func (s *Store) recomputeModelPriorityLocked(m *Model) {
 	if m == nil {
 		return
@@ -442,13 +478,16 @@ func (s *Store) Provider(id string) (Provider, bool) {
 	return Provider{}, false
 }
 
-// UpsertProvider ID 为空则新建，否则按 ID 替换
+// UpsertProvider ID 为空则新建，否则按 ID 替换。
+// 名称会规范化为非空、无 "/" 且全局唯一（重名自动追加序号），因为它是直连模型
+// 对外名 "provider/model" 的前缀；后台手动保存会先做严格校验并提示重名。
 func (s *Store) UpsertProvider(p *Provider) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, old := range s.Providers {
-		if old.ID == p.ID {
+		if old.ID == p.ID && p.ID != "" {
 			s.Providers[i] = p
+			s.normalizeProviderNameLocked(p)
 			s.save()
 			return
 		}
@@ -456,8 +495,35 @@ func (s *Store) UpsertProvider(p *Provider) {
 	if p.ID == "" {
 		p.ID = s.newID("p")
 	}
+	s.normalizeProviderNameLocked(p)
 	s.Providers = append(s.Providers, p)
 	s.save()
+}
+
+// normalizeProviderNameLocked 保证 provider 名非空、不含 "/"、全局唯一（调用方需持锁）。
+func (s *Store) normalizeProviderNameLocked(p *Provider) {
+	p.Name = providerNameBase(p.Name, p.ID)
+	base := p.Name
+	for i := 2; s.providerNameTakenLocked(p.Name, p.ID); i++ {
+		p.Name = fmt.Sprintf("%s (%d)", base, i)
+	}
+}
+
+// providerNameTakenLocked 该名字是否已被其他 provider 使用（调用方需持锁）。
+func (s *Store) providerNameTakenLocked(name, excludeID string) bool {
+	for _, p := range s.Providers {
+		if p.ID != excludeID && p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ProviderNameTaken 该名字是否已被其他 provider 使用（后台保存前校验）。
+func (s *Store) ProviderNameTaken(name, excludeID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.providerNameTakenLocked(name, excludeID)
 }
 
 // UpdateWBAuth 回写 WorkBuddy 续期后的凭证（refresh token 一次性，轮换后旧值即失效，必须落盘）。
@@ -705,6 +771,7 @@ func (s *Store) UpsertModel(m *Model) {
 
 // UpsertModelInGroup 保存共享模型配置，并设置它在 targetGroupID 组内的优先级。
 // 同一个模型配置可被多个组引用；这里只改目标组的成员优先级，不影响其他组。
+// 同一 provider 下的模型名必须唯一，否则直连对外名会重复。
 func (s *Store) UpsertModelInGroup(m *Model, groupID string, priority int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -715,6 +782,19 @@ func (s *Store) UpsertModelInGroup(m *Model, groupID string, priority int) error
 	if g == nil {
 		return fmt.Errorf("路由组不存在")
 	}
+	if _, ok := s.providerLocked(m.ProviderID); !ok {
+		return fmt.Errorf("provider 不存在")
+	}
+	m.Name = strings.TrimSpace(m.Name)
+	if m.Name == "" {
+		return fmt.Errorf("模型名不能为空")
+	}
+	if s.modelNameTakenLocked(m.ProviderID, m.Name, m.ID) {
+		return fmt.Errorf("该 provider 下已存在模型 %q，直连名会重复", m.Name)
+	}
+	if gname, ok := s.externalNameConflictsGroupLocked(m.ProviderID, m.Name); ok {
+		return fmt.Errorf("模型对外名与路由组 %q 重名，请先修改组名", gname)
+	}
 	s.upsertModelLocked(m, g.ID)
 	s.setMemberPriorityLocked(g, m.ID, priority)
 	s.recomputeModelPriorityLocked(m)
@@ -722,11 +802,67 @@ func (s *Store) UpsertModelInGroup(m *Model, groupID string, priority int) error
 	return nil
 }
 
+// modelNameTakenLocked 同一 provider 下是否已有同名模型（调用方需持锁）。
+func (s *Store) modelNameTakenLocked(providerID, name, excludeID string) bool {
+	for _, m := range s.Models {
+		if m.ID != excludeID && m.ProviderID == providerID && m.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// externalNameConflictsGroupLocked 该 provider 下模型的对外名是否与现有路由组重名
+// （调用方需持锁）。组名在请求里优先于直连模型，冲突会让模型永远无法被直连命中。
+func (s *Store) externalNameConflictsGroupLocked(providerID, modelName string) (string, bool) {
+	p, ok := s.providerLocked(providerID)
+	if !ok {
+		return "", false
+	}
+	name := p.Name + "/" + modelName
+	for _, g := range s.Groups {
+		if g.Name == name {
+			return g.Name, true
+		}
+	}
+	return "", false
+}
+
+// groupNameConflictsModelLocked 组名是否与某个直连模型对外名重名（调用方需持锁）。
+func (s *Store) groupNameConflictsModelLocked(name string) bool {
+	for _, m := range s.Models {
+		if p, ok := s.providerLocked(m.ProviderID); ok && externalModelName(p, m) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// GroupConflictForProvider 检查 provider 改名后是否会让其模型对外名与路由组重名。
+// 返回第一个冲突的组名（后台保存前校验用）。
+func (s *Store) GroupConflictForProvider(providerID, providerName string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.Models {
+		if m.ProviderID != providerID {
+			continue
+		}
+		name := providerName + "/" + m.Name
+		for _, g := range s.Groups {
+			if g.Name == name {
+				return g.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
 // upsertModelLocked 保存配置（调用方需持锁）。targetGroupID 非空时确保模型加入该组；
 // 否则新模型加入默认组。旧版携带的 GroupID 也在此迁移后清空。
 func (s *Store) upsertModelLocked(m *Model, targetGroupID string) {
 	legacyGroupID := m.GroupID
 	m.GroupID = ""
+	m.Name = strings.TrimSpace(m.Name)
 	for i, old := range s.Models {
 		if old.ID != "" && old.ID == m.ID {
 			// 后台弹窗不提交运行时静音状态，更新时保留，避免一次编辑把限流静音清掉
@@ -1080,6 +1216,9 @@ func (s *Store) SetAutoModel(name string) error {
 			return fmt.Errorf("路由组名 %q 已被其他组使用", name)
 		}
 	}
+	if s.groupNameConflictsModelLocked(name) {
+		return fmt.Errorf("组名 %q 与某个直连模型对外名重名", name)
+	}
 	if s.Groups[0].Name == name {
 		return nil
 	}
@@ -1155,6 +1294,9 @@ func (s *Store) AddGroup(name, note string, contextLength int64) (RouteGroup, er
 			return RouteGroup{}, fmt.Errorf("路由组名 %q 已存在", name)
 		}
 	}
+	if s.groupNameConflictsModelLocked(name) {
+		return RouteGroup{}, fmt.Errorf("组名 %q 与某个直连模型对外名重名", name)
+	}
 	g := &RouteGroup{ID: s.newID("g"), Name: name, Note: strings.TrimSpace(note), Members: []GroupMember{}, ContextLength: max(contextLength, 0)}
 	s.Groups = append(s.Groups, g)
 	s.save()
@@ -1181,6 +1323,9 @@ func (s *Store) UpdateGroup(id, name, note string, contextLength int64) (RouteGr
 	}
 	if target == nil {
 		return RouteGroup{}, fmt.Errorf("路由组不存在")
+	}
+	if s.groupNameConflictsModelLocked(name) {
+		return RouteGroup{}, fmt.Errorf("组名 %q 与某个直连模型对外名重名", name)
 	}
 	target.Name = name
 	target.Note = strings.TrimSpace(note)
@@ -1397,9 +1542,88 @@ func (s *Store) providerLocked(id string) (*Provider, bool) {
 	return nil, false
 }
 
-// CandidatesDetailed 与 Candidates / AllCandidates 同义，但同时返回被剔除条目的原因。
-// name 为空或 all 为 true 时不按名字过滤（全局 fallback 用）。
-// candidatesDetailedLocked 见 CandidatesDetailed（调用方需持锁）
+// externalModelName 直连模型的对外名：provider 显示名 + "/" + 上游模型名。
+// 只做拼接，不解析；模型名本身可以再包含 "/"。
+func externalModelName(p *Provider, m *Model) string {
+	if p == nil {
+		return m.Name
+	}
+	return p.Name + "/" + m.Name
+}
+
+// DirectLookup 直连模型名的解析结果。直连不再选路：要么唯一命中，要么报错。
+type DirectLookup struct {
+	Candidate Candidate
+	Found     bool
+	Ambiguous bool
+	Reason    string // 命中但当前不可用（静音/每日上限/并行已满）时的原因
+}
+
+// DirectCandidate 按对外名 "provider/model" 精确解析唯一一条模型配置。
+// 同名模型（同 provider 下重复配置）视为数据歧义，不做优先级挑选。
+func (s *Store) DirectCandidate(name string, now time.Time) DirectLookup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	today := now.Format("2006-01-02")
+	var matches []Candidate
+	for _, m := range s.Models {
+		p, ok := s.providerLocked(m.ProviderID)
+		if !ok || externalModelName(p, m) != name {
+			continue
+		}
+		c := Candidate{Provider: *p, Model: *m}
+		c.Model.Mutes = append([]MuteWindow(nil), m.Mutes...)
+		matches = append(matches, c)
+	}
+	switch len(matches) {
+	case 0:
+		return DirectLookup{}
+	case 1:
+		c := matches[0]
+		return DirectLookup{
+			Candidate: c,
+			Found:     true,
+			Reason:    s.skipReason(&c.Model, now, today),
+		}
+	default:
+		return DirectLookup{Found: true, Ambiguous: true}
+	}
+}
+
+// ExposedModel 对外声明的直连模型：唯一名字 + 自身上下文窗口。
+type ExposedModel struct {
+	Name          string
+	ContextLength int64
+}
+
+// ExposedModels 所有开启 Expose 的直连模型，名字已带上 provider 前缀，按名字排序。
+func (s *Store) ExposedModels() []ExposedModel {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]bool, len(s.Models))
+	out := make([]ExposedModel, 0, len(s.Models))
+	for _, m := range s.Models {
+		if m == nil || !m.Expose {
+			continue
+		}
+		p, ok := s.providerLocked(m.ProviderID)
+		if !ok {
+			continue
+		}
+		name := externalModelName(p, m)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, ExposedModel{Name: name, ContextLength: m.ContextLength})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// CandidatesDetailed 返回按名字匹配的候选及被剔除原因（诊断/测试用）。
+// 直连请求不再使用同名候选池，改由 DirectCandidate 精确解析唯一条目。
+// name 为空或 all 为 true 时不按名字过滤。
 func (s *Store) CandidatesDetailed(name string, now time.Time, all bool) ([]Candidate, []SkipReason) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1461,13 +1685,13 @@ func (s *Store) candidatesLocked(entries []candidateEntry, now time.Time) ([]Can
 	return out, skips
 }
 
-// AllCandidates 所有模型的可用候选（全局兜底用），剔除静音中、超每日上限的，按优先级降序
+// AllCandidates 所有模型的可用候选（诊断/测试用），剔除静音中、超每日上限的，按优先级降序
 func (s *Store) AllCandidates(now time.Time) []Candidate {
 	out, _ := s.CandidatesDetailed("", now, true)
 	return out
 }
 
-// Candidates 找出该名字的可用候选：剔除静音中、今日 token 已达上限的，按优先级降序
+// Candidates 找出该名字的可用候选（诊断/测试用）：剔除静音中、今日 token 已达上限的，按优先级降序
 func (s *Store) Candidates(name string, now time.Time) []Candidate {
 	out, _ := s.CandidatesDetailed(name, now, false)
 	return out
@@ -1518,24 +1742,6 @@ func (s *Store) ContextLength(name string) int64 {
 		}
 	}
 	return min
-}
-
-// ModelNames 去重后的对外模型名列表（仅统计开启了 Expose 的路由）
-func (s *Store) ModelNames() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	set := map[string]bool{}
-	for _, m := range s.Models {
-		if m.Expose {
-			set[m.Name] = true
-		}
-	}
-	out := make([]string, 0, len(set))
-	for n := range set {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // Path 状态文件路径（后台展示与测试用）

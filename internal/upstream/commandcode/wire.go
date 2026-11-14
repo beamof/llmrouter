@@ -583,6 +583,21 @@ func ccFailure(status int, body []byte) (int, string) {
 	return status, msg
 }
 
+// ccStatusError 把上游失败包装成可透传的类型化错误；上游没给错误体时用归一文案补一个。
+func ccStatusError(status int, header http.Header, body []byte, msg string) error {
+	out := body
+	if len(bytes.TrimSpace(out)) == 0 {
+		out, _ = json.Marshal(map[string]any{
+			"error": map[string]string{"message": msg, "type": "llmrouter_error"},
+		})
+	}
+	var h http.Header
+	if header != nil {
+		h = header.Clone()
+	}
+	return &upstream.StatusError{Status: status, Header: h, Body: out}
+}
+
 // ccStreamError 解析 error 事件（字符串或 {message,statusCode,type,code}）。
 type ccStreamError struct {
 	Status  int
@@ -755,13 +770,13 @@ func (a *Adapter) attempt(w http.ResponseWriter, r *http.Request, c domain.Candi
 					ProviderID: c.Provider.ID, Model: c.Model.Name,
 					Message: fmt.Sprintf("Command Code 返回 429，已自动静音至 %s", until.Local().Format("01-02 15:04")),
 					Detail:  string(eb)})
-				return fmt.Errorf("上游返回 %d: %s", status, msg)
+				return ccStatusError(status, resp.Header, eb, msg)
 			}
 		}
 		a.rt.Logf(LogEntry{Level: "error", Kind: domain.KindUpstream, Status: status, KeyID: keyID,
 			ProviderID: c.Provider.ID, Model: c.Model.Name,
 			Message: fmt.Sprintf("Command Code 上游返回 HTTP %d", status), Detail: string(eb)})
-		return fmt.Errorf("上游返回 %d: %s", status, msg)
+		return ccStatusError(status, resp.Header, eb, msg)
 	}
 	return a.ccRelay(w, r, c, &upstream.FirstByteReader{R: resp.Body, T: tm}, keyID, wantStream, responsesMode, tm, sm)
 }

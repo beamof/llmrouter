@@ -21,16 +21,6 @@ var hopHeaders = []string{
 	"Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding", "Upgrade",
 }
 
-// StatusError 标准上游返回的非成功状态码。
-type StatusError struct {
-	Status int
-	Body   []byte
-}
-
-func (e *StatusError) Error() string {
-	return fmt.Sprintf("上游返回 HTTP %d: %s", e.Status, ErrSnippet(e.Body))
-}
-
 // Standard 标准 OpenAI 兼容上游适配器：请求与响应字节级透传。
 type Standard struct {
 	Store    *store.Store
@@ -68,9 +58,10 @@ func (s *Standard) Attempt(a *Attempt) error {
 		return err
 	}
 	if resp.StatusCode >= 400 {
-		eb, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		// 1MB 足够覆盖正常错误体；直连请求会把状态码与原始 body 透传给客户端。
+		eb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return &StatusError{Status: resp.StatusCode, Body: eb}
+		return &StatusError{Status: resp.StatusCode, Header: resp.Header.Clone(), Body: eb}
 	}
 	s.relay(a, resp)
 	return nil

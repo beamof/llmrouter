@@ -823,7 +823,7 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
         <option value="commandcode">Command Code（Go 等订阅）</option>
       </select>
     </div>
-    <div class="field"><label>名称</label><input id="p-name" placeholder="deepseek"></div>
+    <div class="field"><label>名称</label><input id="p-name" placeholder="deepseek"><div class="hint" style="margin-top:4px">会作为直连模型名的前缀（如 deepseek/deepseek-chat），必须唯一且不含 /；改名会使旧模型名失效。</div></div>
     <div class="field" id="row-base"><label>Chat 基址 *</label><input id="p-base" class="mono" placeholder="https://api.openai.com/v1"></div>
     <div class="field" id="row-key"><label>API Key</label><input id="p-key" class="mono" placeholder="sk-..." autocomplete="off"></div>
     <div class="field" id="row-resp"><label>Responses 基址</label><input id="p-resp" class="mono" placeholder="留空 = 同 Chat 基址"></div>
@@ -899,6 +899,7 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
       <div style="flex:1;min-width:0">
         <input id="m-name" class="mono" list="upstream-models" placeholder="gpt-4o（可下拉选择，或手动输入）" style="width:100%">
         <datalist id="upstream-models"></datalist>
+        <div class="hint mono" id="m-external" style="margin-top:4px"></div>
         <div class="hint" id="m-fetch-status" style="margin-top:4px"></div>
       </div>
     </div>
@@ -943,7 +944,7 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
   <div class="dlg-body">
     <div class="dlg-head"><h3 id="dlg-group-title">新建路由组</h3></div>
     <div class="field"><label>组名 *</label><input id="g-name" class="mono" placeholder="例如 auto / coding / cheap" style="width:100%"></div>
-    <p class="hint" style="margin:-2px 0 12px">组名就是客户端请求体里的 model 名：填它时只在本组模型里按优先级选路。</p>
+    <p class="hint" style="margin:-2px 0 12px">组名就是客户端请求体里的 model 名：填它时只在本组模型里按优先级选路。组名不能与直连模型名（provider/model）重名。</p>
     <div class="field"><label>备注</label><input id="g-note" placeholder="可选，如：日常编码 / 便宜模型" style="width:100%"></div>
     <div class="field"><label>上下文大小</label>
       <div class="inline"><input id="g-context" type="number" min="0" step="1000" value="0" style="max-width:130px"><span class="hint">tokens，0 = 自动取成员最小值。填了就以本组为准；只影响 /v1/models 的对外声明（context_length / max_model_len），不参与路由</span></div>
@@ -1006,6 +1007,8 @@ const fmtTok = n => {
 };
 const exact = n => fmtN(n) + ' tokens';
 const pname = id => (S.providers.find(p => p.id === id) || {}).name || id || '—';
+// 直连模型对外名：provider/model（后端在 state 里给出 external_name，旧快照回退拼接）
+const extName = m => m ? (m.external_name || (pname(m.provider_id) + '/' + m.name)) : '';
 const keyName = id => !id ? '免鉴权' : id === 'env' ? '环境变量' : ((S.api_keys || []).find(k => k.id === id) || {}).name || '已删除';
 // 思考等级单元格：主值 = 实际下发档位（off/none 灰、其余强调色），声明值与实发不同
 // 时小字标注「声明 X」（实发为空说明该线路没下发档位）
@@ -1418,7 +1421,7 @@ function renderSessions() {
   }
   body.innerHTML = list.map(x => {
     const m = S.models.find(mm => mm.id === x.model_id);
-    const bound = m ? m.name : x.model_id;
+    const bound = m ? extName(m) : x.model_id;
     const prov = m ? pname(m.provider_id) : '—';
     const short = x.id.length > 20 ? x.id.slice(0, 10) + '…' + x.id.slice(-6) : x.id;
     const switched = x.requested && x.requested !== bound;
@@ -1649,7 +1652,7 @@ function renderDetail(rows) {
       const ttft = u.ttft_samples > 0 ? Math.round(u.ttft_nanos / u.ttft_samples / 1e6) : 0;
       const sid = u.session_id || '';
       const short = sid.length > 20 ? sid.slice(0, 10) + '…' + sid.slice(-6) : sid;
-      const switched = u.requested && u.requested !== u.model;
+      const switched = u.requested && u.requested !== (pname(u.provider_id) + '/' + u.model);
       const live = liveIds.has(sid);
       return `<tr>
         <td>${esc(u.date)}</td>
@@ -1864,8 +1867,8 @@ function renderModels() {
       </td>
       <td>
         <div class="model-cell">
-          <span class="model-name mono" title="${esc(m.name)}">${esc(m.name)}</span>
-          <span class="model-prov">${esc(pname(m.provider_id))}</span>
+          <span class="model-name mono" title="直连请求名">${esc(extName(m))}</span>
+          <span class="model-prov">${esc(pname(m.provider_id))} · 上游 ${esc(m.name)}</span>
           <div class="test-res" id="test-${m.id}"></div>
         </div>
       </td>
@@ -1978,6 +1981,7 @@ function editModel(id) {
   $('m-provider').innerHTML = S.providers.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
   $('m-provider').value = editingModel?.provider_id || S.providers[0].id;
   $('m-name').value = editingModel?.name || '';
+  updateModelExternal();
   const curMem = (cur.members || []).find(x => x.model_id === id);
   $('m-priority').value = curMem ? curMem.priority : ((groupModels()[0]?.priority || 0) + 1);
   $('m-limit').value = editingModel?.daily_limit ? editingModel.daily_limit / 10000 : 0;
@@ -2007,7 +2011,16 @@ async function fetchUpstreamModels() {
     st.textContent = '获取上游模型列表失败（' + e.message + '），可手动填写';
   }
 }
-$('m-provider').onchange = fetchUpstreamModels;
+// 直连模型对外名 = provider 名/上游模型名；此处仅输入时预览，保存后以后端规范化的值为准
+function updateModelExternal() {
+  const p = S.providers.find(x => x.id === $('m-provider').value);
+  const name = $('m-name').value.trim();
+  $('m-external').textContent = name
+    ? `直连请求名：${(p ? p.name : 'provider')}/${name}`
+    : '直连请求名为 provider/模型名；provider 名与模型名都必须唯一';
+}
+$('m-provider').onchange = () => { fetchUpstreamModels(); updateModelExternal(); };
+$('m-name').oninput = updateModelExternal;
 
 function addMuteRow(from = '09:00', to = '18:00') {
   const div = document.createElement('div');
@@ -2079,7 +2092,7 @@ function openAttach() {
   if (!candidates.length) { alert('没有可加入的其他模型配置；请先在任意组里「添加模型」'); return; }
   $('a-group').textContent = cur.name;
   $('a-model').innerHTML = candidates.map(m =>
-    `<option value="${m.id}">${esc(pname(m.provider_id))} / ${esc(m.name)}</option>`).join('');
+    `<option value="${m.id}">${esc(extName(m))}</option>`).join('');
   $('a-priority').value = (groupModels()[0]?.priority || 0) + 1;
   dlgAttach.showModal();
 }

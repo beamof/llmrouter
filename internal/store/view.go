@@ -1,10 +1,12 @@
 package store
 
-// ModelView 模型 + 今日已用 tokens + 当前在途请求数（给后台页面）
+// ModelView 模型 + 今日已用 tokens + 当前在途请求数（给后台页面）。
+// ExternalName 是直连请求应使用的对外名 "provider/model"，与 Model.Name（上游模型名）区分。
 type ModelView struct {
 	*Model
-	UsedToday int64 `json:"used_today"`
-	Inflight  int   `json:"inflight"`
+	ExternalName string `json:"external_name"`
+	UsedToday    int64  `json:"used_today"`
+	Inflight     int    `json:"inflight"`
 }
 
 // StateView 后台页面所需的完整状态

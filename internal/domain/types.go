@@ -145,8 +145,9 @@ type Model struct {
 	ProviderID string `json:"provider_id"`
 	// GroupID 仅用于读取旧版数据（每模型单组），加载迁移后恒为空。
 	GroupID string `json:"group_id,omitempty"`
-	Name    string `json:"name"` // 模型名：直接调用时的 model 名，也是发往上游的 model 字段
-	// Priority 直连优先级：由各路由组成员优先级的最大值自动维护。
+	Name    string `json:"name"` // 上游模型名：发往上游的 model 字段，也是直连名 provider/name 的后半段
+	// Priority 直连优先级（已不参与直连选路，仅保留展示/兼容）：由各路由组成员
+	// 优先级的最大值自动维护。
 	Priority      int          `json:"priority"`
 	DailyLimit    int64        `json:"daily_limit"`    // 每日 token 上限，0 = 不限（全局共享）
 	MaxConcurrent int          `json:"max_concurrent"` // 最大并行请求数，0 = 不限；全局共享
