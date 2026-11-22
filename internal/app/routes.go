@@ -66,6 +66,7 @@ func (s *Server) routes() *http.ServeMux {
 	api.HandleFunc("DELETE /api/logs", s.handleLogsClear)
 	api.HandleFunc("GET /api/version", s.handleVersion)
 	api.HandleFunc("GET /api/update/check", s.handleUpdateCheck)
+	api.HandleFunc("GET /api/update/status", s.handleUpdateStatus)
 	api.HandleFunc("POST /api/update/apply", s.handleUpdateApply)
 	mux.Handle("/api/", s.adminAuth(api))
 	return mux

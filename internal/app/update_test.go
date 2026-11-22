@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // withAppVersion 临时改写版本号（模拟发布版/源码构建），测试结束后恢复
@@ -184,7 +185,7 @@ func TestDownloadUpdateVerifiesChecksum(t *testing.T) {
 	sumsBody = fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), asset)
 	path, err := s.downloadUpdate(context.Background(), &updateInfo{
 		Asset: asset, assetURL: srv.URL + "/bin", sumsURL: srv.URL + "/sums",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +211,7 @@ func TestDownloadUpdateVerifiesChecksum(t *testing.T) {
 	sumsBody = fmt.Sprintf("%s  %s\n", strings.Repeat("0", 64), asset)
 	if _, err := s.downloadUpdate(context.Background(), &updateInfo{
 		Asset: asset, assetURL: srv.URL + "/bin", sumsURL: srv.URL + "/sums",
-	}); err == nil || !strings.Contains(err.Error(), "SHA256") {
+	}, nil); err == nil || !strings.Contains(err.Error(), "SHA256") {
 		t.Fatalf("校验不通过应报错，得到 %v", err)
 	}
 	if left, _ := filepath.Glob(filepath.Join(dir, ".llmrouter-update-*")); len(left) > 0 {
@@ -224,8 +225,210 @@ func TestDownloadUpdateVerifiesChecksum(t *testing.T) {
 	sumsBody = fmt.Sprintf("%s  other-binary\n", strings.Repeat("0", 64))
 	if _, err := s.downloadUpdate(context.Background(), &updateInfo{
 		Asset: asset, assetURL: srv.URL + "/bin", sumsURL: srv.URL + "/sums",
-	}); err == nil || !strings.Contains(err.Error(), "没有") {
+	}, nil); err == nil || !strings.Contains(err.Error(), "没有") {
 		t.Fatalf("缺少资产校验值应报错，得到 %v", err)
+	}
+}
+
+// TestUpdateApplyAsyncTask 升级是后台任务：POST 立即返回，状态经
+// /api/update/status 轮询；任务独立于发起请求的连接（客户端断开不中止下载）。
+func TestUpdateApplyAsyncTask(t *testing.T) {
+	asset, ok := updateAssetName(runtime.GOOS, runtime.GOARCH)
+	if !ok {
+		t.Skip("当前平台没有对应的发布资产")
+	}
+	withAppVersion(t, "v1.0.0")
+	bin := bytes.Repeat([]byte("n100-slow-network-payload"), 64*1024) // ~1.6MB
+	sum := sha256.Sum256(bin)
+
+	var gh *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(ghRelease{
+			TagName: "v2.0.0",
+			Assets: []ghAsset{
+				{Name: asset, Size: int64(len(bin)), URL: gh.URL + "/slow/bin"},
+				{Name: "SHA256SUMS.txt", Size: 400, URL: gh.URL + "/slow/sums"},
+			},
+		})
+	})
+	mux.HandleFunc("/slow/bin", func(w http.ResponseWriter, r *http.Request) {
+		// 分块慢速输出，模拟 N100 直连 GitHub 的慢网络
+		w.Header().Set("Content-Length", fmt.Sprint(len(bin)))
+		for off := 0; off < len(bin); off += 32 * 1024 {
+			end := off + 32*1024
+			if end > len(bin) {
+				end = len(bin)
+			}
+			w.Write(bin[off:end])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	})
+	mux.HandleFunc("/slow/sums", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s  %s\n", hex.EncodeToString(sum[:]), asset)
+	})
+	gh = httptest.NewServer(mux)
+	defer gh.Close()
+
+	st, err := LoadStore(filepath.Join(t.TempDir(), "data.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var installedPath string
+	installed := make(chan string, 1)
+	s := &Server{store: st, client: &http.Client{}, ghAPI: gh.URL,
+		installUpdate: func(newPath, exe string) error {
+			installedPath = newPath
+			installed <- newPath
+			return nil
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/update/apply", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	s.handleUpdateApply(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply 应立即返回 200: %d %s", rec.Code, rec.Body.String())
+	}
+	var started struct {
+		OK      bool   `json:"ok"`
+		Latest  string `json:"latest"`
+		Message string `json:"message"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &started)
+	if !started.OK || started.Latest != "2.0.0" {
+		t.Fatalf("启动响应: %+v", started)
+	}
+	cancel() // 客户端立刻断开：任务必须照常完成
+
+	// 轮询任务状态直到安装钩子被调用
+	select {
+	case p := <-installed:
+		if p == "" || installedPath != p {
+			t.Fatalf("安装路径异常: %q", p)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("后台任务未在预期时间内完成下载与校验")
+	}
+	// 终态：done，且「开始安装」日志已入 store（exec 前落盘的修复点）
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		srec := httptest.NewRecorder()
+		s.handleUpdateStatus(srec, httptest.NewRequest(http.MethodGet, "/api/update/status", nil))
+		var status struct {
+			Running bool        `json:"running"`
+			Task    *updateTask `json:"task"`
+		}
+		json.Unmarshal(srec.Body.Bytes(), &status)
+		if status.Task != nil && status.Task.Stage == "done" {
+			if status.Running {
+				t.Fatal("done 后任务不应仍在执行")
+			}
+			if status.Task.Received != int64(len(bin)) || status.Task.Total != int64(len(bin)) {
+				t.Fatalf("下载进度: %+v", status.Task)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("任务未到 done: %+v", status.Task)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	foundLog := false
+	for _, l := range st.Logs {
+		if strings.Contains(l.Message, "开始安装新版本") {
+			foundLog = true
+		}
+	}
+	if !foundLog {
+		t.Fatal("「开始安装」日志应在 exec 前写入 store")
+	}
+	os.Remove(installedPath)
+}
+
+// TestUpdateApplyAsyncFailure 校验失败：任务转 failed、原因可见、服务不受影响
+func TestUpdateApplyAsyncFailure(t *testing.T) {
+	asset, ok := updateAssetName(runtime.GOOS, runtime.GOARCH)
+	if !ok {
+		t.Skip("当前平台没有对应的发布资产")
+	}
+	withAppVersion(t, "v1.0.0")
+	var gh *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(ghRelease{TagName: "v2.0.0", Assets: []ghAsset{
+			{Name: asset, Size: 10, URL: gh.URL + "/bin"},
+			{Name: "SHA256SUMS.txt", Size: 400, URL: gh.URL + "/sums"},
+		}})
+	})
+	mux.HandleFunc("/bin", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("tampered!!")) })
+	mux.HandleFunc("/sums", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s  %s\n", strings.Repeat("0", 64), asset)
+	})
+	gh = httptest.NewServer(mux)
+	defer gh.Close()
+
+	st, _ := LoadStore(filepath.Join(t.TempDir(), "data.json"))
+	s := &Server{store: st, client: &http.Client{}, ghAPI: gh.URL,
+		installUpdate: func(string, string) error { t.Fatal("校验失败不应走到安装"); return nil },
+	}
+	rec := httptest.NewRecorder()
+	s.handleUpdateApply(rec, httptest.NewRequest(http.MethodPost, "/api/update/apply", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply 应启动任务: %d %s", rec.Code, rec.Body.String())
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		srec := httptest.NewRecorder()
+		s.handleUpdateStatus(srec, httptest.NewRequest(http.MethodGet, "/api/update/status", nil))
+		var status struct {
+			Running bool        `json:"running"`
+			Task    *updateTask `json:"task"`
+		}
+		json.Unmarshal(srec.Body.Bytes(), &status)
+		if status.Task != nil && status.Task.Stage == "failed" {
+			if !strings.Contains(status.Task.Message, "下载安装包失败") {
+				t.Fatalf("失败原因: %+v", status.Task)
+			}
+			if status.Running {
+				t.Fatal("失败后任务不应仍在执行")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("任务未到 failed: %+v", status.Task)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestUpdateApplyConflict 任务执行中重复 apply 应被拒绝
+func TestUpdateApplyConflict(t *testing.T) {
+	withAppVersion(t, "v1.0.0")
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/releases/latest" {
+			json.NewEncoder(w).Encode(ghRelease{TagName: "v2.0.0"})
+			return
+		}
+		<-block // 卡住资产下载
+	}))
+	defer srv.Close()
+	defer close(block)
+	st, _ := LoadStore(filepath.Join(t.TempDir(), "data.json"))
+	s := &Server{store: st, client: &http.Client{}, ghAPI: srv.URL}
+	// 手工把任务置为执行中，验证并发拒绝
+	s.updMu.Lock()
+	s.updRunning = true
+	s.updMu.Unlock()
+	rec := httptest.NewRecorder()
+	s.handleUpdateApply(rec, httptest.NewRequest(http.MethodPost, "/api/update/apply", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("执行中重复 apply 应 409: %d", rec.Code)
 	}
 }
 

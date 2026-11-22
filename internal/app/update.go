@@ -97,6 +97,20 @@ type versionInfo struct {
 	Installable bool   `json:"installable"` // 当前平台是否有预编译发布包可自动升级
 }
 
+// updateTask 一次升级任务的实时状态（/api/update/status 轮询体）。
+// 升级是后台任务：慢网络下下载可能持续数分钟，同步阻塞的 POST 会被浏览器
+// 或中间代理掐断，前端只能误报"失败"而服务端其实仍在正常下载安装。
+type updateTask struct {
+	Stage      string    `json:"stage"`                 // downloading / applying / done / failed
+	Message    string    `json:"message,omitempty"`     // 阶段描述或失败原因
+	Latest     string    `json:"latest,omitempty"`      // 目标版本
+	Asset      string    `json:"asset,omitempty"`       // 安装包资产名
+	Total      int64     `json:"total,omitempty"`       // 安装包字节数（总）
+	Received   int64     `json:"received,omitempty"`    // 已下载字节数
+	StartedAt  time.Time `json:"started_at"`            // 任务启动时刻
+	FinishedAt time.Time `json:"finished_at,omitempty"` // 终态（done/failed）时刻
+}
+
 // updateAssetName 发布资产按 GOOS/GOARCH 命名（见 .github/workflows/release.yml）。
 func updateAssetName(goos, goarch string) (string, bool) {
 	arch := map[string]string{"amd64": "x86_64", "arm64": "arm64"}[goarch]
@@ -309,7 +323,10 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
-// handleUpdateApply 下载并安装最新版本，然后退出等待升级助手重启服务。
+// handleUpdateApply 启动升级任务并立即返回；下载、校验与安装在后台进行，
+// 进度经 /api/update/status 轮询。同步段只做版本检测与前置校验（约几秒），
+// 避免慢网络下长时间无响应的 POST 被浏览器或中间代理掐断——那会让前端误报
+// "升级失败"，而服务端其实仍在正常下载（下载也不再随客户端断开而中止）。
 func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	s.updMu.Lock()
 	if s.updRunning {
@@ -319,70 +336,125 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	}
 	s.updRunning = true
 	s.updMu.Unlock()
-	release := func() {
+	abort := func(status int, msg string) {
 		s.updMu.Lock()
 		s.updRunning = false
 		s.updMu.Unlock()
-	}
-	fail := func(status int, msg string) {
-		release()
 		s.logFail(LogEntry{Level: "error", Kind: kindUpdate, Status: status, Message: msg})
 		writeErr(w, status, msg)
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second) // 同步段只查 Release 元数据
 	defer cancel()
-
 	info, err := s.checkUpdate(ctx) // 升级不复用缓存：必须是此刻的最新版
 	if err != nil {
-		fail(http.StatusBadGateway, "检测更新失败: "+err.Error())
+		abort(http.StatusBadGateway, "检测更新失败: "+err.Error())
 		return
 	}
 	if !info.HasUpdate {
-		fail(http.StatusBadRequest, "当前已是最新版本（"+info.Current+"）")
+		msg := "当前已是最新版本（" + info.Current + "）"
+		if info.Notes != "" {
+			// 平台无发布包 / 资产尚未就绪等：原文案"已是最新"会误导
+			msg = strings.TrimSuffix(info.Notes, "。") + "，请稍后再试或到 Release 页面手动下载"
+		}
+		abort(http.StatusBadRequest, msg)
 		return
 	}
 	if info.assetURL == "" {
-		fail(http.StatusBadRequest, "最新发布中没有当前平台（"+runtime.GOOS+"/"+runtime.GOARCH+"）的可执行文件")
+		abort(http.StatusBadRequest, "最新发布中没有当前平台（"+runtime.GOOS+"/"+runtime.GOARCH+"）的可执行文件")
 		return
 	}
 	if info.sumsURL == "" {
-		fail(http.StatusBadRequest, "最新发布缺少 SHA256SUMS.txt，无法校验安装包，已中止")
+		abort(http.StatusBadRequest, "最新发布缺少 SHA256SUMS.txt，无法校验安装包，已中止")
 		return
 	}
 
-	newPath, err := s.downloadUpdate(ctx, info)
+	task := &updateTask{
+		Stage: "downloading", Latest: info.Latest, Asset: info.Asset,
+		Total: info.AssetSize, StartedAt: time.Now(),
+	}
+	s.updMu.Lock()
+	s.updTask = task
+	s.updMu.Unlock()
+
+	go s.runUpdateTask(task, info)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"latest":  info.Latest,
+		"message": "已开始后台下载 v" + info.Latest + "，进度见下方状态",
+	})
+}
+
+// handleUpdateStatus 升级任务的实时状态（前端轮询：阶段、下载进度、失败原因）。
+// 任务状态只存内存；exec 重启后自然消失，前端据此转入等待服务上线。
+func (s *Server) handleUpdateStatus(w http.ResponseWriter, _ *http.Request) {
+	s.updMu.Lock()
+	defer s.updMu.Unlock()
+	if s.updTask == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"running": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"running": s.updRunning, "task": s.updTask})
+}
+
+// runUpdateTask 后台执行下载 → 校验 → 安装 → 重启。上下文独立于发起请求：
+// 客户端断开、页面关闭都不影响任务继续。任何失败写回任务状态并记日志，
+// 正在运行的服务不受影响。
+func (s *Server) runUpdateTask(task *updateTask, info *updateInfo) {
+	set := func(stage, msg string) {
+		s.updMu.Lock()
+		task.Stage, task.Message = stage, msg
+		if stage == "failed" || stage == "done" {
+			task.FinishedAt = time.Now()
+			s.updRunning = false
+		}
+		s.updMu.Unlock()
+	}
+	fail := func(msg, detail string) {
+		set("failed", msg)
+		s.logFail(LogEntry{Level: "error", Kind: kindUpdate, Message: msg, Detail: detail})
+	}
+
+	// 独立上下文：不随发起请求的连接断开而取消，总预算 10 分钟
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	progress := func(received, total int64) {
+		s.updMu.Lock()
+		task.Received, task.Total = received, total
+		s.updMu.Unlock()
+	}
+	newPath, err := s.downloadUpdate(ctx, info, progress)
 	if err != nil {
-		fail(http.StatusBadGateway, "下载安装包失败: "+err.Error())
+		fail("下载安装包失败", err.Error())
+		os.Remove(newPath)
 		return
 	}
 	exe, err := executablePath()
 	if err != nil {
 		os.Remove(newPath)
-		fail(http.StatusInternalServerError, "定位当前可执行文件失败: "+err.Error())
+		fail("定位当前可执行文件失败", err.Error())
 		return
 	}
-	s.store.Flush() // 升级会替换并退出进程，先把热数据写盘
-	if err := prepareUpdateRestart(newPath, exe); err != nil {
-		os.Remove(newPath)
-		fail(http.StatusInternalServerError, "准备升级失败: "+err.Error())
-		return
-	}
-
+	set("applying", "已下载并校验，准备替换二进制并重启")
 	s.logFail(LogEntry{
 		Level: "info", Kind: kindUpdate, Status: http.StatusOK,
 		Message: "开始安装新版本 " + info.Latest,
 		Detail:  fmt.Sprintf("资产 %s（%d 字节），安装后自动重启", info.Asset, info.AssetSize),
 	})
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"latest":  info.Latest,
-		"message": "已下载并校验 v" + info.Latest + "，服务即将重启",
-	})
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush() // 先把响应发出去，再退出进程
+	// 先落盘再动二进制：exec/退出前把「开始安装」日志与热数据写出
+	// （旧实现先 Flush 后写日志，日志会卡在 2 秒合并窗口里随进程消失）。
+	s.store.Flush()
+	install := s.installUpdate
+	if install == nil {
+		install = defaultInstallUpdate
 	}
-	time.AfterFunc(700*time.Millisecond, func() { finishUpdateRestart(newPath, exe) })
+	if err := install(newPath, exe); err != nil {
+		os.Remove(newPath)
+		fail("安装新版本失败（已回滚，旧版本继续运行）", err.Error())
+		return
+	}
+	set("done", "已安装，服务即将重启")
 }
 
 // executablePath 返回当前可执行文件的真实绝对路径（跟随符号链接，避免替换到链接本身）。
@@ -430,9 +502,11 @@ func copySelfToTemp() (string, error) {
 	return helper, nil
 }
 
-// downloadUpdate 下载安装包到程序目录并校验 SHA256，返回临时文件路径。
-// 放在程序目录是为了替换时能原子改名（跨分区 rename 会失败）。
-func (s *Server) downloadUpdate(ctx context.Context, info *updateInfo) (string, error) {
+// downloadUpdate 下载安装包到程序目录，边下边写盘并增量计算 SHA256，
+// onProgress（可为 nil）收到累计字节数与总量。放在程序目录是为了替换时能
+// 原子改名（跨分区 rename 会失败）。返回临时文件路径；失败时已清理临时文件
+// 或把残路径一并返回交调用方删除。
+func (s *Server) downloadUpdate(ctx context.Context, info *updateInfo, onProgress func(received, total int64)) (string, error) {
 	exe, err := executablePath()
 	if err != nil {
 		return "", err
@@ -453,28 +527,80 @@ func (s *Server) downloadUpdate(ctx context.Context, info *updateInfo) (string, 
 		return "", fmt.Errorf("在程序目录创建临时文件失败（是否缺少写权限？）: %v", err)
 	}
 	tmp := f.Name()
-	f.Close()
+	cleanup := func(cause error) (string, error) {
+		f.Close()
+		os.Remove(tmp)
+		return "", cause
+	}
 
-	body, err := s.fetchBytes(ctx, info.assetURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, info.assetURL, nil)
 	if err != nil {
+		return cleanup(err)
+	}
+	req.Header.Set("User-Agent", "llmrouter/"+appVersion)
+	resp, err := s.updateClient().Do(req)
+	if err != nil {
+		return cleanup(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return cleanup(fmt.Errorf("下载 %s 失败：HTTP %d %s", filepath.Base(info.assetURL), resp.StatusCode, errSnippet(b)))
+	}
+	total := info.AssetSize
+	if cl := resp.ContentLength; cl > 0 {
+		total = cl
+	}
+	hasher := sha256.New()
+	var received int64
+	buf := make([]byte, 64<<10)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			received += int64(n)
+			if received > maxUpdateSize {
+				return cleanup(fmt.Errorf("文件超过 %d MB，已中止", maxUpdateSize>>20))
+			}
+			if _, werr := f.Write(buf[:n]); werr != nil {
+				return cleanup(werr)
+			}
+			hasher.Write(buf[:n])
+			if onProgress != nil {
+				onProgress(received, total)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return cleanup(fmt.Errorf("下载中断: %v", rerr))
+		}
+	}
+	if err := f.Close(); err != nil {
 		os.Remove(tmp)
 		return "", err
 	}
-	sum := sha256.Sum256(body)
-	if got := hex.EncodeToString(sum[:]); got != want {
+	if got := hex.EncodeToString(hasher.Sum(nil)); got != want {
 		os.Remove(tmp)
 		return "", fmt.Errorf("SHA256 校验不通过（期望 %s，实际 %s），已中止安装", want, got)
 	}
-	if err := os.WriteFile(tmp, body, 0o755); err != nil {
-		os.Remove(tmp)
-		return "", err
-	}
-	// CreateTemp 建的是 0600，WriteFile 不会改已有文件权限；Linux 下缺执行位就无法启动
+	// CreateTemp 建的是 0600；Linux 下缺执行位就无法启动
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		os.Remove(tmp)
 		return "", err
 	}
 	return tmp, nil
+}
+
+// defaultInstallUpdate 完成安装收尾：平台准备（Windows 起升级助手）+ 稍候 +
+// 交接重启（Unix exec / Windows 退出交给助手）。稍候是给状态轮询的最后一次
+// 响应留出余量，让前端能稳定看到 done 再转入等待上线。
+func defaultInstallUpdate(newPath, exe string) error {
+	if err := prepareUpdateRestart(newPath, exe); err != nil {
+		return err
+	}
+	time.Sleep(700 * time.Millisecond)
+	return finishUpdateRestart(newPath, exe)
 }
 
 func (s *Server) fetchChecksums(ctx context.Context, url string) (map[string]string, error) {

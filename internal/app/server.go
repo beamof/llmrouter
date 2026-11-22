@@ -39,6 +39,9 @@ type Server struct {
 	updMu      sync.Mutex
 	upd        *updateInfo // 最近一次版本检测结果（缓存），nil = 未检测
 	updAt      time.Time   // 缓存写入时间
-	updRunning bool        // 升级任务是否已启动（替换文件后进程会退出）
-	ghAPI      string      // GitHub API 基址覆盖（测试注入，空 = 官方端点）
+	updRunning bool        // 升级任务是否正在执行
+	updTask    *updateTask // 当前/最近一次升级任务的实时状态（前端轮询）
+	// installUpdate 完成安装收尾（平台准备 + 交接重启）；测试注入用，nil = 默认实现。
+	installUpdate func(newPath, exe string) error
+	ghAPI         string // GitHub API 基址覆盖（测试注入，空 = 官方端点）
 }

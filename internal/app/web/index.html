@@ -2965,25 +2965,53 @@ function renderUpdate() {
   $('ver-notes').textContent = [UPD.notes, UPD.release_notes].filter(Boolean).join('\n\n');
 }
 
-// 下载 → 校验 SHA256 → 替换二进制 → 自动重启
+// 启动升级任务 → 轮询任务状态（下载进度）→ 安装 → 等服务重启。
+// 下载在服务端后台进行，页面断开也不影响任务继续。
 async function applyUpdate() {
   if (!UPD?.has_update) return;
   const apply = $('btn-upd-apply'), check = $('btn-upd-check'), st = $('ver-status');
   if (!confirm(`下载并安装 v${UPD.latest}？安装后服务会自动重启，进行中的请求会中断。`)) return;
   apply.disabled = true;
   check.disabled = true;
-  st.textContent = `正在下载并校验安装包（${fmtBytes(UPD.asset_size)}），请勿关闭页面…`;
   const current = UPD.current;
   try {
     const r = await api('POST', '/api/update/apply');
-    st.innerHTML = `<b>${esc(r.message || '正在安装')}</b>`;
-    $('ver-notes').textContent = '服务重启后本页会自动重新连接。';
-    await waitRestart(current);
+    st.innerHTML = `<b>${esc(r.message || '升级任务已启动')}</b>`;
   } catch (e) {
     st.textContent = '升级失败：' + e.message;
     apply.disabled = false;
     check.disabled = false;
+    return;
   }
+  // 轮询任务状态：下载进度 → 安装 → done/failed；服务重启后状态接口短暂不可达，
+  // 只要见过任务在跑就转入等待上线
+  let sawRunning = false;
+  for (let i = 0; i < 900; i++) { // 上限 15 分钟（慢网络下载）
+    await new Promise(rs => setTimeout(rs, 1000));
+    let res;
+    try { res = await api('GET', '/api/update/status'); }
+    catch (e) { continue; /* 服务重启中的短暂不可达 */ }
+    const task = res.task;
+    if (!task) { if (sawRunning) break; continue; }
+    sawRunning = true;
+    if (task.stage === 'failed') {
+      st.textContent = '升级失败：' + (task.message || '未知错误') + '（服务未受影响，可重试）';
+      apply.disabled = false;
+      check.disabled = false;
+      return;
+    }
+    if (task.stage === 'downloading') {
+      const pct = task.total > 0 ? `（${Math.min(100, Math.round(task.received * 100 / task.total))}%）` : '';
+      st.textContent = `正在下载 v${task.latest}：${fmtBytes(task.received)} / ${fmtBytes(task.total || 0)}${pct}，可离开本页，下载在服务端继续`;
+    } else if (task.stage === 'applying') {
+      st.textContent = `v${task.latest} 已下载并校验，正在替换并重启…`;
+    } else if (task.stage === 'done') {
+      break;
+    }
+    if (!res.running) break;
+  }
+  $('ver-notes').textContent = '服务重启后本页会自动重新连接。';
+  await waitRestart(current);
 }
 
 // 升级后轮询版本接口，等服务重新上线并确认版本已变化

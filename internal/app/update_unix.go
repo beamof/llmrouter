@@ -20,8 +20,8 @@ func prepareUpdateRestart(_, _ string) error { return nil }
 
 // finishUpdateRestart 原地轮换二进制后用 exec 换成新版本继续运行。
 // exec 保持同一 PID：systemd 视角服务从未停止；手动运行时进程也留在原终端。
-// 任何一步失败都把文件轮换回来，当前进程继续用旧版本服务，不中断。
-func finishUpdateRestart(newPath, exe string) {
+// 任何一步失败都把文件轮换回来，当前进程继续用旧版本服务，不中断，并返回错误。
+func finishUpdateRestart(newPath, exe string) error {
 	logf := func(format string, a ...any) {
 		fmt.Fprintf(os.Stderr, "[llmrouter-update] "+format+"\n", a...)
 	}
@@ -30,12 +30,12 @@ func finishUpdateRestart(newPath, exe string) {
 	if err := os.Rename(exe, oldPath); err != nil {
 		logf("无法备份旧程序: %v，取消本次升级（旧程序继续运行）", err)
 		os.Remove(newPath)
-		return
+		return fmt.Errorf("无法备份旧程序: %w", err)
 	}
 	if err := os.Rename(newPath, exe); err != nil {
 		logf("无法就位新程序: %v，已回滚（旧程序继续运行）", err)
 		os.Rename(oldPath, exe)
-		return
+		return fmt.Errorf("无法就位新程序: %w", err)
 	}
 	logf("新版本已就位，exec 重启 %s", exe)
 	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
@@ -43,7 +43,9 @@ func finishUpdateRestart(newPath, exe string) {
 		logf("exec 新版本失败: %v，已回滚（旧程序继续运行）", err)
 		os.Rename(exe, newPath)
 		os.Rename(oldPath, exe)
+		return fmt.Errorf("exec 新版本失败: %w", err)
 	}
+	return nil // exec 成功后不会走到这里
 }
 
 // processAlive 判断进程是否仍在运行；EPERM 表示进程存在但属于其他用户。

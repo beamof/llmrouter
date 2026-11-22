@@ -28,7 +28,10 @@ func prepareUpdateRestart(newPath, exe string) error {
 }
 
 // finishUpdateRestart 退出主进程，把轮换与重启交给已就位的升级助手。
-func finishUpdateRestart(_, _ string) { os.Exit(0) }
+func finishUpdateRestart(_, _ string) error {
+	os.Exit(0)
+	return nil // 不可达
+}
 
 // detachCommand 让新进程独立于当前控制台进程组：
 // 升级助手/重启后的服务不会随原进程的 Ctrl+C 一起退出，但仍沿用同一控制台输出日志。
