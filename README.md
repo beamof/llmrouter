@@ -9,7 +9,7 @@ WorkBuddy、Zed、Command Code 等私有协议上游由内置适配器按其线�
 - **多 Provider + 多路由组**：直连模型对外名统一为 `provider/model`，每个名字唯一对应一条配置，不选路、不故障转移；路由组对外是独立的虚拟模型名，组内按优先级自动故障转移，模型配置全局共享
 - **透传优先**：请求体只改写顶层 `model` 值（组名 / `provider/model` → 上游模型名），其余字段值不改写、不注入；SSE 边收边发，非流式原样回传；直连上游失败时状态码与响应体原样透传
 - **路由治理**：每日 token 上限、并行上限、按时段静音、429 自动静音、会话粘性、Responses 协议转换
-- **内置上游适配**：WorkBuddy / CodeBuddy（国内 / 国际）、Zed、Command Code
+- **内置上游适配**：WorkBuddy / CodeBuddy（国内 / 国际）、Zed、Command Code、Codex 套餐（ChatGPT 计划）
 - **网页后台**（中文、单文件、无前端依赖）：Provider / 模型 / 路由组管理、用量与会话统计、余额查询、异常日志、版本检测与一键升级、深浅色跟随系统
 - 状态落盘为单个 JSON 文件，零外部依赖，单二进制
 
@@ -64,18 +64,19 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## 上游适配
 
-三类私有协议上游与标准 Provider 混挂，共用全部路由规则。基址固定为官方端点、不可自定义
+私有协议上游与标准 Provider 混挂，共用全部路由规则。基址固定为官方端点、不可自定义
 （凭证随请求发出，避免发往其他主机）；需要代理时在 Provider 的「网络代理」栏配置。
 
-| | WorkBuddy / CodeBuddy | Zed | Command Code |
-|---|---|---|---|
-| 凭证入口 | 扫描本机客户端 / 粘贴凭证 JSON | 浏览器原生登录 / 粘贴回调 URL | 读取本机 CLI 登录 / 粘贴 API Key |
-| responses 承接 | 需开全局「Responses 协议转换」 | 直接承接 | 直接承接 |
-| 额外操作 | 每日签到 / 余额快照 | 套餐用量刷新 | 套餐与模型目录同步 |
+| | WorkBuddy / CodeBuddy | Zed | Command Code | Codex 套餐 |
+|---|---|---|---|---|
+| 凭证入口 | 扫描本机客户端 / 粘贴凭证 JSON | 浏览器原生登录 / 粘贴回调 URL | 读取本机 CLI 登录 / 粘贴 API Key | 浏览器 OAuth 登录 / 粘贴回调 URL |
+| responses 承接 | 需开全局「Responses 协议转换」 | 直接承接 | 直接承接 | 直接承接 |
+| 额外操作 | 每日签到 / 余额快照 | 套餐用量刷新 | 套餐与模型目录同步 | 模型目录同步 |
 
 - **WorkBuddy**：复用官方客户端登录态（glm、deepseek、minimax、kimi、hunyuan 等），凭证自动续期；非流式请求由网关聚合返回
 - **Zed**：复用 Zed 账号额度（`gpt-*`、`claude-*`），登录一次长期有效、凭证自动续期；`system_id` 依次取弹窗、`LLMROUTER_ZED_SYSTEM_ID`、本机安装数据库
 - **Command Code**：复用订阅额度（Go / Pro / GOAT / Max / Ultra）；`max_tokens` 上限 200000；可选零数据保留
+- **Codex 套餐**：Sign in with ChatGPT（ChatGPT Plus / Pro 的计划额度）：浏览器授权后 llmrouter 以 OAuth 公共客户端动态注册，access token（1 小时）临期自动续期、refresh token（30 天）滚动轮换；出站恒走 `api.openai.com/v1/responses` 且强制流式、不落盘，网关自动剥离该通道不支持的字段（`temperature` 等）与托管工具、把 `system` 折成 `developer`；需要 ChatGPT Plus / Pro 且用量与 ChatGPT 共享（Plus 为 5 小时窗口，达限 429 时按网关规则自动静音）；删除 Provider 会尝试在 OpenAI 侧吊销授权
 
 ## 后台与小工具
 

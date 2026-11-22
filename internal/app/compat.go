@@ -19,6 +19,7 @@ type (
 	ZedCred         = domain.ZedCred
 	ZedPlan         = domain.ZedPlan
 	CommandCodeCred = domain.CommandCodeCred
+	CodexCred       = domain.CodexCred
 	MuteWindow      = domain.MuteWindow
 	Model           = domain.Model
 	APIKey          = domain.APIKey

@@ -8,6 +8,7 @@ import (
 	"llmrouter/internal/auth"
 	"llmrouter/internal/session"
 	"llmrouter/internal/upstream"
+	"llmrouter/internal/upstream/codex"
 	"llmrouter/internal/upstream/workbuddy"
 	"llmrouter/internal/upstream/zed"
 )
@@ -25,10 +26,13 @@ type Server struct {
 
 	sessions *session.Manager // 会话粘性绑定（仅内存，重启即清）
 
-	wb      *workbuddy.Adapter // WorkBuddy 适配器（含续期单飞锁与目录缓存）
-	zed     *zed.Adapter       // Zed 适配器（含重铸单飞锁与登录会话）
-	zedBase string             // Zed 云端基址覆盖（测试注入用，空 = 官方端点）
-	ccBase  string             // Command Code 基址覆盖（测试注入用，空 = 官方端点）
+	wb            *workbuddy.Adapter // WorkBuddy 适配器（含续期单飞锁与目录缓存）
+	zed           *zed.Adapter       // Zed 适配器（含重铸单飞锁与登录会话）
+	zedBase       string             // Zed 云端基址覆盖（测试注入用，空 = 官方端点）
+	ccBase        string             // Command Code 基址覆盖（测试注入用，空 = 官方端点）
+	codex         *codex.Adapter     // Codex 套餐适配器（含续期单飞锁与登录会话）
+	codexAuthBase string             // Codex 授权服务器基址覆盖（测试注入用，空 = 官方端点）
+	codexAPIBase  string             // Codex 推理 API 基址覆盖（测试注入用，空 = 官方端点）
 
 	guard *auth.Guard // 后台鉴权与失败锁定
 

@@ -42,6 +42,7 @@ type Provider struct {
 	WB           *WorkBuddyCred   `json:"wb,omitempty"`            // WorkBuddy 凭证
 	Zed          *ZedCred         `json:"zed,omitempty"`           // Zed 凭证
 	CommandCode  *CommandCodeCred `json:"commandcode,omitempty"`   // Command Code 凭证
+	Codex        *CodexCred       `json:"codex,omitempty"`         // Codex 套餐（Sign in with ChatGPT）凭证
 }
 
 // WorkBuddyCred WorkBuddy 上游的账号凭证（本机客户端扫描导入或后台粘贴）。
@@ -130,6 +131,41 @@ type CommandCodeCred struct {
 	CLI       bool       `json:"cli,omitempty"`
 	ZDR       bool       `json:"zdr,omitempty"`
 	CheckedAt *time.Time `json:"checked_at,omitempty"`
+}
+
+// CodexCred Codex 套餐（Sign in with ChatGPT 的 ChatGPT plan usage）账号凭证。
+// OAuth 公共客户端（无 secret）：首次登录用 client_id=dynamic_agent_client 动态注册，
+// 回调换回正式 client_id 保存；access token 约 1 小时有效，临期用 refresh token
+// （30 天滚动轮换）续期。IDToken 留作下次登录的 id_token_hint（可过期）。
+type CodexCred struct {
+	Subject          string     `json:"subject,omitempty"` // ID token 的 sub，账号唯一标识
+	Email            string     `json:"email,omitempty"`
+	Name             string     `json:"name,omitempty"`
+	ClientID         string     `json:"client_id,omitempty"` // 动态注册下发的正式 client_id（非 dynamic_agent_client）
+	AccessToken      string     `json:"access_token,omitempty"`
+	RefreshToken     string     `json:"refresh_token,omitempty"`
+	IDToken          string     `json:"id_token,omitempty"` // 保留作 id_token_hint
+	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	RefreshExpiresAt *time.Time `json:"refresh_expires_at,omitempty"`
+	Scopes           []string   `json:"scopes,omitempty"`
+	PlanUsage        bool       `json:"plan_usage,omitempty"` // 已授权 chatgpt.tokens.use.direct（可用套餐推理）
+	CheckedAt        *time.Time `json:"checked_at,omitempty"` // 最近一次登录/刷新成功时刻
+}
+
+// Expires 取 access token 过期时刻（nil 安全）
+func (c *CodexCred) Expires() time.Time {
+	if c == nil || c.ExpiresAt == nil {
+		return time.Time{}
+	}
+	return *c.ExpiresAt
+}
+
+// RefreshExpires 取 refresh token 过期时刻（nil 安全）
+func (c *CodexCred) RefreshExpires() time.Time {
+	if c == nil || c.RefreshExpiresAt == nil {
+		return time.Time{}
+	}
+	return *c.RefreshExpiresAt
 }
 
 // MuteWindow 每天重复的静音时段，支持跨零点（如 22:00~06:00）

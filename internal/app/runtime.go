@@ -37,7 +37,7 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 	})
 }
 
-// registry 组装上游适配器注册表（标准上游 + 三类私有协议）。
+// registry 组装上游适配器注册表（标准上游 + 各私有协议）。
 func (s *Server) registry() *upstream.Registry {
 	if s.reg == nil {
 		std := &upstream.Standard{Store: s.store, Clients: s.upstreamRuntime().Clients, APIToken: s.apiToken}
@@ -45,6 +45,7 @@ func (s *Server) registry() *upstream.Registry {
 		r.Register(s.wbAdapter())
 		r.Register(s.zedAdapter())
 		r.Register(s.ccAdapter())
+		r.Register(s.codexAdapter())
 		s.reg = r
 	}
 	return s.reg

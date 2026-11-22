@@ -22,6 +22,7 @@
   --wb-bg:#e0f2fe; --wb-fg:#0369a1;
   --zed-bg:#f3e8ff; --zed-fg:#7e22ce;
   --cc-bg:#ccfbf1; --cc-fg:#0f766e;
+  --codex-bg:#e7f5ec; --codex-fg:#15803d;
   --input-ph:#a4afc1;
   --topbar-fade:rgba(245,247,251,.55);
   --tip-bg:#111827; --tip-tx:#fff; --tip-mut:#c7d2fe;
@@ -49,6 +50,7 @@
     --wb-bg:#0c2a3d; --wb-fg:#7dd3fc;
     --zed-bg:#2a1b40; --zed-fg:#d8b4fe;
     --cc-bg:#0f2f2c; --cc-fg:#5eead4;
+    --codex-bg:#0f2e1a; --codex-fg:#86efac;
     --input-ph:#5f6f89;
     --topbar-fade:rgba(11,16,32,.6);
     --tip-bg:#e8eefc; --tip-tx:#0f172a; --tip-mut:#475569;
@@ -272,6 +274,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .kind-tag.wb{background:var(--wb-bg);color:var(--wb-fg)}
 .kind-tag.zed{background:var(--zed-bg);color:var(--zed-fg)}
 .kind-tag.cc{background:var(--cc-bg);color:var(--cc-fg)}
+.kind-tag.codex{background:var(--codex-bg);color:var(--codex-fg)}
 .provider-endpoint{display:flex;align-items:center;gap:6px;margin-top:3px;min-width:0;color:var(--mut);font-size:11.5px}
 .provider-endpoint .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px}
 .mini-tag{
@@ -821,6 +824,7 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
         <option value="workbuddy-intl">WorkBuddy 国际版</option>
         <option value="zed">Zed 账号</option>
         <option value="commandcode">Command Code（Go 等订阅）</option>
+        <option value="codex">Codex 套餐（ChatGPT 计划）</option>
       </select>
     </div>
     <div class="field"><label>名称</label><input id="p-name" placeholder="deepseek"><div class="hint" style="margin-top:4px">会作为直连模型名的前缀（如 deepseek/deepseek-chat），必须唯一且不含 /；改名会使旧模型名失效。</div></div>
@@ -876,6 +880,22 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
         </div>
       </div>
       <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">复用 Command Code 订阅额度（Go / Pro / GOAT / Max / Ultra）。Go 套餐没有 Provider API，llmrouter 走 CLI 自己的 POST /alpha/generate 线协议；出站请求会转换成 CLI 格式，回程再翻回 chat / responses。点击「读取本机 CLI 登录」读取 ~/.commandcode/auth.json（只读），或直接粘贴 API Key。导入后自动按套餐同步模型（Go 会过滤掉套餐不含的高级模型）。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
+    </div>
+    <div id="p-codex" hidden style="margin-top:8px">
+      <div class="field"><label>ChatGPT 账号</label>
+        <div class="inline" style="flex:1">
+          <span class="hint" style="flex:1">浏览器完成 OpenAI 授权后自动创建 Provider 并同步模型</span>
+          <button class="btn mini pri" onclick="codexLoginStart()">登录 ChatGPT</button>
+        </div>
+      </div>
+      <div id="p-codexstatus" class="hint" style="margin:4px 0 8px"></div>
+      <div class="field" style="align-items:flex-start"><label>粘贴回调 URL</label>
+        <div style="flex:1;min-width:0">
+          <textarea id="p-codexcb" class="mono" rows="2" placeholder='http://127.0.0.1:随机端口/auth/callback?code=…&state=… （浏览器无法访问本机时，复制授权后地址栏的完整 URL 粘贴到这里）' style="width:100%;box-sizing:border-box"></textarea>
+          <button class="btn mini" onclick="codexLoginPaste()" style="margin-top:4px">用粘贴的 URL 完成登录</button>
+        </div>
+      </div>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 ChatGPT 套餐（Plus / Pro 的 Codex 额度，Sign in with ChatGPT）作为上游：点击「登录 ChatGPT」后在浏览器授权，自动创建 Provider 并同步账号可用模型。需要 ChatGPT Plus / Pro 且账号所在地区可用；用量与 ChatGPT 共享（5 小时窗口）。出站走 api.openai.com/v1/responses（强制流式、不落盘），llmrouter 自动剥离该通道不支持的字段与托管工具。服务器上没有浏览器时用上方粘贴回调兜底。删除 Provider 会尝试在 OpenAI 侧吊销授权。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
     </div>
   </div>
   <div class="dlg-foot split">
@@ -2175,6 +2195,7 @@ function providerKindTag(p) {
     case 'workbuddy-intl': return '<span class="kind-tag wb">WB 国际</span>';
     case 'zed': return '<span class="kind-tag zed">Zed</span>';
     case 'commandcode': return '<span class="kind-tag cc">Command Code</span>';
+    case 'codex': return '<span class="kind-tag codex">Codex</span>';
     default: return '<span class="kind-tag">标准</span>';
   }
 }
@@ -2220,6 +2241,16 @@ function providerStatusHTML(p) {
       <span class="status-extra">${esc(who)}${c.plan ? ' · ' + esc(c.plan) : ''}${c.zdr ? ' · ZDR' : ''} · <span class="mono">${esc(maskKey(c.api_key))}</span></span>
     </div>`;
   }
+  if (p.kind === 'codex') {
+    const c = p.codex;
+    if (!c || !c.subject) return '<span class="pill bad">未登录</span>';
+    const e = expiryBadge(c.expires_at);
+    const planTag = c.plan_usage ? '' : ' · <span class="pill warn" style="margin:0">未授权套餐推理</span>';
+    return `<div class="status-line">
+      <span class="pill ${e.cls || 'ok'}">${e.cls ? e.label : '凭证有效'}</span>
+      <span class="status-extra">${esc(c.email || c.name || c.subject)}${e.detail ? ' · token 至 ' + e.detail : ''}${planTag}</span>
+    </div>`;
+  }
   if (p.api_key) {
     return `<div class="status-line"><span class="pill ok">Key 已配置</span><span class="status-extra mono">${esc(maskKey(p.api_key))}</span></div>`;
   }
@@ -2231,16 +2262,17 @@ function providerEndpointHTML(p) {
   const isWB = p.kind === 'workbuddy' || p.kind === 'workbuddy-intl';
   const isZed = p.kind === 'zed';
   const isCC = p.kind === 'commandcode';
+  const isCodex = p.kind === 'codex';
   let endpoint = p.base_url;
-  if (!isWB && !isZed && !isCC) {
+  if (!isWB && !isZed && !isCC && !isCodex) {
     try {
       const u = new URL(p.base_url);
       endpoint = u.host + (u.pathname === '/' ? '' : u.pathname.replace(/\/$/, ''));
     } catch { endpoint = p.base_url; }
   }
-  const text = isWB ? '官方客户端端点' : isZed ? 'cloud.zed.dev' : isCC ? 'api.commandcode.ai' : endpoint;
+  const text = isWB ? '官方客户端端点' : isZed ? 'cloud.zed.dev' : isCC ? 'api.commandcode.ai' : isCodex ? 'api.openai.com（ChatGPT 计划）' : endpoint;
   const tags = [];
-  if (!isWB && !isZed && !isCC && p.responses_url && p.responses_url !== p.base_url) tags.push('Responses 独立');
+  if (!isWB && !isZed && !isCC && !isCodex && p.responses_url && p.responses_url !== p.base_url) tags.push('Responses 独立');
   if (p.proxy) tags.push('代理');
   return `<div class="provider-endpoint" title="${esc(p.base_url)}">
     <span class="mono">${esc(text)}</span>
@@ -2258,6 +2290,7 @@ function renderProviders() {
     const isWB = p.kind === 'workbuddy' || p.kind === 'workbuddy-intl';
     const isZed = p.kind === 'zed';
     const isCC = p.kind === 'commandcode';
+    const isCodex = p.kind === 'codex';
     let balCell, quick;
     if (isWB) {
       balCell = wbBalanceHTML(p);
@@ -2268,6 +2301,9 @@ function renderProviders() {
     } else if (isCC) {
       balCell = ccBalanceHTML(p);
       quick = `<button class="link-btn" onclick="ccRefreshNow('${p.id}')">刷新套餐</button>`;
+    } else if (isCodex) {
+      balCell = codexBalanceHTML(p);
+      quick = `<button class="link-btn" onclick="codexRefreshNow('${p.id}')">刷新账号 / 同步模型</button>`;
     } else {
       balCell = balanceHTML(p);
       quick = `<button class="link-btn" onclick="queryBalance('${p.id}')">查余额</button>`;
@@ -2451,24 +2487,134 @@ async function ccRefreshNow(id) {
   } catch (e) { alert(e.message); }
 }
 
+/* ---------- Codex 套餐（Sign in with ChatGPT） ---------- */
+let codexLoginState = ''; // 进行中的登录会话 state
+
+// 编辑已有 codex provider 时取其凭证（保存时原样带回，登录成功后由服务端更新）
+function codexCredOf(editing) {
+  return (editing && editing.kind === 'codex' && editing.codex) ? editing.codex : null;
+}
+
+// Codex 套餐状态单元格：授权情况 + 凭证有效期
+function codexBalanceHTML(p) {
+  const c = p.codex;
+  if (!c) return '<span class="hint">未登录</span>';
+  const when = c.checked_at ? `<div class="cell-sub">更新于 ${agoText(c.checked_at)}</div>` : '';
+  let s = c.plan_usage ? 'ChatGPT 套餐已授权' : '未授权套餐推理';
+  const re = c.refresh_expires_at ? new Date(c.refresh_expires_at) : null;
+  if (re && !isNaN(re)) s += ` · 授权至 ${re.toLocaleDateString()}`;
+  return `<div class="bal">${esc(s)}</div>${when}`;
+}
+
+function codexRenderStatus() {
+  const el = $('p-codexstatus');
+  if ($('p-kind').value !== 'codex') return;
+  const cred = codexCredOf(editingProvider);
+  if (!cred) { el.innerHTML = '尚未登录——点击「登录 ChatGPT」在浏览器完成授权后自动创建 Provider'; return; }
+  const exp = cred.expires_at ? new Date(cred.expires_at) : null;
+  let html = `已登录：<b>${esc(cred.email || cred.name || cred.subject)}</b>` +
+    (cred.plan_usage ? '' : ' · <span class="pill warn">未授权套餐推理</span>') +
+    (exp ? ` · token 到期 ${exp.toLocaleString()}` : '');
+  if (editingProvider) {
+    html += ` <button class="btn mini" onclick="codexRefreshNow('${editingProvider.id}')">续期 / 刷新账号</button>`;
+  }
+  el.innerHTML = html;
+}
+
+// 发起登录：拿到授权 URL 后新开浏览器页，本页轮询会话状态。
+// 编辑已有 provider 时带 provider_id：服务端沿用其 client_id + id_token_hint（跳过账号选择）。
+async function codexLoginStart() {
+  try {
+    const res = await api('POST', '/api/codex/login', {
+      name: $('p-name').value.trim(),
+      proxy: $('p-proxy').value.trim(),
+      provider_id: editingProvider?.id || '',
+    });
+    codexLoginState = res.state;
+    $('p-codexstatus').innerHTML = '已打开授权页，完成 ChatGPT 登录后这里会自动更新…（10 分钟内有效）';
+    window.open(res.url, '_blank', 'noopener');
+    codexPoll();
+  } catch (e) { alert('发起登录失败: ' + e.message); }
+}
+
+function codexPoll() {
+  if (!codexLoginState) return;
+  setTimeout(async () => {
+    let res;
+    try { res = await api('GET', '/api/codex/login/status?state=' + encodeURIComponent(codexLoginState)); }
+    catch (e) { return; /* 会话过期等：停止轮询 */ }
+    if (res.status === 'pending') { codexPoll(); return; }
+    codexLoginState = '';
+    if (res.status === 'success') {
+      await load();
+      editingProvider = S.providers.find(p => p.id === res.provider) || null;
+      $('p-name').value = editingProvider?.name || $('p-name').value;
+      codexRenderStatus();
+      let msg = `ChatGPT 登录成功，已同步 ${res.models} 个模型（优先级 0，可在模型页调整）`;
+      if (res.warning) msg += `；注意：${res.warning}`;
+      toast(msg);
+    } else {
+      $('p-codexstatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}，可重试`;
+    }
+  }, 1500);
+}
+
+// 无浏览器环境兜底：粘贴浏览器地址栏里的回调 URL
+async function codexLoginPaste() {
+  const url = $('p-codexcb').value.trim();
+  if (!url) { alert('请先粘贴回调 URL'); return; }
+  if (!codexLoginState) { alert('请先点击「登录 ChatGPT」发起会话，再把浏览器里的回调 URL 粘贴到这里'); return; }
+  try {
+    const res = await api('POST', '/api/codex/login/paste', {state: codexLoginState, url});
+    codexLoginState = '';
+    if (res.status === 'success') {
+      await load();
+      editingProvider = S.providers.find(p => p.id === res.provider) || null;
+      $('p-name').value = editingProvider?.name || $('p-name').value;
+      codexRenderStatus();
+      let msg = `ChatGPT 登录成功，已同步 ${res.models} 个模型`;
+      if (res.warning) msg += `；注意：${res.warning}`;
+      toast(msg);
+    } else {
+      $('p-codexstatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}`;
+    }
+  } catch (e) { alert(e.message); }
+}
+
+async function codexRefreshNow(id) {
+  try {
+    const res = await api('POST', `/api/providers/${id}/codex-refresh`);
+    let msg = `已续期，token 到期 ${res.expires_at ? new Date(res.expires_at).toLocaleString() : '未知'}`;
+    if (res.synced != null) msg += `，同步 ${res.synced} 个新模型`;
+    if (res.warning) msg += `；注意：${res.warning}`;
+    toast(msg);
+    await load();
+    editingProvider = S.providers.find(p => p.id === id) || editingProvider;
+    codexRenderStatus();
+  } catch (e) { alert(e.message); }
+}
+
 /* ---------- WorkBuddy 凭证 ---------- */
 const WB_ENDPOINTS = {'workbuddy': 'https://copilot.tencent.com/v2', 'workbuddy-intl': 'https://www.codebuddy.ai/v2'};
 let wbCred = null; // 当前弹窗持有的凭证（编辑时来自 provider，重新导入后覆盖）
 let wbHits = [];
 
 function onKindChange() {
-  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode', special = wb || zed || cc;
+  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode', codex = kind === 'codex', special = wb || zed || cc || codex;
   for (const id of ['row-base', 'row-key', 'row-resp', 'row-bal']) $(id).style.display = special ? 'none' : '';
   $('hint-normal').style.display = special ? 'none' : '';
   $('p-wb').hidden = !wb;
   $('p-zed').hidden = !zed;
   $('p-cc').hidden = !cc;
+  $('p-codex').hidden = !codex;
   if (wb) $('p-base').value = WB_ENDPOINTS[kind];
   if (zed) $('p-base').value = 'https://cloud.zed.dev/completions';
   if (cc) $('p-base').value = 'https://api.commandcode.ai/alpha/generate';
+  if (codex) $('p-base').value = 'https://api.openai.com/v1/responses';
   wbRenderStatus();
   zedRenderStatus();
   ccRenderStatus();
+  codexRenderStatus();
 }
 
 function wbRenderStatus() {
@@ -2590,19 +2736,21 @@ function editProvider(id) {
   zedLoginState = '';
   $('p-cckey').value = '';
   $('p-cczdr').checked = !!editingProvider?.commandcode?.zdr;
+  $('p-codexcb').value = '';
+  codexLoginState = '';
   onKindChange();
   dlgProvider.showModal();
 }
 
 async function saveProvider() {
-  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode';
+  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode', codex = kind === 'codex';
   const body = {
     name: $('p-name').value.trim() || 'provider',
     kind,
     base_url: $('p-base').value.trim(),
-    responses_url: (wb || zed || cc) ? '' : $('p-resp').value.trim(),
-    api_key: (wb || zed || cc) ? '' : $('p-key').value.trim(),
-    balance_url: (wb || zed || cc) ? '' : $('p-bal').value.trim(),
+    responses_url: (wb || zed || cc || codex) ? '' : $('p-resp').value.trim(),
+    api_key: (wb || zed || cc || codex) ? '' : $('p-key').value.trim(),
+    balance_url: (wb || zed || cc || codex) ? '' : $('p-bal').value.trim(),
     proxy: $('p-proxy').value.trim(),
   };
   if (wb) {
@@ -2614,6 +2762,11 @@ async function saveProvider() {
     body.zed = zedCredOf(editingProvider);
     if (!body.base_url) body.base_url = 'https://cloud.zed.dev/completions';
     if (!body.zed || !body.zed.user_id) { alert('Zed 类型需要先完成「登录 Zed」'); return; }
+  }
+  if (codex) {
+    body.codex = codexCredOf(editingProvider);
+    if (!body.base_url) body.base_url = 'https://api.openai.com/v1/responses';
+    if (!body.codex || !body.codex.subject) { alert('Codex 套餐类型需要先完成「登录 ChatGPT」'); return; }
   }
   if (cc) {
     body.base_url = 'https://api.commandcode.ai/alpha/generate';

@@ -53,7 +53,7 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 	if p.Kind != "" {
 		adapter, ok := s.registry().ForKind(p.Kind)
 		if !ok {
-			writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy、workbuddy-intl、zed 或 commandcode")
+			writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy、workbuddy-intl、zed、commandcode 或 codex")
 			return
 		}
 		if err := adapter.ValidateProvider(&p); err != nil {

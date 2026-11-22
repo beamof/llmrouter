@@ -24,6 +24,7 @@ type (
 	ZedCred         = domain.ZedCred
 	ZedPlan         = domain.ZedPlan
 	CommandCodeCred = domain.CommandCodeCred
+	CodexCred       = domain.CodexCred
 	MuteWindow      = domain.MuteWindow
 	Model           = domain.Model
 	APIKey          = domain.APIKey
@@ -63,6 +64,10 @@ type Store struct {
 	// 默认关闭：仅支持 chat 的上游（WorkBuddy）不承接 responses 请求，路由会改选
 	// 其他原生支持 responses 的模型；开启后此类模型才参与 responses 路由（由适配层转换）。
 	ResponsesConvert bool `json:"responses_convert,omitempty"`
+
+	// CodexHostID 本机 Codex 套餐（Sign in with ChatGPT）的 ext_agent_host_id，
+	// 首次登录前生成并持久化，之后所有账号的登录/续期都复用（主机标识跨账号共享）。
+	CodexHostID string `json:"codex_host_id,omitempty"`
 
 	// SessionTTLSeconds 会话粘性的滑动过期秒数，0 = 默认（sessionTTL，1 小时）。
 	// 每次会话内成功请求都会重新计时；通过设置接口修改时，现有绑定会立即按新值重算。
@@ -316,6 +321,7 @@ type configFile struct {
 	AutoModel         string              `json:"auto_model,omitempty"`
 	ResponsesConvert  bool                `json:"responses_convert,omitempty"`
 	SessionTTLSeconds int64               `json:"session_ttl_seconds,omitempty"`
+	CodexHostID       string              `json:"codex_host_id,omitempty"`
 }
 
 // hotState 用量文件（data.json.usage）的形状：高频写、可合并落盘。
@@ -344,6 +350,7 @@ func (s *Store) save() {
 		AutoModel:         s.AutoModel,
 		ResponsesConvert:  s.ResponsesConvert,
 		SessionTTLSeconds: s.SessionTTLSeconds,
+		CodexHostID:       s.CodexHostID,
 	}, "", "  ")
 	if err != nil {
 		s.reportSaveError(err)
@@ -667,10 +674,72 @@ func (s *Store) ProviderByZedUser(userID string) (Provider, bool) {
 	return Provider{}, false
 }
 
+// UpdateCodexAuth 回写 Codex 套餐刷新后的凭证（换指针拷贝，理由同 UpdateWBAuth：
+// Candidate 里的 Provider 是浅拷贝，并发请求各自持有不可变快照）。
+func (s *Store) UpdateCodexAuth(providerID string, c *CodexCred) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.Codex == nil {
+		return false
+	}
+	cp := *c
+	p.Codex = &cp
+	s.save()
+	return true
+}
+
+// ProviderByCodexSubject 按 Codex 套餐账号 sub（或 client_id）找 provider，
+// 重复登录同一账号时原地更新而不是新建。
+func (s *Store) ProviderByCodexSubject(subject, clientID string) (Provider, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.Providers {
+		if p.Kind != "codex" || p.Codex == nil {
+			continue
+		}
+		if subject != "" && p.Codex.Subject == subject {
+			return *p, true
+		}
+		if clientID != "" && p.Codex.ClientID == clientID {
+			return *p, true
+		}
+	}
+	return Provider{}, false
+}
+
+// EnsureCodexHostID 返回本机的 ext_agent_host_id（urn:uuid:…），没有则生成并落盘。
+// 主机标识与账号无关：同一安装上所有 Codex 套餐登录共用一个。
+func (s *Store) EnsureCodexHostID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.CodexHostID != "" {
+		return s.CodexHostID
+	}
+	var b [16]byte
+	rand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	s.CodexHostID = fmt.Sprintf("urn:uuid:%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:])
+	s.save()
+	return s.CodexHostID
+}
+
 // HasZedModel 判断某 provider 下是否已有同名模型条目（登录同步模型时去重）
 func (s *Store) HasZedModel(providerID, name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.hasProviderModelLocked(providerID, name)
+}
+
+// HasCodexModel 判断某 Codex provider 下是否已有同名模型条目（登录同步模型时去重）
+func (s *Store) HasCodexModel(providerID, name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hasProviderModelLocked(providerID, name)
+}
+
+func (s *Store) hasProviderModelLocked(providerID, name string) bool {
 	for _, m := range s.Models {
 		if m.ProviderID == providerID && m.Name == name {
 			return true
