@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"llmrouter/internal/domain"
 	"llmrouter/internal/httpx"
 	"llmrouter/internal/upstream"
 )
@@ -537,6 +538,8 @@ func (a *Adapter) HandleCodexImport(w http.ResponseWriter, r *http.Request) {
 	// 导入即续期：验证凭证有效，并轮换掉粘贴来的 refresh token
 	tr, err := a.refreshTokens(ctx, cli, cred)
 	if err != nil {
+		a.rt.Logf(LogEntry{Level: "error", Kind: domain.KindUpstream,
+			Message: "Codex 凭证导入失败（续期被拒）", Detail: err.Error()})
 		httpx.WriteErr(w, http.StatusBadGateway, "凭证验证（续期）失败: "+err.Error())
 		return
 	}

@@ -10,6 +10,7 @@ package codex
 // developers.openai.com/siwc 的 Registration and sign-in / Models and inference。
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
@@ -54,7 +55,7 @@ const (
 // 刷新端点不同、凭证字段嵌套在 tokens 里、推理走 ChatGPT 后端并要求伪装 CLI
 // 的专用请求头）。参数与端点为公开事实（Codex CLI / ccLoad 等开源实现一致）。
 const (
-	codexCLIClientID   = "app_EMoamEEZ73f0CktYaXp7hrann"
+	codexCLIClientID   = "app_EMoamEEZ73f0CkXaXp7hrann" // Codex CLI 官方公开 client（与 auth.json 内 JWT 的 client_id 一致）
 	codexCLIScope      = "openid profile email offline_access"
 	codexCLIBase       = "https://chatgpt.com/backend-api/codex"
 	codexCLIOriginator = "codex_cli_rs"
@@ -72,17 +73,19 @@ var codexCLIModels = []string{
 	"codex-mini-latest",
 }
 
-// tokenResponse OAuth token 端点的响应形状（code 交换与 refresh 共用）
+// tokenResponse OAuth token 端点的响应形状（code 交换与 refresh 共用）。
+// Error 用 RawMessage：/oauth/token 的错误是嵌套对象（{"error":{"code",…}}），
+// 标准形态是字符串，两种都见过。
 type tokenResponse struct {
-	AccessToken      string `json:"access_token"`
-	RefreshToken     string `json:"refresh_token"`
-	IDToken          string `json:"id_token"`
-	TokenType        string `json:"token_type"`
-	ExpiresIn        int64  `json:"expires_in"`
-	Scope            string `json:"scope"`
-	EarliestRefresh  int64  `json:"earliest_refresh_at"`
-	Error            string `json:"error,omitempty"`
-	ErrorDescription string `json:"error_description,omitempty"`
+	AccessToken      string          `json:"access_token"`
+	RefreshToken     string          `json:"refresh_token"`
+	IDToken          string          `json:"id_token"`
+	TokenType        string          `json:"token_type"`
+	ExpiresIn        int64           `json:"expires_in"`
+	Scope            string          `json:"scope"`
+	EarliestRefresh  int64           `json:"earliest_refresh_at"`
+	Error            json.RawMessage `json:"error,omitempty"`
+	ErrorDescription string          `json:"error_description,omitempty"`
 }
 
 // codexOf 返回 provider 的 Codex 凭证；非 codex provider 返回 nil
@@ -379,18 +382,41 @@ func (a *Adapter) refreshTokens(ctx context.Context, cli *http.Client, cred *Cod
 
 // codexTokenError 把 token 端点的 OAuth 错误翻译成可读信息
 func codexTokenError(op string, status int, tr *tokenResponse) error {
-	code := tr.Error
-	if code == "" {
+	code, detail := codexOAuthError(tr)
+	if code == "" && detail == "" {
 		return fmt.Errorf("%s 返回 HTTP %d", op, status)
 	}
-	detail := tr.ErrorDescription
 	if detail == "" {
 		detail = code
+	}
+	if code == "" {
+		code = detail
 	}
 	if codexRefreshDead(code) {
 		return fmt.Errorf("%s失败：%s（授权已失效，请重新登录 ChatGPT 账号）", op, detail)
 	}
-	return fmt.Errorf("%s失败：%s（HTTP %d）", op, detail, status)
+	return fmt.Errorf("%s失败：%s[%s]（HTTP %d）", op, detail, code, status)
+}
+
+// codexOAuthError 兼容两种错误形态：标准 OAuth（error 字符串 + error_description）
+// 与 /oauth/token 的嵌套对象（{"error":{"code","message"}}）。
+func codexOAuthError(tr *tokenResponse) (code, detail string) {
+	raw := bytes.TrimSpace(tr.Error)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, tr.ErrorDescription
+	}
+	var obj struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		return obj.Code, obj.Message
+	}
+	return "", ""
 }
 
 // codexRefreshDead 哪些错误码表示 refresh token 不可再用（SIWC Errors and recovery）

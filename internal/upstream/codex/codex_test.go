@@ -1216,3 +1216,22 @@ func TestCodexCLIListModels(t *testing.T) {
 		t.Fatalf("CLI 目录应返回内置列表: %v", models)
 	}
 }
+
+func TestCodexTokenErrorShapes(t *testing.T) {
+	// /oauth/token 的嵌套对象形态（实测 401 invalid_client 即此形态）
+	nested := &tokenResponse{Error: json.RawMessage(`{"message":"Invalid client specified.","type":"invalid_request_error","code":"invalid_client"}`)}
+	err := codexTokenError("续期", 401, nested)
+	if err == nil || !strings.Contains(err.Error(), "invalid_client") || !strings.Contains(err.Error(), "Invalid client specified") {
+		t.Fatalf("嵌套形态: %v", err)
+	}
+	// 标准 OAuth 形态（error 字符串 + error_description）
+	std := &tokenResponse{Error: json.RawMessage(`"invalid_grant"`), ErrorDescription: "refresh token is invalid"}
+	err = codexTokenError("续期", 400, std)
+	if err == nil || !strings.Contains(err.Error(), "重新登录") {
+		t.Fatalf("标准形态应识别死凭证: %v", err)
+	}
+	// 无错误字段
+	if err := codexTokenError("续期", 500, &tokenResponse{}); err == nil || !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("空错误形态: %v", err)
+	}
+}
