@@ -489,6 +489,102 @@ func (a *Adapter) HandleCodexLoginCancel(w http.ResponseWriter, r *http.Request)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"state": state, "status": "cancelled"})
 }
 
+// HandleCodexImport 粘贴凭证 JSON 直接导入：浏览器登录之外的第二条凭证入口，
+// 适配无浏览器环境与跨机器迁移（SIWC Self-hosted VMs 的凭证转移场景）。
+// 兼容 SIWC 凭证记录与本网关 data.json 的 codex 字段两种形态；导入即续期——
+// 既验证凭证有效，也把粘贴来的 refresh token 轮换掉（转移即交割，来源端不再可用）。
+func (a *Adapter) HandleCodexImport(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name  string     `json:"name"`
+		Proxy string     `json:"proxy"`
+		Raw   string     `json:"raw"`
+		Cred  *CodexCred `json:"cred"` // 结构化形态（内部调用/测试）
+	}
+	if !httpx.Decode(w, r, &req) {
+		return
+	}
+	proxy, err := upstream.NormalizeProxy(strings.TrimSpace(req.Proxy))
+	if err != nil {
+		httpx.WriteErr(w, http.StatusBadRequest, "网络代理非法: "+err.Error())
+		return
+	}
+	cred := req.Cred
+	if cred == nil && strings.TrimSpace(req.Raw) != "" {
+		if cred, err = codexParseCred([]byte(strings.TrimSpace(req.Raw)), time.Now()); err != nil {
+			httpx.WriteErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if cred == nil {
+		httpx.WriteErr(w, http.StatusBadRequest, "缺少凭证（粘贴凭证 JSON 或提供 cred 字段）")
+		return
+	}
+	if strings.TrimSpace(cred.ClientID) == "" || strings.TrimSpace(cred.RefreshToken) == "" {
+		httpx.WriteErr(w, http.StatusBadRequest, "凭证缺少 client_id / refresh_token，无法导入")
+		return
+	}
+	cli, err := a.rt.Clients.For(Provider{Proxy: proxy}, 30*time.Second)
+	if err != nil {
+		httpx.WriteErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	// 导入即续期：验证凭证有效，并轮换掉粘贴来的 refresh token
+	tr, err := a.refreshTokens(ctx, cli, cred.ClientID, cred.RefreshToken)
+	if err != nil {
+		httpx.WriteErr(w, http.StatusBadGateway, "凭证验证（续期）失败: "+err.Error())
+		return
+	}
+	// 刷新响应里的 ID token 经 JWKS 校验后回填账号身份（导入不携带 nonce，跳过该项）
+	warn := ""
+	if tr.IDToken != "" {
+		if claims, verr := a.jwks.verify(ctx, cli, a.jwksURL(), tr.IDToken, cred.ClientID, ""); verr == nil {
+			cred.Subject, cred.Email, cred.Name = claims.Subject, claims.Email, claims.Name
+		} else {
+			warn = "ID token 校验失败，沿用凭证自带的账号信息: " + verr.Error()
+		}
+	}
+	if strings.TrimSpace(cred.Subject) == "" {
+		// 兜底：解码凭证保留的 id_token 取 sub（粘贴内容本身即受信输入）
+		if sub, email, name := codexDecodeIDTokenClaims(cred.IDToken); sub != "" {
+			cred.Subject, cred.Email, cred.Name = sub, email, name
+		}
+	}
+	if strings.TrimSpace(cred.Subject) == "" {
+		httpx.WriteErr(w, http.StatusBadRequest, "凭证缺少 subject（账号标识），无法归并到 Provider")
+		return
+	}
+	nc := a.credFromToken(cred, tr)
+	models, merr := a.fetchModels(ctx, cli, nc)
+	if merr != nil {
+		if warn != "" {
+			warn += "；"
+		}
+		warn += "模型目录同步失败：" + merr.Error()
+	}
+	if !nc.PlanUsage {
+		if warn != "" {
+			warn += "；"
+		}
+		warn += "凭证未包含 ChatGPT 套餐推理权限（chatgpt.tokens.use.direct），推理会被拒绝"
+	}
+	pid, n := a.persistLogin(nc, models, strings.TrimSpace(req.Name), proxy)
+	label := nc.Email
+	if label == "" {
+		label = nc.Subject
+	}
+	log.Printf("[INFO] Codex 凭证导入成功：%s（provider %s，同步 %d 个模型）", label, pid, n)
+	out := map[string]any{
+		"status": "success", "provider": pid, "models": n,
+		"expires_at": nc.Expires(), "plan_usage": nc.PlanUsage,
+	}
+	if warn != "" {
+		out["warning"] = warn
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
+}
+
 // HandleCodexRefresh 强制续期并同步模型目录（镜像 HandleZedRefresh）
 func (a *Adapter) HandleCodexRefresh(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.rt.Store.Provider(r.PathValue("id"))

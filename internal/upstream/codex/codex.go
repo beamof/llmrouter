@@ -151,6 +151,89 @@ func (a *Adapter) exchangeCode(ctx context.Context, cli *http.Client, clientID, 
 	return tr, nil
 }
 
+// ── 凭证粘贴导入 ─────────────────────────────────────────────────────────
+
+// codexParseCred 解析粘贴导入的凭证 JSON。兼容两种形态：
+//  1. SIWC 官方文档的本地凭证记录（Registration and sign-in 第 5 步）：
+//     expires_in 为相对秒数，附带 issuer / ext_agent_host_id / saved_at 等额外字段；
+//  2. 本网关 data.json 里 provider 的 codex 字段：expires_at 为绝对时刻。
+//
+// client_id 与 refresh_token 缺一不可（无法续期的凭证没有意义）；subject 允许
+// 缺省，由导入流程从刷新响应的 ID token 或凭证保留的 id_token 补齐。
+// 凭证里的 ext_agent_host_id 属于来源主机，导入时不采用（本机沿用自身的 host ID）。
+func codexParseCred(raw []byte, now time.Time) (*CodexCred, error) {
+	var f struct {
+		Subject          string     `json:"subject"`
+		Email            string     `json:"email"`
+		Name             string     `json:"name"`
+		ClientID         string     `json:"client_id"`
+		IDToken          string     `json:"id_token"`
+		AccessToken      string     `json:"access_token"`
+		RefreshToken     string     `json:"refresh_token"`
+		ExpiresIn        int64      `json:"expires_in"`
+		ExpiresAt        *time.Time `json:"expires_at"`
+		RefreshExpiresAt *time.Time `json:"refresh_expires_at"`
+		Scopes           []string   `json:"scopes"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, errors.New("凭证 JSON 无法解析（需要对象形态）")
+	}
+	cred := &CodexCred{
+		Subject:          strings.TrimSpace(f.Subject),
+		Email:            strings.TrimSpace(f.Email),
+		Name:             strings.TrimSpace(f.Name),
+		ClientID:         strings.TrimSpace(f.ClientID),
+		IDToken:          strings.TrimSpace(f.IDToken),
+		AccessToken:      strings.TrimSpace(f.AccessToken),
+		RefreshToken:     strings.TrimSpace(f.RefreshToken),
+		RefreshExpiresAt: f.RefreshExpiresAt,
+	}
+	for _, s := range f.Scopes {
+		if s = strings.TrimSpace(s); s != "" {
+			cred.Scopes = append(cred.Scopes, s)
+			if s == codexPlanScope {
+				cred.PlanUsage = true
+			}
+		}
+	}
+	if cred.ClientID == "" {
+		return nil, errors.New("凭证缺少 client_id 字段")
+	}
+	if cred.RefreshToken == "" {
+		return nil, errors.New("凭证缺少 refresh_token 字段")
+	}
+	switch {
+	case f.ExpiresAt != nil:
+		cred.ExpiresAt = f.ExpiresAt // 本网关形态：绝对时刻原样保留
+	case f.ExpiresIn > 0:
+		t := now.Add(time.Duration(f.ExpiresIn) * time.Second) // SIWC 记录形态：按导入时刻折算
+		cred.ExpiresAt = &t
+	}
+	if cred.RefreshExpiresAt == nil {
+		t := now.Add(30 * 24 * time.Hour) // refresh token 30 天滚动
+		cred.RefreshExpiresAt = &t
+	}
+	return cred, nil
+}
+
+// codexDecodeIDTokenClaims 不验签名地解码 id_token 的身份声明（导入兜底用：
+// 粘贴内容本身即受信输入，签名在原始登录时已验证过）。
+func codexDecodeIDTokenClaims(token string) (subject, email, name string) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return "", "", ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", "", ""
+	}
+	var claims codexIDClaims
+	if json.Unmarshal(payload, &claims) != nil {
+		return "", "", ""
+	}
+	return strings.TrimSpace(claims.Subject), strings.TrimSpace(claims.Email), strings.TrimSpace(claims.Name)
+}
+
 // codexRefreshToken 用 refresh token 续期（轮换：响应带新的 refresh token）。
 // 失败按错误码分类：invalid_grant / *expired / *invalidated / *reused 表示
 // refresh token 已不可用，需要重新登录。

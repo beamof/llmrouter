@@ -35,6 +35,10 @@ func (s *Server) handleCodexLoginCancel(w http.ResponseWriter, r *http.Request) 
 	s.codexAdapter().HandleCodexLoginCancel(w, r)
 }
 
+func (s *Server) handleCodexImport(w http.ResponseWriter, r *http.Request) {
+	s.codexAdapter().HandleCodexImport(w, r)
+}
+
 func (s *Server) handleCodexRefresh(w http.ResponseWriter, r *http.Request) {
 	s.codexAdapter().HandleCodexRefresh(w, r)
 }

@@ -895,7 +895,13 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
           <button class="btn mini" onclick="codexLoginPaste()" style="margin-top:4px">用粘贴的 URL 完成登录</button>
         </div>
       </div>
-      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 ChatGPT 套餐（Plus / Pro 的 Codex 额度，Sign in with ChatGPT）作为上游：点击「登录 ChatGPT」后在浏览器授权，自动创建 Provider 并同步账号可用模型。需要 ChatGPT Plus / Pro 且账号所在地区可用；用量与 ChatGPT 共享（5 小时窗口）。出站走 api.openai.com/v1/responses（强制流式、不落盘），llmrouter 自动剥离该通道不支持的字段与托管工具。服务器上没有浏览器时用上方粘贴回调兜底。删除 Provider 会尝试在 OpenAI 侧吊销授权。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
+      <div class="field" style="align-items:flex-start"><label>粘贴凭证 JSON</label>
+        <div style="flex:1;min-width:0">
+          <textarea id="p-codexraw" class="mono" rows="4" placeholder='{"client_id":"oaiapp_…","subject":"…","access_token":"…","refresh_token":"…","expires_in":3600,"scopes":["chatgpt.tokens.use.direct",…]}（SIWC 凭证记录，或从另一台 llmrouter 的 data.json codex 字段复制）' style="width:100%;box-sizing:border-box"></textarea>
+          <button class="btn mini" onclick="codexImportRaw()" style="margin-top:4px">导入粘贴的凭证</button>
+        </div>
+      </div>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 ChatGPT 套餐（Plus / Pro 的 Codex 额度，Sign in with ChatGPT）作为上游：点击「登录 ChatGPT」后在浏览器授权，自动创建 Provider 并同步账号可用模型。需要 ChatGPT Plus / Pro 且账号所在地区可用；用量与 ChatGPT 共享（5 小时窗口）。出站走 api.openai.com/v1/responses（强制流式、不落盘），llmrouter 自动剥离该通道不支持的字段与托管工具。服务器上没有浏览器时用粘贴回调兜底，或把别处得到的凭证 JSON 直接粘贴导入（导入即续期验证并轮换 refresh token，来源端凭证随之失效）。删除 Provider 会尝试在 OpenAI 侧吊销授权。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
     </div>
   </div>
   <div class="dlg-foot split">
@@ -2594,6 +2600,27 @@ async function codexRefreshNow(id) {
   } catch (e) { alert(e.message); }
 }
 
+// 粘贴凭证 JSON 直接导入（无浏览器 / 跨机器迁移场景）
+async function codexImportRaw() {
+  const raw = $('p-codexraw').value.trim();
+  if (!raw) { alert('请先粘贴凭证 JSON'); return; }
+  try {
+    const res = await api('POST', '/api/codex/import', {
+      name: $('p-name').value.trim(),
+      proxy: $('p-proxy').value.trim(),
+      raw,
+    });
+    await load();
+    editingProvider = S.providers.find(p => p.id === res.provider) || null;
+    $('p-name').value = editingProvider?.name || $('p-name').value;
+    $('p-codexraw').value = '';
+    codexRenderStatus();
+    let msg = `凭证已导入，同步 ${res.models} 个模型`;
+    if (res.warning) msg += `；注意：${res.warning}`;
+    toast(msg);
+  } catch (e) { alert('导入失败: ' + e.message); }
+}
+
 /* ---------- WorkBuddy 凭证 ---------- */
 const WB_ENDPOINTS = {'workbuddy': 'https://copilot.tencent.com/v2', 'workbuddy-intl': 'https://www.codebuddy.ai/v2'};
 let wbCred = null; // 当前弹窗持有的凭证（编辑时来自 provider，重新导入后覆盖）
@@ -2737,6 +2764,7 @@ function editProvider(id) {
   $('p-cckey').value = '';
   $('p-cczdr').checked = !!editingProvider?.commandcode?.zdr;
   $('p-codexcb').value = '';
+  $('p-codexraw').value = '';
   codexLoginState = '';
   onKindChange();
   dlgProvider.showModal();

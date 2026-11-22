@@ -69,14 +69,14 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 | | WorkBuddy / CodeBuddy | Zed | Command Code | Codex 套餐 |
 |---|---|---|---|---|
-| 凭证入口 | 扫描本机客户端 / 粘贴凭证 JSON | 浏览器原生登录 / 粘贴回调 URL | 读取本机 CLI 登录 / 粘贴 API Key | 浏览器 OAuth 登录 / 粘贴回调 URL |
+| 凭证入口 | 扫描本机客户端 / 粘贴凭证 JSON | 浏览器原生登录 / 粘贴回调 URL | 读取本机 CLI 登录 / 粘贴 API Key | 浏览器 OAuth 登录 / 粘贴回调 URL / 粘贴凭证 JSON |
 | responses 承接 | 需开全局「Responses 协议转换」 | 直接承接 | 直接承接 | 直接承接 |
 | 额外操作 | 每日签到 / 余额快照 | 套餐用量刷新 | 套餐与模型目录同步 | 模型目录同步 |
 
 - **WorkBuddy**：复用官方客户端登录态（glm、deepseek、minimax、kimi、hunyuan 等），凭证自动续期；非流式请求由网关聚合返回
 - **Zed**：复用 Zed 账号额度（`gpt-*`、`claude-*`），登录一次长期有效、凭证自动续期；`system_id` 依次取弹窗、`LLMROUTER_ZED_SYSTEM_ID`、本机安装数据库
 - **Command Code**：复用订阅额度（Go / Pro / GOAT / Max / Ultra）；`max_tokens` 上限 200000；可选零数据保留
-- **Codex 套餐**：Sign in with ChatGPT（ChatGPT Plus / Pro 的计划额度）：浏览器授权后 llmrouter 以 OAuth 公共客户端动态注册，access token（1 小时）临期自动续期、refresh token（30 天）滚动轮换；出站恒走 `api.openai.com/v1/responses` 且强制流式、不落盘，网关自动剥离该通道不支持的字段（`temperature` 等）与托管工具、把 `system` 折成 `developer`；需要 ChatGPT Plus / Pro 且用量与 ChatGPT 共享（Plus 为 5 小时窗口，达限 429 时按网关规则自动静音）；删除 Provider 会尝试在 OpenAI 侧吊销授权
+- **Codex 套餐**：Sign in with ChatGPT（ChatGPT Plus / Pro 的计划额度）：浏览器授权后 llmrouter 以 OAuth 公共客户端动态注册，access token（1 小时）临期自动续期、refresh token（30 天）滚动轮换；出站恒走 `api.openai.com/v1/responses` 且强制流式、不落盘，网关自动剥离该通道不支持的字段（`temperature` 等）与托管工具、把 `system` 折成 `developer`；需要 ChatGPT Plus / Pro 且用量与 ChatGPT 共享（Plus 为 5 小时窗口，达限 429 时按网关规则自动静音）；无浏览器环境可用粘贴回调 URL 兜底，或把凭证 JSON（SIWC 凭证记录 / 另一台 llmrouter 的 data.json `codex` 字段）直接粘贴导入——导入即续期验证并轮换 refresh token；删除 Provider 会尝试在 OpenAI 侧吊销授权
 
 ## 后台与小工具
 

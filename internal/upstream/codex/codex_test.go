@@ -377,6 +377,12 @@ func codexStartFakeAuth(t *testing.T) *codexFakeAuth {
 		fa.lastForm = r.PostForm
 		challenge := fa.wantChallenge
 		fa.mu.Unlock()
+		// 死凭证注入：refresh_token 以 dead- 开头时回 invalid_grant（导入失败用例）
+		if rt := r.PostForm.Get("refresh_token"); strings.HasPrefix(rt, "dead-") {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":"invalid_grant","error_description":"refresh token is invalid"}`)
+			return
+		}
 		// PKCE：授权请求的 code_challenge 与本次 code_verifier 应配对
 		if r.PostForm.Get("grant_type") == "authorization_code" && challenge != "" {
 			d := sha256.Sum256([]byte(r.PostForm.Get("code_verifier")))
@@ -824,5 +830,169 @@ func TestCodexHostIDStable(t *testing.T) {
 	}
 	if st2.EnsureCodexHostID() != id1 {
 		t.Fatal("host ID 应跨重启持久")
+	}
+}
+
+// ── 凭证粘贴导入 ─────────────────────────────────────────────────────────
+
+func TestCodexParseCred(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	// SIWC 官方凭证记录形态：expires_in 相对秒数，多余字段（issuer 等）忽略
+	siwc := `{"email":"a@b.c","issuer":"https://auth.openai.com","subject":"auth0|u",
+		"client_id":"oaiapp_x","ext_agent_host_id":"urn:uuid:x","id_token":"it",
+		"access_token":"at","refresh_token":"rt","token_type":"Bearer","expires_in":3600,
+		"scopes":["chatgpt.tokens.use.direct","openid"],"saved_at":"2026-11-01T00:00:00Z"}`
+	c, err := codexParseCred([]byte(siwc), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ClientID != "oaiapp_x" || c.RefreshToken != "rt" || c.AccessToken != "at" || c.IDToken != "it" {
+		t.Fatalf("基本字段: %+v", c)
+	}
+	if c.Subject != "auth0|u" || c.Email != "a@b.c" {
+		t.Fatalf("身份字段: %+v", c)
+	}
+	if !c.PlanUsage || len(c.Scopes) != 2 {
+		t.Fatalf("scopes: %+v", c)
+	}
+	if !c.Expires().Equal(now.Add(time.Hour)) {
+		t.Fatalf("expires_in 应按导入时刻折算: %v", c.Expires())
+	}
+	if c.RefreshExpiresAt == nil || c.RefreshExpires().Before(now.Add(29*24*time.Hour)) {
+		t.Fatalf("refresh 过期应兜底 30 天: %v", c.RefreshExpires())
+	}
+	// 本网关 data.json 形态：expires_at 绝对时刻原样保留
+	ours := fmt.Sprintf(`{"subject":"s2","client_id":"c2","access_token":"a2","refresh_token":"r2",
+		"expires_at":%q,"refresh_expires_at":%q,"scopes":["openid"],"plan_usage":false}`,
+		now.Add(2*time.Hour).Format(time.RFC3339), now.Add(10*24*time.Hour).Format(time.RFC3339))
+	c2, err := codexParseCred([]byte(ours), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c2.Expires().Equal(now.Add(2 * time.Hour)) {
+		t.Fatalf("expires_at 应原样保留: %v", c2.Expires())
+	}
+	if c2.PlanUsage {
+		t.Fatal("scopes 不含套餐权限时 PlanUsage 应为 false")
+	}
+	// 缺关键字段与非法 JSON 拒绝
+	for _, bad := range []string{
+		`{"client_id":"c"}`,        // 缺 refresh_token
+		`{"refresh_token":"r"}`,    // 缺 client_id
+		`not json`,                 // 非 JSON
+		`["array","not","object"]`, // 非对象
+	} {
+		if _, err := codexParseCred([]byte(bad), now); err == nil {
+			t.Fatalf("%q 应被拒绝", bad)
+		}
+	}
+}
+
+func TestCodexDecodeIDTokenClaims(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"auth0|x","email":"x@y.z","name":"X"}`))
+	sub, email, name := codexDecodeIDTokenClaims(header + "." + payload + ".sig")
+	if sub != "auth0|x" || email != "x@y.z" || name != "X" {
+		t.Fatalf("声明解码: %q %q %q", sub, email, name)
+	}
+	if s, _, _ := codexDecodeIDTokenClaims("not-a-jwt"); s != "" {
+		t.Fatal("非 JWT 应返回空")
+	}
+}
+
+// codexImportCall 调一次导入接口，返回（状态码, 响应 JSON）
+func codexImportCall(t *testing.T, a *Adapter, body string) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/codex/import", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.HandleCodexImport(rec, req)
+	var res map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &res)
+	return rec.Code, res
+}
+
+func TestCodexImportFlow(t *testing.T) {
+	fa := codexStartFakeAuth(t)
+	fi := codexStartFakeAPI(t, nil)
+	a, st := codexNewAdapter(t, fa.base, fi.base)
+
+	// SIWC 记录导入：subject 留空，靠刷新响应的 ID token（JWKS 校验）补齐
+	raw := `{"email":"whatever@example.com","subject":"","client_id":"oaiapp_src",
+		"access_token":"src-at","refresh_token":"src-rt","expires_in":60,
+		"scopes":["openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"]}`
+	code, res := codexImportCall(t, a, fmt.Sprintf(`{"name":"迁移的账号","raw":%q}`, raw))
+	if code != 200 || res["status"] != "success" {
+		t.Fatalf("导入应成功: %d %v", code, res)
+	}
+	// 导入即续期：refresh grant + 轮换
+	fa.mu.Lock()
+	form := fa.lastForm
+	fa.mu.Unlock()
+	if form.Get("grant_type") != "refresh_token" || form.Get("refresh_token") != "src-rt" ||
+		form.Get("client_id") != "oaiapp_src" || form.Get("resource") != codexResource {
+		t.Fatalf("导入应先续期验证: %v", form)
+	}
+	providers := st.AllProviders()
+	if len(providers) != 1 {
+		t.Fatalf("应创建 1 个 provider: %d", len(providers))
+	}
+	p := providers[0]
+	if p.Name != "迁移的账号" {
+		t.Fatalf("自定义名称: %q", p.Name)
+	}
+	if p.Codex.Subject != "auth0|user-1" || p.Codex.Email != "alice@example.com" {
+		t.Fatalf("身份应取自校验后的 ID token: %+v", p.Codex)
+	}
+	if p.Codex.AccessToken != "at-1" || p.Codex.RefreshToken != "rt-1" {
+		t.Fatalf("token 应已轮换: %+v", p.Codex)
+	}
+	if !p.Codex.PlanUsage {
+		t.Fatal("应识别套餐推理权限")
+	}
+	if got := st.ProviderModelCount(p.ID); got != 3 {
+		t.Fatalf("模型同步: %d", got)
+	}
+
+	// 同一账号再次导入：原地更新（subject 相同）
+	code, res = codexImportCall(t, a, fmt.Sprintf(`{"raw":%q}`, raw))
+	if code != 200 || res["status"] != "success" {
+		t.Fatalf("二次导入应成功: %d %v", code, res)
+	}
+	if len(st.AllProviders()) != 1 {
+		t.Fatalf("同账号应原地更新: %d", len(st.AllProviders()))
+	}
+	if again, _ := st.Provider(p.ID); again.Codex.RefreshToken != "rt-2" {
+		t.Fatalf("二次导入应再次轮换: %q", again.Codex.RefreshToken)
+	}
+}
+
+func TestCodexImportDeadToken(t *testing.T) {
+	fa := codexStartFakeAuth(t)
+	fi := codexStartFakeAPI(t, nil)
+	a, st := codexNewAdapter(t, fa.base, fi.base)
+	raw := `{"subject":"s","client_id":"oaiapp_x","access_token":"at","refresh_token":"dead-rt","expires_in":3600,"scopes":[]}`
+	code, res := codexImportCall(t, a, fmt.Sprintf(`{"raw":%q}`, raw))
+	if code != http.StatusBadGateway {
+		t.Fatalf("死凭证应 502: %d %v", code, res)
+	}
+	if msg, _ := res["error"].(map[string]any)["message"].(string); !strings.Contains(msg, "重新登录") {
+		t.Fatalf("应提示重新登录: %v", res)
+	}
+	if len(st.AllProviders()) != 0 {
+		t.Fatal("失败的导入不应落盘 provider")
+	}
+}
+
+func TestCodexImportBadInput(t *testing.T) {
+	a, _ := codexNewAdapter(t, "", "")
+	for _, body := range []string{
+		`{}`,                              // 缺凭证
+		`{"raw":"not json"}`,              // 非 JSON 凭证
+		`{"raw":"{\"client_id\":\"c\"}"}`, // 缺 refresh_token
+	} {
+		if code, _ := codexImportCall(t, a, body); code != http.StatusBadRequest {
+			t.Fatalf("%s 应 400", body)
+		}
 	}
 }

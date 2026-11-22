@@ -46,6 +46,7 @@ func (s *Server) routes() *http.ServeMux {
 	api.HandleFunc("GET /api/codex/login/status", s.handleCodexLoginStatus)
 	api.HandleFunc("POST /api/codex/login/paste", s.handleCodexLoginPaste)
 	api.HandleFunc("POST /api/codex/login/cancel", s.handleCodexLoginCancel)
+	api.HandleFunc("POST /api/codex/import", s.handleCodexImport)
 	api.HandleFunc("POST /api/providers/{id}/codex-refresh", s.handleCodexRefresh)
 	api.HandleFunc("POST /api/groups", s.handleGroupCreate)
 	api.HandleFunc("PUT /api/groups/{id}", s.handleGroupUpdate)
