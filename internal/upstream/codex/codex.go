@@ -63,14 +63,15 @@ const (
 )
 
 // codexCLIModels CLI 模式的内置模型目录：ChatGPT 后端没有公开的目录端点，
-// 按当前 Codex 常用型号内置（后台仍可手填任意模型名）。
+// 按当前 Codex 命名空间内置（可用集因账号档位而异，free 档可能全部不可用；
+// 后台可手填任意模型名，返回 model_not_found 即该账号无此模型授权）。
 var codexCLIModels = []string{
-	"gpt-5.3-codex", "gpt-5.3-codex-mini",
+	"gpt-5.6-sol",
+	"gpt-5.5", "gpt-5.5-codex",
+	"gpt-5.4", "gpt-5.4-codex",
+	"gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.3-codex-mini",
 	"gpt-5.2-codex", "gpt-5.2-codex-mini",
 	"gpt-5.1-codex", "gpt-5.1-codex-mini",
-	"gpt-5-codex", "gpt-5-codex-mini",
-	"o4-mini",
-	"codex-mini-latest",
 }
 
 // tokenResponse OAuth token 端点的响应形状（code 交换与 refresh 共用）。

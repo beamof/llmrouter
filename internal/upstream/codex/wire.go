@@ -15,6 +15,7 @@ package codex
 import (
 	"bufio"
 	"bytes"
+	crand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -149,8 +150,8 @@ type codexWirePlan struct {
 }
 
 // codexUpstreamHeader 数据面请求头：SIWC 只需 Bearer；CLI 模式要求伪装
-// Codex 官方客户端（chatgpt-account-id / originator / OpenAI-Beta / UA），
-// 否则 ChatGPT 后端拒绝服务。
+// Codex 官方客户端（chatgpt-account-id / originator / OpenAI-Beta / UA /
+// session_id），否则 ChatGPT 后端拒绝服务。
 func codexUpstreamHeader(cred *CodexCred) http.Header {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
@@ -165,7 +166,17 @@ func codexUpstreamHeader(cred *CodexCred) http.Header {
 	h.Set("originator", codexCLIOriginator)
 	h.Set("OpenAI-Beta", "responses=experimental")
 	h.Set("User-Agent", codexCLIUserAgent)
+	h.Set("session_id", codexNewUUID()) // CLI 每请求一个会话标识
 	return h
+}
+
+// codexNewUUID 生成 UUIDv4 文本（session_id 头用）
+func codexNewUUID() string {
+	var b [16]byte
+	crand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // codexBuildOutbound 把客户端请求（chat 或 responses 形态）装配成 SIWC 合规的
