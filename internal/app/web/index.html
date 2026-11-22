@@ -897,11 +897,11 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
       </div>
       <div class="field" style="align-items:flex-start"><label>粘贴凭证 JSON</label>
         <div style="flex:1;min-width:0">
-          <textarea id="p-codexraw" class="mono" rows="4" placeholder='{"client_id":"oaiapp_…","subject":"…","access_token":"…","refresh_token":"…","expires_in":3600,"scopes":["chatgpt.tokens.use.direct",…]}（SIWC 凭证记录，或从另一台 llmrouter 的 data.json codex 字段复制）' style="width:100%;box-sizing:border-box"></textarea>
+          <textarea id="p-codexraw" class="mono" rows="4" placeholder='支持三种格式：Codex CLI 的 ~/.codex/auth.json 原文；SIWC 凭证记录；本网关 data.json 的 codex 字段' style="width:100%;box-sizing:border-box"></textarea>
           <button class="btn mini" onclick="codexImportRaw()" style="margin-top:4px">导入粘贴的凭证</button>
         </div>
       </div>
-      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 ChatGPT 套餐（Plus / Pro 的 Codex 额度，Sign in with ChatGPT）作为上游：点击「登录 ChatGPT」后在浏览器授权，自动创建 Provider 并同步账号可用模型。需要 ChatGPT Plus / Pro 且账号所在地区可用；用量与 ChatGPT 共享（5 小时窗口）。出站走 api.openai.com/v1/responses（强制流式、不落盘），llmrouter 自动剥离该通道不支持的字段与托管工具。服务器上没有浏览器时用粘贴回调兜底，或把别处得到的凭证 JSON 直接粘贴导入（导入即续期验证并轮换 refresh token，来源端凭证随之失效）。删除 Provider 会尝试在 OpenAI 侧吊销授权。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 ChatGPT 套餐（Plus / Pro 的 Codex 额度）作为上游，两种凭证来源：① 点击「登录 ChatGPT」走 Sign in with ChatGPT 浏览器授权（需要 ChatGPT Plus / Pro）；② 本机装过 Codex CLI 的话，把 ~/.codex/auth.json 的内容整份粘贴到上方「粘贴凭证 JSON」导入（复用 CLI 登录态，出站走 ChatGPT 后端的 Codex 通道并自动伪装官方客户端）。服务器上没有浏览器时也可用粘贴回调 URL 兜底。出站强制流式、不落盘，llmrouter 自动剥离该通道不支持的字段与托管工具；用量与 ChatGPT 共享（Plus 为 5 小时窗口，达限 429 自动静音）。导入即续期验证并轮换 refresh token（来源端凭证随之失效）。删除 Provider 会尝试在 OpenAI 侧吊销授权。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
     </div>
   </div>
   <div class="dlg-foot split">
@@ -2251,10 +2251,12 @@ function providerStatusHTML(p) {
     const c = p.codex;
     if (!c || !c.subject) return '<span class="pill bad">未登录</span>';
     const e = expiryBadge(c.expires_at);
-    const planTag = c.plan_usage ? '' : ' · <span class="pill warn" style="margin:0">未授权套餐推理</span>';
+    const isCLI = c.mode === 'cli';
+    const planTag = (c.plan_usage || isCLI) ? '' : ' · <span class="pill warn" style="margin:0">未授权套餐推理</span>';
+    const srcTag = isCLI ? ' · Codex CLI' : '';
     return `<div class="status-line">
       <span class="pill ${e.cls || 'ok'}">${e.cls ? e.label : '凭证有效'}</span>
-      <span class="status-extra">${esc(c.email || c.name || c.subject)}${e.detail ? ' · token 至 ' + e.detail : ''}${planTag}</span>
+      <span class="status-extra">${esc(c.email || c.name || c.subject)}${srcTag}${e.detail ? ' · token 至 ' + e.detail : ''}${planTag}</span>
     </div>`;
   }
   if (p.api_key) {
@@ -2506,7 +2508,8 @@ function codexBalanceHTML(p) {
   const c = p.codex;
   if (!c) return '<span class="hint">未登录</span>';
   const when = c.checked_at ? `<div class="cell-sub">更新于 ${agoText(c.checked_at)}</div>` : '';
-  let s = c.plan_usage ? 'ChatGPT 套餐已授权' : '未授权套餐推理';
+  const isCLI = c.mode === 'cli';
+  let s = isCLI ? 'Codex CLI 登录态' : (c.plan_usage ? 'ChatGPT 套餐已授权' : '未授权套餐推理');
   const re = c.refresh_expires_at ? new Date(c.refresh_expires_at) : null;
   if (re && !isNaN(re)) s += ` · 授权至 ${re.toLocaleDateString()}`;
   return `<div class="bal">${esc(s)}</div>${when}`;
@@ -2516,10 +2519,12 @@ function codexRenderStatus() {
   const el = $('p-codexstatus');
   if ($('p-kind').value !== 'codex') return;
   const cred = codexCredOf(editingProvider);
-  if (!cred) { el.innerHTML = '尚未登录——点击「登录 ChatGPT」在浏览器完成授权后自动创建 Provider'; return; }
+  if (!cred) { el.innerHTML = '尚未登录——点击「登录 ChatGPT」在浏览器完成授权后自动创建 Provider；或把 Codex CLI 的 ~/.codex/auth.json 内容粘贴到下方导入'; return; }
   const exp = cred.expires_at ? new Date(cred.expires_at) : null;
+  const isCLI = cred.mode === 'cli';
   let html = `已登录：<b>${esc(cred.email || cred.name || cred.subject)}</b>` +
-    (cred.plan_usage ? '' : ' · <span class="pill warn">未授权套餐推理</span>') +
+    (isCLI ? ' · <span class="mini-tag">Codex CLI</span>' : '') +
+    ((cred.plan_usage || isCLI) ? '' : ' · <span class="pill warn">未授权套餐推理</span>') +
     (exp ? ` · token 到期 ${exp.toLocaleString()}` : '');
   if (editingProvider) {
     html += ` <button class="btn mini" onclick="codexRefreshNow('${editingProvider.id}')">续期 / 刷新账号</button>`;

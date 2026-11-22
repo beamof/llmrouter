@@ -36,7 +36,8 @@ type Adapter struct {
 	jwks jwksCache
 
 	authBase string // 授权服务器基址覆盖（测试注入；空 = 官方端点）
-	apiBase  string // 推理 API 基址覆盖（测试注入；空 = 官方端点）
+	apiBase  string // 推理 API 基址覆盖（SIWC；测试注入，空 = 官方端点）
+	cliBase  string // ChatGPT 后端基址覆盖（CLI 模式；测试注入，空 = 官方端点）
 }
 
 // New 创建适配器。
@@ -57,12 +58,12 @@ func (a *Adapter) Kinds() []string { return []string{"codex"} }
 // CanServe 适配层两种接入协议都承接（chat 出站转 Responses）。
 func (a *Adapter) CanServe(domain.Protocol) bool { return true }
 
-// ValidateProvider 固定数据面基址并校验凭证。
+// ValidateProvider 固定数据面基址并校验凭证（SIWC 与 CLI 模式端点不同）。
 func (a *Adapter) ValidateProvider(p *domain.Provider) error {
 	if p.Codex == nil || strings.TrimSpace(p.Codex.Subject) == "" {
 		return fmt.Errorf("Codex 类型的 provider 必须携带凭证（codex.subject），编辑时请勿丢弃 codex 字段")
 	}
-	p.BaseURL = a.api() + codexResponsesPath
+	p.BaseURL = a.dataPlaneURL(p.Codex)
 	return nil
 }
 
@@ -93,7 +94,11 @@ func (a *Adapter) Probe(ctx context.Context, p domain.Provider, model string) (u
 }
 
 // ListModels 拉取账号可见的模型目录（后台「添加模型」下拉用）。
+// CLI 模式没有目录端点，直接返回内置列表。
 func (a *Adapter) ListModels(ctx context.Context, p domain.Provider) ([]string, error) {
+	if codexIsCLI(codexOf(p)) {
+		return append([]string(nil), codexCLIModels...), nil
+	}
 	return a.Catalog(ctx, p)
 }
 
@@ -201,7 +206,7 @@ func (a *Adapter) refreshToken(p Provider, force bool) (*CodexCred, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	tr, err := a.refreshTokens(ctx, cli, cred.ClientID, cred.RefreshToken)
+	tr, err := a.refreshTokens(ctx, cli, cred)
 	if err != nil {
 		return nil, fmt.Errorf("续期 Codex 套餐凭证: %v", err)
 	}
@@ -238,6 +243,10 @@ func (a *Adapter) credFromToken(cred *CodexCred, tr *tokenResponse) *CodexCred {
 				nc.PlanUsage = true
 			}
 		}
+	}
+	if codexIsCLI(cred) {
+		// CLI 登录态本身即 Codex 推理授权，其 scope 集不含 plan usage 标记
+		nc.PlanUsage = true
 	}
 	now := a.rt.NowTime()
 	nc.CheckedAt = &now

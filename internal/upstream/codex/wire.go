@@ -75,9 +75,7 @@ func (a *Adapter) attempt(w http.ResponseWriter, r *http.Request, c Candidate, s
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(cred.AccessToken))
+		req.Header = codexUpstreamHeader(cred)
 		return cli.Do(req)
 	}
 	// 发请求并分类。凭据级拒绝（401）强制续期后原候选重试一次；
@@ -148,6 +146,26 @@ func (a *Adapter) attempt(w http.ResponseWriter, r *http.Request, c Candidate, s
 // codexWirePlan 一次出站请求的形态
 type codexWirePlan struct {
 	effort string // 实际下发的思考档位；"" = 未下发
+}
+
+// codexUpstreamHeader 数据面请求头：SIWC 只需 Bearer；CLI 模式要求伪装
+// Codex 官方客户端（chatgpt-account-id / originator / OpenAI-Beta / UA），
+// 否则 ChatGPT 后端拒绝服务。
+func codexUpstreamHeader(cred *CodexCred) http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	h.Set("Accept", "text/event-stream")
+	h.Set("Authorization", "Bearer "+strings.TrimSpace(cred.AccessToken))
+	if !codexIsCLI(cred) {
+		return h
+	}
+	if cred.AccountID != "" {
+		h.Set("chatgpt-account-id", cred.AccountID)
+	}
+	h.Set("originator", codexCLIOriginator)
+	h.Set("OpenAI-Beta", "responses=experimental")
+	h.Set("User-Agent", codexCLIUserAgent)
+	return h
 }
 
 // codexBuildOutbound 把客户端请求（chat 或 responses 形态）装配成 SIWC 合规的

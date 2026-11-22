@@ -278,7 +278,7 @@ func (a *Adapter) loginCloseListener(sess *loginSession) {
 // persistLogin 创建或原地更新 Codex Provider，并同步模型条目（只增不删，
 // 不覆盖用户调整过的优先级/上限/暴露开关）。
 func (a *Adapter) persistLogin(cred *CodexCred, models []string, name, proxy string) (string, int) {
-	p := &Provider{Kind: "codex", BaseURL: a.api() + codexResponsesPath, Proxy: proxy, Codex: cred}
+	p := &Provider{Kind: "codex", BaseURL: a.dataPlaneURL(cred), Proxy: proxy, Codex: cred}
 	if old, ok := a.rt.Store.ProviderByCodexSubject(cred.Subject, cred.ClientID); ok {
 		p.ID, p.Name, p.Proxy = old.ID, old.Name, old.Proxy // 原地更新：保留 ID/名称/代理
 	}
@@ -296,7 +296,11 @@ func (a *Adapter) persistLogin(cred *CodexCred, models []string, name, proxy str
 				label = label[:8]
 			}
 		}
-		p.Name = "Codex · " + label
+		if codexIsCLI(cred) {
+			p.Name = "Codex CLI · " + label
+		} else {
+			p.Name = "Codex · " + label
+		}
 	}
 	a.rt.Store.UpsertProvider(p)
 	n := 0
@@ -531,7 +535,7 @@ func (a *Adapter) HandleCodexImport(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	// 导入即续期：验证凭证有效，并轮换掉粘贴来的 refresh token
-	tr, err := a.refreshTokens(ctx, cli, cred.ClientID, cred.RefreshToken)
+	tr, err := a.refreshTokens(ctx, cli, cred)
 	if err != nil {
 		httpx.WriteErr(w, http.StatusBadGateway, "凭证验证（续期）失败: "+err.Error())
 		return
@@ -563,7 +567,7 @@ func (a *Adapter) HandleCodexImport(w http.ResponseWriter, r *http.Request) {
 		}
 		warn += "模型目录同步失败：" + merr.Error()
 	}
-	if !nc.PlanUsage {
+	if !nc.PlanUsage && !codexIsCLI(nc) {
 		if warn != "" {
 			warn += "；"
 		}

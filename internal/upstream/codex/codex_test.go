@@ -402,6 +402,34 @@ func codexStartFakeAuth(t *testing.T) *codexFakeAuth {
 	mux.HandleFunc("/api/accounts/oauth/revoke", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
+	// Codex CLI 的刷新端点（不同路径）：校验 client_id 与授权形态
+	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(400)
+			return
+		}
+		if r.PostForm.Get("client_id") != codexCLIClientID || r.PostForm.Get("grant_type") != "refresh_token" {
+			w.WriteHeader(400)
+			io.WriteString(w, `{"error":"invalid_client","error_description":"not codex cli app"}`)
+			return
+		}
+		if rt := r.PostForm.Get("refresh_token"); strings.HasPrefix(rt, "dead-") {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":"invalid_grant","error_description":"refresh token is invalid"}`)
+			return
+		}
+		fa.mu.Lock()
+		fa.tokens++
+		n := fa.tokens
+		fa.lastForm = r.PostForm
+		fa.mu.Unlock()
+		idTok := codexSignJWT(t, key, "k1", map[string]any{
+			"iss": codexIssuer, "aud": []string{codexCLIClientID}, "sub": "google-oauth2|777",
+			"email": "cli@example.com", "exp": time.Now().Add(time.Hour).Unix(),
+		})
+		io.WriteString(w, fmt.Sprintf(`{"access_token":"cli-at-%d","refresh_token":"cli-rt-%d","id_token":%q,"token_type":"Bearer","expires_in":3600,"scope":%q}`,
+			n, n, idTok, codexCLIScope))
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	fa.base = srv.URL
@@ -410,10 +438,11 @@ func codexStartFakeAuth(t *testing.T) *codexFakeAuth {
 
 // codexFakeAPI 伪造 api.openai.com：models / responses
 type codexFakeAPI struct {
-	base      string
-	responses func(w http.ResponseWriter, r *http.Request) // /responses 覆盖
-	lastBody  []byte
-	auth      string // 收到的 Authorization
+	base        string
+	responses   func(w http.ResponseWriter, r *http.Request) // /responses 覆盖
+	lastBody    []byte
+	auth        string      // 收到的 Authorization
+	lastHeaders http.Header // 收到的完整请求头（CLI 模式伪装头断言用）
 }
 
 func codexStartFakeAPI(t *testing.T, handler func(w http.ResponseWriter, r *http.Request)) *codexFakeAPI {
@@ -431,6 +460,7 @@ func codexStartFakeAPI(t *testing.T, handler func(w http.ResponseWriter, r *http
 		b, _ := io.ReadAll(r.Body)
 		fi.lastBody = b
 		fi.auth = r.Header.Get("Authorization")
+		fi.lastHeaders = r.Header.Clone()
 		if fi.responses != nil {
 			fi.responses(w, r)
 			return
@@ -443,14 +473,17 @@ func codexStartFakeAPI(t *testing.T, handler func(w http.ResponseWriter, r *http
 	return fi
 }
 
-// codexNewAdapter 构造注入了伪造端点的适配器与真实 store
+// codexNewAdapter 构造注入了伪造端点的适配器与真实 store。
+// CLI 数据面（chatgpt.com/backend-api/codex）在测试里与 SIWC 共用同一 fake。
 func codexNewAdapter(t *testing.T, authBase, apiBase string) (*Adapter, *store.Store) {
 	t.Helper()
 	st, err := store.LoadStore(t.TempDir() + "/data.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewWithBases(&upstream.Runtime{Store: st, Clients: upstream.NewClientFactory(&http.Client{})}, authBase, apiBase), st
+	a := NewWithBases(&upstream.Runtime{Store: st, Clients: upstream.NewClientFactory(&http.Client{})}, authBase, apiBase)
+	a.cliBase = apiBase
+	return a, st
 }
 
 // codexStartLogin 发起登录，返回（state, 回调 URL）。回调 URL 从授权地址的
@@ -994,5 +1027,192 @@ func TestCodexImportBadInput(t *testing.T) {
 		if code, _ := codexImportCall(t, a, body); code != http.StatusBadRequest {
 			t.Fatalf("%s 应 400", body)
 		}
+	}
+}
+
+// ── Codex CLI（auth.json）模式 ───────────────────────────────────────────
+
+// codexFakeAuthJSON 构造一份 Codex CLI 的 ~/.codex/auth.json 形态 JSON
+func codexFakeAuthJSON(t *testing.T, refreshToken string) string {
+	t.Helper()
+	mint := func(claims map[string]any) string {
+		header, _ := json.Marshal(map[string]any{"alg": "RS256", "kid": "k1"})
+		payload, _ := json.Marshal(claims)
+		return base64.RawURLEncoding.EncodeToString(header) + "." +
+			base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+	}
+	idTok := mint(map[string]any{
+		"iss": codexIssuer, "aud": codexCLIClientID, "sub": "google-oauth2|123",
+		"email": "kyle@example.com", "email_verified": true, "name": "Kyle",
+	})
+	accessTok := mint(map[string]any{
+		"aud": "https://api.openai.com/v1", "client_id": codexCLIClientID,
+		"sub": "google-oauth2|123", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	return fmt.Sprintf(`{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-17T04:54:07Z",
+		"tokens":{"access_token":%q,"account_id":"63e4e403-7a12-4454-bad3-cce6f77490f6",
+		"id_token":%q,"refresh_token":%q}}`, accessTok, idTok, refreshToken)
+}
+
+func TestCodexParseCLIAuth(t *testing.T) {
+	raw := []byte(codexFakeAuthJSON(t, "cli-rt-1"))
+	cred, err := codexParseCred(raw, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !codexIsCLI(cred) {
+		t.Fatal("auth.json 应解析为 CLI 模式")
+	}
+	if cred.ClientID != codexCLIClientID || cred.RefreshToken != "cli-rt-1" {
+		t.Fatalf("基本字段: %+v", cred)
+	}
+	if cred.Subject != "google-oauth2|123" || cred.Email != "kyle@example.com" || cred.Name != "Kyle" {
+		t.Fatalf("身份应取自 id_token 声明: %+v", cred)
+	}
+	if cred.AccountID != "63e4e403-7a12-4454-bad3-cce6f77490f6" {
+		t.Fatalf("account_id: %q", cred.AccountID)
+	}
+	if !cred.PlanUsage {
+		t.Fatal("CLI 登录态 PlanUsage 应为 true")
+	}
+	if cred.ExpiresAt == nil || time.Until(*cred.ExpiresAt) > 2*time.Hour {
+		t.Fatalf("过期时刻应取自 access token 的 exp: %v", cred.ExpiresAt)
+	}
+	// API Key 模式 / 缺 tokens / 缺 refresh_token 都不认
+	for _, bad := range []string{
+		`{"OPENAI_API_KEY":"sk-x","auth_mode":"apikey","tokens":null}`,
+		`{"auth_mode":"chatgpt","tokens":{"access_token":"a"}}`, // 缺 refresh_token
+	} {
+		if cli := codexParseCLIAuth([]byte(bad)); cli != nil {
+			t.Fatalf("%s 不应识别为 CLI 凭证", bad)
+		}
+	}
+}
+
+func TestCodexImportCLIAuth(t *testing.T) {
+	fa := codexStartFakeAuth(t)
+	fi := codexStartFakeAPI(t, nil)
+	a, st := codexNewAdapter(t, fa.base, fi.base)
+
+	raw := codexFakeAuthJSON(t, "cli-src-rt")
+	code, res := codexImportCall(t, a, fmt.Sprintf(`{"raw":%q}`, raw))
+	if code != 200 || res["status"] != "success" {
+		t.Fatalf("auth.json 导入应成功: %d %v", code, res)
+	}
+	// 导入即续期：走的应是 CLI 端点与 CLI client
+	fa.mu.Lock()
+	form := fa.lastForm
+	fa.mu.Unlock()
+	if form.Get("client_id") != codexCLIClientID || form.Get("refresh_token") != "cli-src-rt" {
+		t.Fatalf("CLI 刷新表单: %v", form)
+	}
+	if form.Get("scope") == "" || form.Get("resource") != "" {
+		t.Fatalf("CLI 刷新应带 scope 不带 resource: %v", form)
+	}
+	providers := st.AllProviders()
+	if len(providers) != 1 {
+		t.Fatalf("应创建 1 个 provider: %d", len(providers))
+	}
+	p := providers[0]
+	c := p.Codex
+	if !codexIsCLI(c) || c.AccessToken != "cli-at-1" || c.RefreshToken != "cli-rt-1" {
+		t.Fatalf("CLI 凭证应已轮换: %+v", c)
+	}
+	// 身份以刷新响应 id_token（JWKS 校验）为准
+	if c.Subject != "google-oauth2|777" || c.Email != "cli@example.com" {
+		t.Fatalf("身份: %+v", c)
+	}
+	if p.BaseURL != fi.base+"/responses" {
+		t.Fatalf("CLI 数据面基址: %s", p.BaseURL)
+	}
+	if !c.PlanUsage {
+		t.Fatal("CLI 模式 PlanUsage 应保持 true")
+	}
+	if got := st.ProviderModelCount(p.ID); got != len(codexCLIModels) {
+		t.Fatalf("应同步内置模型目录: %d", got)
+	}
+	if res["warning"] != nil {
+		t.Fatalf("不应有告警: %v", res["warning"])
+	}
+}
+
+func TestCodexCLIAttemptHeaders(t *testing.T) {
+	fi := codexStartFakeAPI(t, codexSSEHandler)
+	a, st := codexNewAdapter(t, "", fi.base)
+	exp := time.Now().Add(time.Hour)
+	st.UpsertProvider(&Provider{ID: "p1", Name: "codexcli", Kind: "codex",
+		BaseURL: a.cliDataBase() + codexResponsesPath,
+		Codex: &CodexCred{Subject: "s", Mode: "cli", AccountID: "acc-1",
+			ClientID: codexCLIClientID, AccessToken: "cli-at", RefreshToken: "cli-rt", ExpiresAt: &exp}})
+	st.UpsertModel(&Model{ID: "m1", ProviderID: "p1", Name: "gpt-5.3-codex"})
+	p, _ := st.Provider("p1")
+	m, _ := st.Model("m1")
+	c := Candidate{Provider: p, Model: m}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-5.3-codex","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	if err := a.attempt(rec, req, c, []byte(`{"model":"gpt-5.3-codex","messages":[{"role":"user","content":"hi"}]}`), "k", false, upstream.NewTiming(), nil); err != nil {
+		t.Fatalf("attempt: %v", err)
+	}
+	if rec.Body.String() == "" || !strings.Contains(rec.Body.String(), "你好世界") && !strings.Contains(rec.Body.String(), `"content"`) {
+		t.Fatalf("响应异常: %s", rec.Body.String())
+	}
+	// CLI 模式伪装头
+	h := fi.lastHeaders
+	for k, want := range map[string]string{
+		"Authorization":      "Bearer cli-at",
+		"Chatgpt-Account-Id": "acc-1",
+		"Originator":         codexCLIOriginator,
+		"Openai-Beta":        "responses=experimental",
+	} {
+		if got := h.Get(k); got != want {
+			t.Fatalf("请求头 %s = %q，期望 %q", k, got, want)
+		}
+	}
+	if ua := h.Get("User-Agent"); !strings.HasPrefix(ua, "codex_cli_rs/") {
+		t.Fatalf("User-Agent 应伪装 Codex CLI: %q", ua)
+	}
+	// 出站体仍满足 store:false + stream:true
+	var sent map[string]any
+	json.Unmarshal(fi.lastBody, &sent)
+	if sent["store"] != false || sent["stream"] != true {
+		t.Fatalf("出站约束: %v", sent)
+	}
+}
+
+func TestCodexCLIRefreshViaAdapter(t *testing.T) {
+	fa := codexStartFakeAuth(t)
+	a, st := codexNewAdapter(t, fa.base, "")
+	exp := time.Now().Add(time.Minute) // 临期，触发续期
+	st.UpsertProvider(&Provider{ID: "p1", Name: "cli1", Kind: "codex", BaseURL: "http://x/responses",
+		Codex: &CodexCred{Subject: "s", Mode: "cli", ClientID: codexCLIClientID,
+			AccessToken: "old", RefreshToken: "cli-old-rt", ExpiresAt: &exp, PlanUsage: true}})
+	p, _ := st.Provider("p1")
+	nc, err := a.refreshToken(p, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nc.AccessToken != "cli-at-1" || nc.RefreshToken != "cli-rt-1" {
+		t.Fatalf("CLI 续期结果: %+v", nc)
+	}
+	if !nc.PlanUsage {
+		t.Fatal("CLI 模式续期后 PlanUsage 应保持 true（scope 集不含 plan usage 标记）")
+	}
+}
+
+func TestCodexCLIListModels(t *testing.T) {
+	fa := codexStartFakeAuth(t)
+	a, st := codexNewAdapter(t, fa.base, "")
+	exp := time.Now().Add(time.Hour)
+	st.UpsertProvider(&Provider{ID: "p1", Name: "cli1", Kind: "codex", BaseURL: "http://x/responses",
+		Codex: &CodexCred{Subject: "s", Mode: "cli", ClientID: codexCLIClientID,
+			AccessToken: "at", RefreshToken: "rt", ExpiresAt: &exp}})
+	p, _ := st.Provider("p1")
+	models, err := a.ListModels(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != len(codexCLIModels) {
+		t.Fatalf("CLI 目录应返回内置列表: %v", models)
 	}
 }

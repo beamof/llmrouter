@@ -133,22 +133,27 @@ type CommandCodeCred struct {
 	CheckedAt *time.Time `json:"checked_at,omitempty"`
 }
 
-// CodexCred Codex 套餐（Sign in with ChatGPT 的 ChatGPT plan usage）账号凭证。
-// OAuth 公共客户端（无 secret）：首次登录用 client_id=dynamic_agent_client 动态注册，
-// 回调换回正式 client_id 保存；access token 约 1 小时有效，临期用 refresh token
-// （30 天滚动轮换）续期。IDToken 留作下次登录的 id_token_hint（可过期）。
+// CodexCred Codex 套餐账号凭证，两种来源（Mode 区分）：
+//   - ""（默认）= Sign in with ChatGPT 的 plan usage：OAuth 公共客户端动态注册，
+//     access token（1 小时）临期用 refresh token（30 天滚动）续期，推理走
+//     api.openai.com/v1/responses；
+//   - "cli" = Codex CLI 的 ~/.codex/auth.json 登录态：client_id 固定为 Codex CLI
+//     应用（app_…），刷新走 auth.openai.com/oauth/token，推理走
+//     chatgpt.com/backend-api/codex/responses（带 chatgpt-account-id 等专用头）。
 type CodexCred struct {
 	Subject          string     `json:"subject,omitempty"` // ID token 的 sub，账号唯一标识
 	Email            string     `json:"email,omitempty"`
 	Name             string     `json:"name,omitempty"`
-	ClientID         string     `json:"client_id,omitempty"` // 动态注册下发的正式 client_id（非 dynamic_agent_client）
+	Mode             string     `json:"mode,omitempty"`       // 空 = SIWC plan usage；"cli" = Codex CLI auth.json
+	AccountID        string     `json:"account_id,omitempty"` // CLI 模式：chatgpt-account-id 头
+	ClientID         string     `json:"client_id,omitempty"`  // 动态注册下发的正式 client_id；CLI 模式为固定 app_…
 	AccessToken      string     `json:"access_token,omitempty"`
 	RefreshToken     string     `json:"refresh_token,omitempty"`
 	IDToken          string     `json:"id_token,omitempty"` // 保留作 id_token_hint
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
 	RefreshExpiresAt *time.Time `json:"refresh_expires_at,omitempty"`
 	Scopes           []string   `json:"scopes,omitempty"`
-	PlanUsage        bool       `json:"plan_usage,omitempty"` // 已授权 chatgpt.tokens.use.direct（可用套餐推理）
+	PlanUsage        bool       `json:"plan_usage,omitempty"` // 已授权推理（SIWC：chatgpt.tokens.use.direct；CLI 恒 true）
 	CheckedAt        *time.Time `json:"checked_at,omitempty"` // 最近一次登录/刷新成功时刻
 }
 

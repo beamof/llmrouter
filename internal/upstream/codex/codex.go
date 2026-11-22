@@ -48,6 +48,30 @@ const (
 	codexRefreshWindow = 2 * time.Minute
 )
 
+// ── Codex CLI（~/.codex/auth.json）模式的固定参数 ─────────────────────────
+//
+// Codex CLI 官方客户端的 OAuth app 与数据面端点（与 SIWC plan usage 是两套体系：
+// 刷新端点不同、凭证字段嵌套在 tokens 里、推理走 ChatGPT 后端并要求伪装 CLI
+// 的专用请求头）。参数与端点为公开事实（Codex CLI / ccLoad 等开源实现一致）。
+const (
+	codexCLIClientID   = "app_EMoamEEZ73f0CktYaXp7hrann"
+	codexCLIScope      = "openid profile email offline_access"
+	codexCLIBase       = "https://chatgpt.com/backend-api/codex"
+	codexCLIOriginator = "codex_cli_rs"
+	codexCLIUserAgent  = "codex_cli_rs/0.68.0 (Windows 11; x86_64) llmrouter"
+)
+
+// codexCLIModels CLI 模式的内置模型目录：ChatGPT 后端没有公开的目录端点，
+// 按当前 Codex 常用型号内置（后台仍可手填任意模型名）。
+var codexCLIModels = []string{
+	"gpt-5.3-codex", "gpt-5.3-codex-mini",
+	"gpt-5.2-codex", "gpt-5.2-codex-mini",
+	"gpt-5.1-codex", "gpt-5.1-codex-mini",
+	"gpt-5-codex", "gpt-5-codex-mini",
+	"o4-mini",
+	"codex-mini-latest",
+}
+
 // tokenResponse OAuth token 端点的响应形状（code 交换与 refresh 共用）
 type tokenResponse struct {
 	AccessToken      string `json:"access_token"`
@@ -69,13 +93,42 @@ func codexOf(p Provider) *CodexCred {
 	return nil
 }
 
-// codexTokenURL token 端点（authBase 可注入，测试指向 httptest）
+// codexIsCLI 凭证是否来自 Codex CLI 的 auth.json（数据面与刷新端点不同）
+func codexIsCLI(c *CodexCred) bool { return c != nil && c.Mode == "cli" }
+
+// codexTokenURL token 端点（SIWC，authBase 可注入，测试指向 httptest）
 func (a *Adapter) tokenURL() string {
 	base := a.authBase
 	if base == "" {
 		base = codexAuthBase
 	}
 	return strings.TrimRight(base, "/") + "/api/accounts/oauth/token"
+}
+
+// codexCLITokenURL Codex CLI 的刷新端点（同一授权服务器、不同路径）
+func (a *Adapter) cliTokenURL() string {
+	base := a.authBase
+	if base == "" {
+		base = codexAuthBase
+	}
+	return strings.TrimRight(base, "/") + "/oauth/token"
+}
+
+// codexCLIDataBase CLI 模式的数据面基址（cliBase 可注入）
+func (a *Adapter) cliDataBase() string {
+	if a.cliBase != "" {
+		return strings.TrimRight(a.cliBase, "/")
+	}
+	return codexCLIBase
+}
+
+// codexDataPlaneURL 该凭证的数据面端点（SIWC → 公共 Responses API；
+// CLI → ChatGPT 后端的 codex responses）
+func (a *Adapter) dataPlaneURL(cred *CodexCred) string {
+	if codexIsCLI(cred) {
+		return a.cliDataBase() + codexResponsesPath
+	}
+	return a.api() + codexResponsesPath
 }
 
 // codexAuthorizeURL 授权端点
@@ -153,15 +206,78 @@ func (a *Adapter) exchangeCode(ctx context.Context, cli *http.Client, clientID, 
 
 // ── 凭证粘贴导入 ─────────────────────────────────────────────────────────
 
-// codexParseCred 解析粘贴导入的凭证 JSON。兼容两种形态：
-//  1. SIWC 官方文档的本地凭证记录（Registration and sign-in 第 5 步）：
+// codexJWTExpiry 解码 JWT 的 exp 声明（Codex CLI 的 auth.json 不带过期时刻，
+// 但它的 access token 本身是 JWT，可直接解出）。
+func codexJWTExpiry(token string) (time.Time, bool) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var c struct {
+		Exp int64 `json:"exp"`
+	}
+	if json.Unmarshal(payload, &c) != nil || c.Exp <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(c.Exp, 0), true
+}
+
+// codexParseCLIAuth 解析 Codex CLI 的 ~/.codex/auth.json（auth_mode=chatgpt 时
+// 的形态：凭证嵌套在 tokens 对象里）。非该形态返回 nil。
+func codexParseCLIAuth(raw []byte) *CodexCred {
+	var v struct {
+		AuthMode string `json:"auth_mode"`
+		Tokens   *struct {
+			AccessToken  string `json:"access_token"`
+			AccountID    string `json:"account_id"`
+			IDToken      string `json:"id_token"`
+			RefreshToken string `json:"refresh_token"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil || v.Tokens == nil || v.Tokens.RefreshToken == "" {
+		return nil
+	}
+	if v.AuthMode != "" && v.AuthMode != "chatgpt" {
+		return nil // API Key 模式的 auth.json 不属于本适配器
+	}
+	cred := &CodexCred{
+		Mode:         "cli",
+		AccountID:    strings.TrimSpace(v.Tokens.AccountID),
+		ClientID:     codexCLIClientID,
+		AccessToken:  strings.TrimSpace(v.Tokens.AccessToken),
+		IDToken:      strings.TrimSpace(v.Tokens.IDToken),
+		RefreshToken: strings.TrimSpace(v.Tokens.RefreshToken),
+		Scopes:       strings.Fields(codexCLIScope),
+		PlanUsage:    true, // CLI 登录态本身即 Codex 推理授权
+	}
+	if sub, email, name := codexDecodeIDTokenClaims(cred.IDToken); sub != "" {
+		cred.Subject, cred.Email, cred.Name = sub, email, name
+	}
+	if exp, ok := codexJWTExpiry(cred.AccessToken); ok {
+		cred.ExpiresAt = &exp
+	}
+	rexp := time.Now().Add(30 * 24 * time.Hour)
+	cred.RefreshExpiresAt = &rexp
+	return cred
+}
+
+// codexParseCred 解析粘贴导入的凭证 JSON。兼容三种形态：
+//  1. Codex CLI 的 ~/.codex/auth.json（tokens 嵌套）→ CLI 模式凭证；
+//  2. SIWC 官方文档的本地凭证记录（Registration and sign-in 第 5 步）：
 //     expires_in 为相对秒数，附带 issuer / ext_agent_host_id / saved_at 等额外字段；
-//  2. 本网关 data.json 里 provider 的 codex 字段：expires_at 为绝对时刻。
+//  3. 本网关 data.json 里 provider 的 codex 字段：expires_at 为绝对时刻。
 //
 // client_id 与 refresh_token 缺一不可（无法续期的凭证没有意义）；subject 允许
 // 缺省，由导入流程从刷新响应的 ID token 或凭证保留的 id_token 补齐。
 // 凭证里的 ext_agent_host_id 属于来源主机，导入时不采用（本机沿用自身的 host ID）。
 func codexParseCred(raw []byte, now time.Time) (*CodexCred, error) {
+	if cli := codexParseCLIAuth(raw); cli != nil {
+		return cli, nil
+	}
 	var f struct {
 		Subject          string     `json:"subject"`
 		Email            string     `json:"email"`
@@ -235,16 +351,23 @@ func codexDecodeIDTokenClaims(token string) (subject, email, name string) {
 }
 
 // codexRefreshToken 用 refresh token 续期（轮换：响应带新的 refresh token）。
+// SIWC 与 CLI 凭证的刷新端点与表单不同（CLI 走 /oauth/token 并显式带 scope）。
 // 失败按错误码分类：invalid_grant / *expired / *invalidated / *reused 表示
 // refresh token 已不可用，需要重新登录。
-func (a *Adapter) refreshTokens(ctx context.Context, cli *http.Client, clientID, refreshToken string) (*tokenResponse, error) {
+func (a *Adapter) refreshTokens(ctx context.Context, cli *http.Client, cred *CodexCred) (*tokenResponse, error) {
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
-		"client_id":     {clientID},
-		"refresh_token": {refreshToken},
-		"resource":      {codexResource},
+		"client_id":     {cred.ClientID},
+		"refresh_token": {cred.RefreshToken},
 	}
-	tr, status, _, err := codexPostForm(ctx, cli, a.tokenURL(), form)
+	endpoint := a.tokenURL()
+	if codexIsCLI(cred) {
+		form.Set("scope", codexCLIScope)
+		endpoint = a.cliTokenURL()
+	} else {
+		form.Set("resource", codexResource)
+	}
+	tr, status, _, err := codexPostForm(ctx, cli, endpoint, form)
 	if err != nil {
 		return nil, fmt.Errorf("续期请求失败: %v", err)
 	}
@@ -507,10 +630,13 @@ func codexAudContains(raw json.RawMessage, audience string) bool {
 
 // ── 模型目录与错误分类 ────────────────────────────────────────────────────
 
-// codexFetchModels 拉取账号可见的模型目录（GET /v1/models，SIWC 形状是
-// models[].slug/display_name/visibility）。只保留 visibility == "list" 的条目，
-// 保留服务端排序（SIWC Models and inference 第 1 步）。
+// codexFetchModels 拉取账号可见的模型目录。SIWC 走 GET /v1/models（形状是
+// models[].slug/display_name/visibility，只保留 visibility == "list" 的条目并
+// 保留服务端排序）；CLI 模式没有目录端点，返回内置列表。
 func (a *Adapter) fetchModels(ctx context.Context, cli *http.Client, cred *CodexCred) ([]string, error) {
+	if codexIsCLI(cred) {
+		return append([]string(nil), codexCLIModels...), nil
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.api()+codexModelsPath, nil)
 	if err != nil {
 		return nil, err
