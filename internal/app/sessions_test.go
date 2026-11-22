@@ -408,7 +408,7 @@ func TestDerivedSessionFromRemoteAddr(t *testing.T) {
 	// 2) A 被静音：同 IP 仍走 A（绑定优先，源端口变化不影响），换个 IP 则按规则走 B
 	mA := s.store.Models[0]
 	now := time.Now()
-	mA.Mutes = []MuteWindow{{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")}}
+	mA.Mutes = []MuteWindow{{From: now.Add(-5 * time.Minute).Format("15:04"), To: now.Add(5 * time.Minute).Format("15:04")}}
 	s.store.UpsertModel(mA)
 	if got := call(addr, ""); got != `{"ok":"A"}` {
 		t.Fatalf("同源地址应粘在绑定 A: %s", got)

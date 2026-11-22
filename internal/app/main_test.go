@@ -197,7 +197,7 @@ func TestMuteTimeWindow(t *testing.T) {
 	s, app := newTestServer(t)
 	m := addProviderModel(t, s, up.URL, "m", func(m *Model) {
 		m.Mutes = []MuteWindow{
-			{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")},
+			{From: now.Add(-5 * time.Minute).Format("15:04"), To: now.Add(5 * time.Minute).Format("15:04")},
 		}
 	})
 	if resp, body := postJSON(t, app, "/v1/chat/completions", `{"model":"m-p/m"}`); resp.StatusCode != 429 || !strings.Contains(body, "静音") {
@@ -550,7 +550,7 @@ func TestAutoModel(t *testing.T) {
 
 	// A 静音 → auto 自动落到 B
 	now := time.Now()
-	mA.Mutes = []MuteWindow{{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")}}
+	mA.Mutes = []MuteWindow{{From: now.Add(-5 * time.Minute).Format("15:04"), To: now.Add(5 * time.Minute).Format("15:04")}}
 	s.store.UpsertModel(mA)
 	if _, body := postJSONWithHeader(t, app, "POST", "/v1/chat/completions", reqBody, "X-Session-ID", "auto-2"); body != `{"ok":"B"}` {
 		t.Fatalf("A 静音后 auto 应选 B: %s", body)
@@ -1108,7 +1108,7 @@ func TestSessionBinding(t *testing.T) {
 	// 2) 规则变化（A 被静音）：无会话头走 B，带会话头仍走 A（绑定优先于规则）
 	mA := s.store.Models[0]
 	now := time.Now()
-	mA.Mutes = []MuteWindow{{From: now.Add(-time.Minute).Format("15:04"), To: now.Add(time.Minute).Format("15:04")}}
+	mA.Mutes = []MuteWindow{{From: now.Add(-5 * time.Minute).Format("15:04"), To: now.Add(5 * time.Minute).Format("15:04")}}
 	s.store.UpsertModel(mA)
 	if _, b := postJSON(t, app, "/v1/chat/completions", `{"model":"auto"}`); b != `{"ok":"B"}` {
 		t.Fatalf("无会话请求应走 B: %s", b)
