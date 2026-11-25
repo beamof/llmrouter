@@ -270,13 +270,15 @@ func (s *Server) handleModelUnmute(w http.ResponseWriter, r *http.Request) {
 	s.replyState(w, r)
 }
 
-// handleSettings 更新设置：默认路由组名、responses 协议转换开关、会话 TTL。
-// 字段用指针，未提交的项保持原值（前端可以只改其中一项）。
+// handleSettings 更新设置：默认路由组名、responses 协议转换开关、会话 TTL、
+// Gemini App OAuth 客户端。字段用指针，未提交的项保持原值（前端可以只改其中一项）。
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AutoModel         *string `json:"auto_model"`
-		ResponsesConvert  *bool   `json:"responses_convert"`
-		SessionTTLSeconds *int64  `json:"session_ttl_seconds"`
+		AutoModel               *string `json:"auto_model"`
+		ResponsesConvert        *bool   `json:"responses_convert"`
+		SessionTTLSeconds       *int64  `json:"session_ttl_seconds"`
+		GeminiOAuthClientID     *string `json:"gemini_oauth_client_id"`
+		GeminiOAuthClientSecret *string `json:"gemini_oauth_client_secret"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -297,6 +299,16 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	if req.SessionTTLSeconds != nil {
 		s.store.SetSessionTTL(*req.SessionTTLSeconds)
 		s.applySessionTTL(s.store.SessionTTL()) // 现有绑定也按新 TTL 立即重算
+	}
+	if req.GeminiOAuthClientID != nil || req.GeminiOAuthClientSecret != nil {
+		id, secret := s.store.GeminiOAuthClient()
+		if req.GeminiOAuthClientID != nil {
+			id = *req.GeminiOAuthClientID
+		}
+		if req.GeminiOAuthClientSecret != nil {
+			secret = *req.GeminiOAuthClientSecret
+		}
+		s.store.SetGeminiOAuthClient(id, secret)
 	}
 	s.replyState(w, r)
 }

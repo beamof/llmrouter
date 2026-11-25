@@ -27,7 +27,7 @@ var (
 	// errOAuthClient OAuth 客户端本身被拒（client_id / client_secret 不对）
 	errOAuthClient = errors.New("OAuth 客户端无效（client_id / client_secret 被 Google 拒绝）")
 	// errOAuthClientMissing 没有可用的 OAuth 客户端配置
-	errOAuthClientMissing = errors.New("未配置 Google OAuth 客户端：请设置 LLMROUTER_GEMINI_CLIENT_ID / LLMROUTER_GEMINI_CLIENT_SECRET，或在凭证里提供 client_id / client_secret")
+	errOAuthClientMissing = errors.New("未配置 Google OAuth 客户端：请到后台「设置 → 常规 → Gemini App OAuth 客户端」填写 Client ID / Secret（保存到 data.json），或设置 LLMROUTER_GEMINI_CLIENT_ID / LLMROUTER_GEMINI_CLIENT_SECRET，或在凭证里提供 client_id / client_secret")
 
 	subjectRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,255}$`)
 )
@@ -39,19 +39,26 @@ type tokenResponse struct {
 	ExpiresIn    float64 `json:"expires_in"`
 }
 
-// clientIDFor / clientSecretFor 凭证自带的 OAuth 客户端优先，否则用环境变量配置的
-func (a *Adapter) clientIDFor(c *AppCred) string {
-	if c != nil && strings.TrimSpace(c.ClientID) != "" {
-		return strings.TrimSpace(c.ClientID)
+// oauthClientFor 选择 OAuth 客户端：Provider 凭证自带 > 后台设置（data.json）>
+// 环境变量。按「对」选择，避免把不同来源的 client_id / secret 拼在一起。
+func (a *Adapter) oauthClientFor(c *AppCred) (id, secret string) {
+	if c != nil {
+		id, secret = strings.TrimSpace(c.ClientID), strings.TrimSpace(c.ClientSecret)
+		if id != "" {
+			return id, secret
+		}
 	}
-	return a.oauthClientID
+	if a.rt != nil && a.rt.Store != nil {
+		if id, secret = a.rt.Store.GeminiOAuthClient(); id != "" {
+			return id, secret
+		}
+	}
+	return a.oauthClientID, a.oauthClientSecret
 }
 
-func (a *Adapter) clientSecretFor(c *AppCred) string {
-	if c != nil && strings.TrimSpace(c.ClientSecret) != "" {
-		return strings.TrimSpace(c.ClientSecret)
-	}
-	return a.oauthClientSecret
+func (a *Adapter) clientIDFor(c *AppCred) string {
+	id, _ := a.oauthClientFor(c)
+	return id
 }
 
 // noRedirectClient 共享传输层的浅拷贝客户端：不跟随重定向（令牌只发给固定端点）
@@ -112,7 +119,7 @@ func oauthPost(ctx context.Context, cli *http.Client, endpoint string, form url.
 
 // exchangeCode 用授权码换 token（回环 PKCE）
 func (a *Adapter) exchangeCode(ctx context.Context, cli *http.Client, cred *AppCred, code, verifier, redirectURI string) (*tokenResponse, error) {
-	id := a.clientIDFor(cred)
+	id, secret := a.oauthClientFor(cred)
 	if id == "" {
 		return nil, errOAuthClientMissing
 	}
@@ -123,7 +130,7 @@ func (a *Adapter) exchangeCode(ctx context.Context, cli *http.Client, cred *AppC
 		"code_verifier": {verifier},
 		"redirect_uri":  {redirectURI},
 	}
-	if secret := a.clientSecretFor(cred); secret != "" {
+	if secret != "" {
 		form.Set("client_secret", secret)
 	}
 	return oauthPost(ctx, cli, a.tokenURL(), form)
@@ -131,7 +138,7 @@ func (a *Adapter) exchangeCode(ctx context.Context, cli *http.Client, cred *AppC
 
 // refreshTokens 用 refresh token 续期 access token（带上完整的刷新 scope 集）
 func (a *Adapter) refreshTokens(ctx context.Context, cli *http.Client, cred *AppCred) (*tokenResponse, error) {
-	id := a.clientIDFor(cred)
+	id, secret := a.oauthClientFor(cred)
 	if id == "" {
 		return nil, errOAuthClientMissing
 	}
@@ -141,7 +148,7 @@ func (a *Adapter) refreshTokens(ctx context.Context, cli *http.Client, cred *App
 		"refresh_token": {cred.RefreshToken},
 		"scope":         {strings.Join(oauthRefreshScopes, " ")},
 	}
-	if secret := a.clientSecretFor(cred); secret != "" {
+	if secret != "" {
 		form.Set("client_secret", secret)
 	}
 	return oauthPost(ctx, cli, a.tokenURL(), form)

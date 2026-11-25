@@ -108,7 +108,8 @@ type Adapter struct {
 	origin     string // Robin 服务 origin 覆盖（测试注入；空 = 官方端点）
 	uploadBase string // 图片上传 origin 覆盖（测试注入；空 = 官方端点）
 
-	// OAuth 客户端：仓库不内置凭证，由环境变量或 Provider 凭证提供。
+	// OAuth 客户端：仓库不内置凭证。选择顺序：Provider 凭证自带 > 后台设置
+	// （data.json）> 环境变量。
 	oauthClientID     string
 	oauthClientSecret string
 

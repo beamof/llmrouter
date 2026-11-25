@@ -72,6 +72,11 @@ type Store struct {
 	// 首次登录前生成并持久化，之后所有账号的登录/续期都复用（主机标识跨账号共享）。
 	CodexHostID string `json:"codex_host_id,omitempty"`
 
+	// GeminiOAuthClientID / GeminiOAuthClientSecret 后台设置页配置的 Gemini App
+	// OAuth 客户端（保存到 data.json）。优先级：Provider 凭证自带 > 这里 > 环境变量。
+	GeminiOAuthClientID     string `json:"gemini_oauth_client_id,omitempty"`
+	GeminiOAuthClientSecret string `json:"gemini_oauth_client_secret,omitempty"`
+
 	// SessionTTLSeconds 会话粘性的滑动过期秒数，0 = 默认（sessionTTL，1 小时）。
 	// 每次会话内成功请求都会重新计时；通过设置接口修改时，现有绑定会立即按新值重算。
 	SessionTTLSeconds int64 `json:"session_ttl_seconds,omitempty"`
@@ -325,6 +330,9 @@ type configFile struct {
 	ResponsesConvert  bool                `json:"responses_convert,omitempty"`
 	SessionTTLSeconds int64               `json:"session_ttl_seconds,omitempty"`
 	CodexHostID       string              `json:"codex_host_id,omitempty"`
+
+	GeminiOAuthClientID     string `json:"gemini_oauth_client_id,omitempty"`
+	GeminiOAuthClientSecret string `json:"gemini_oauth_client_secret,omitempty"`
 }
 
 // hotState 用量文件（data.json.usage）的形状：高频写、可合并落盘。
@@ -354,6 +362,9 @@ func (s *Store) save() {
 		ResponsesConvert:  s.ResponsesConvert,
 		SessionTTLSeconds: s.SessionTTLSeconds,
 		CodexHostID:       s.CodexHostID,
+
+		GeminiOAuthClientID:     s.GeminiOAuthClientID,
+		GeminiOAuthClientSecret: s.GeminiOAuthClientSecret,
 	}, "", "  ")
 	if err != nil {
 		s.reportSaveError(err)
@@ -1606,6 +1617,28 @@ func (s *Store) SetSessionTTL(seconds int64) {
 		return
 	}
 	s.SessionTTLSeconds = seconds
+	s.save()
+}
+
+// GeminiOAuthClient 后台配置的 Gemini App OAuth 客户端（空 = 未配置）。
+func (s *Store) GeminiOAuthClient() (id, secret string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.GeminiOAuthClientID, s.GeminiOAuthClientSecret
+}
+
+// SetGeminiOAuthClient 保存 Gemini App OAuth 客户端到 data.json（空 ID = 清除整对）。
+func (s *Store) SetGeminiOAuthClient(id, secret string) {
+	id, secret = strings.TrimSpace(id), strings.TrimSpace(secret)
+	if id == "" {
+		secret = ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.GeminiOAuthClientID == id && s.GeminiOAuthClientSecret == secret {
+		return
+	}
+	s.GeminiOAuthClientID, s.GeminiOAuthClientSecret = id, secret
 	s.save()
 }
 

@@ -46,6 +46,8 @@ func (s *Store) SnapshotJSON() []byte {
 	v.AutoModel = s.AutoModel // 已持锁，直接读；空值由前端按默认 auto 处理
 	v.ResponsesConvert = s.ResponsesConvert
 	v.SessionTTLSeconds = int64(s.sessionTTLLocked() / time.Second)
+	v.GeminiOAuthClientID = s.GeminiOAuthClientID
+	v.GeminiOAuthClientSecret = s.GeminiOAuthClientSecret
 	sort.Slice(v.Usage, func(i, j int) bool {
 		a, b := v.Usage[i], v.Usage[j]
 		if a.Date != b.Date {

@@ -347,9 +347,17 @@ func TestGeminiAppModelTestAndAdminRoutes(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.Contains(body, `"status":"accepted"`) {
 		t.Fatalf("接受条款不对: %d %s", resp.StatusCode, body)
 	}
+	// 后台设置里的 Gemini OAuth 客户端（落盘 data.json）优先于环境变量
+	resp, body = postJSONWithHeader(t, app, "PUT", "/api/settings",
+		`{"gemini_oauth_client_id":"store-client-id","gemini_oauth_client_secret":"store-client-secret"}`,
+		"Content-Type", "application/json")
+	if resp.StatusCode != 200 || !strings.Contains(body, `"gemini_oauth_client_id":"store-client-id"`) {
+		t.Fatalf("保存 Gemini OAuth 客户端失败: %d %s", resp.StatusCode, body)
+	}
 	// 登录会话：发起 → 轮询 → 取消
 	resp, body = postJSON(t, app, "/api/gemini/login", `{"name":"","proxy":""}`)
-	if resp.StatusCode != 200 || !strings.Contains(body, `"status":"pending"`) || !strings.Contains(body, s.geminiOAuthBase+"/auth?") {
+	if resp.StatusCode != 200 || !strings.Contains(body, `"status":"pending"`) ||
+		!strings.Contains(body, s.geminiOAuthBase+"/auth?") || !strings.Contains(body, "client_id=store-client-id") {
 		t.Fatalf("发起登录不对: %d %s", resp.StatusCode, body)
 	}
 	var login struct {

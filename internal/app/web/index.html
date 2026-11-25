@@ -771,6 +771,17 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
           </div>
 
           <div class="panel">
+            <div class="panel-head"><h3>Gemini App OAuth 客户端</h3></div>
+            <details class="hint-toggle"><summary>说明</summary><p class="hint">Gemini App 的浏览器登录与 token 续期需要一个 Google OAuth 客户端。优先级：Provider 凭证自带的 <code>client_id</code> / <code>client_secret</code> &gt; 这里（保存到 <code>data.json</code>）&gt; 环境变量 <code>LLMROUTER_GEMINI_CLIENT_ID</code> / <code>LLMROUTER_GEMINI_CLIENT_SECRET</code>。保存后立即生效，无需重启。</p></details>
+            <div class="field"><label>Client ID</label><input id="gemini-cid" class="mono" autocomplete="off" placeholder="…apps.googleusercontent.com"></div>
+            <div class="field"><label>Client Secret</label><input id="gemini-csecret" class="mono" type="password" autocomplete="off" placeholder="公开客户端可留空"></div>
+            <div class="row-inline">
+              <button class="btn pri" onclick="saveGeminiOAuthClient()">保存</button>
+              <span class="hint">留空 Client ID 并保存 = 清除</span>
+            </div>
+          </div>
+
+          <div class="panel">
             <div class="panel-head"><h3>会话有效期</h3></div>
             <details class="hint-toggle"><summary>说明</summary><p class="hint"><code>X-Session-ID</code> 粘性绑定的滑动过期时间：每次成功请求后重新计时。保存后立即按最近活跃时间重算现有绑定；填 0 恢复默认 60 分钟，上限 30 天。</p></details>
             <div class="row-inline">
@@ -933,7 +944,7 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
           <button class="btn mini" onclick="geminiImportRaw()" style="margin-top:4px">导入粘贴的凭证</button>
         </div>
       </div>
-      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 Gemini / Google AI 订阅（Free、AI Pro、AI Ultra、AI Plus）的额度作为上游：点击「登录 Google」走标准 OAuth 授权（需要 Google 账号；服务端需配置 LLMROUTER_GEMINI_CLIENT_ID / LLMROUTER_GEMINI_CLIENT_SECRET，或凭证自带 client_id / client_secret；同一账号重复登录会原地更新）。服务器上没有浏览器时用粘贴回调 URL 兜底，或把带 refresh_token 的凭证 JSON 粘贴到上方导入。出站走 Gemini 原生通道并固定为临时会话（不进账号的云端历史）；工具调用走提示词协议，由网关校验后才下发。上游不返回 token 用量，统计页里是估算值。模型档位严格校验，上游降级会被拒绝；套餐额度耗尽返回 429 并自动静音 5 小时。新账号若提示需要先接受服务条款，可用「接受 Gemini 条款」或到官方 Gemini 应用里接受。只支持 data: URL 内联图片。访问上游需要代理时填上方「网络代理」（令牌续期也由网关发出）。</p></details>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 Gemini / Google AI 订阅（Free、AI Pro、AI Ultra、AI Plus）的额度作为上游：点击「登录 Google」走标准 OAuth 授权（需要 Google 账号；先在「设置 → 常规 → Gemini App OAuth 客户端」配置 Client ID / Secret，或设置 LLMROUTER_GEMINI_CLIENT_ID / LLMROUTER_GEMINI_CLIENT_SECRET，或凭证自带 client_id / client_secret；同一账号重复登录会原地更新）。服务器上没有浏览器时用粘贴回调 URL 兜底，或把带 refresh_token 的凭证 JSON 粘贴到上方导入。出站走 Gemini 原生通道并固定为临时会话（不进账号的云端历史）；工具调用走提示词协议，由网关校验后才下发。上游不返回 token 用量，统计页里是估算值。模型档位严格校验，上游降级会被拒绝；套餐额度耗尽返回 429 并自动静音 5 小时。新账号若提示需要先接受服务条款，可用「接受 Gemini 条款」或到官方 Gemini 应用里接受。只支持 data: URL 内联图片。访问上游需要代理时填上方「网络代理」（令牌续期也由网关发出）。</p></details>
     </div>
   </div>
   <div class="dlg-foot split">
@@ -2014,6 +2025,18 @@ async function saveSessionTTL() {
     S = await api('PUT', '/api/settings', {session_ttl_seconds: Math.round(min * 60)});
     renderAll();
     toast('已保存会话有效期：' + ttlLabel());
+  } catch (e) { alert(e.message); }
+}
+
+// 保存 Gemini App OAuth 客户端（落盘 data.json；Client ID 留空 = 清除）
+async function saveGeminiOAuthClient() {
+  const id = $('gemini-cid').value.trim();
+  const secret = $('gemini-csecret').value.trim();
+  if (!id && secret) { alert('请填写 Client ID'); return; }
+  try {
+    S = await api('PUT', '/api/settings', {gemini_oauth_client_id: id, gemini_oauth_client_secret: secret});
+    renderAll();
+    toast(id ? '已保存 Gemini OAuth 客户端' : '已清除 Gemini OAuth 客户端');
   } catch (e) { alert(e.message); }
 }
 
@@ -3117,6 +3140,8 @@ function renderGeneral() {
   $('ep-models').textContent = origin + '/v1/models';
   if (document.activeElement !== $('auto-name')) $('auto-name').value = S.auto_model || 'auto';
   if (document.activeElement !== $('sess-ttl')) $('sess-ttl').value = Math.round((S.session_ttl_seconds || 3600) / 60);
+  if (document.activeElement !== $('gemini-cid')) $('gemini-cid').value = S.gemini_oauth_client_id || '';
+  if (document.activeElement !== $('gemini-csecret')) $('gemini-csecret').value = S.gemini_oauth_client_secret || '';
   $('resp-convert').checked = !!S.responses_convert;
   renderAuthState();
   loadVersion();

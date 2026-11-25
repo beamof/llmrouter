@@ -286,6 +286,21 @@ func strconvQuote(s string) string {
 	return string(b)
 }
 
+// 后台设置（data.json）里的 OAuth 客户端优先于环境变量
+func TestOAuthClientFromStore(t *testing.T) {
+	f := newFakeGemini(t)
+	f.store.SetGeminiOAuthClient("store-client-id", "store-client-secret")
+	f.a.oauthClientID, f.a.oauthClientSecret = "", "" // 模拟只有 data.json 配置
+	rec := callHandler(f.a.HandleGeminiImport, http.MethodPost, "/api/gemini/import", `{"raw":"{\"refresh_token\":\"rt-store\"}"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("导入应使用 data.json 里的 OAuth 客户端: %d %s", rec.Code, rec.Body)
+	}
+	form := f.tokenForm[len(f.tokenForm)-1]
+	if form.Get("client_id") != "store-client-id" || form.Get("client_secret") != "store-client-secret" {
+		t.Errorf("续期应使用 data.json 配置的 OAuth 客户端: %v", form)
+	}
+}
+
 // 没有环境变量也没有凭证自带 client_id 时，登录/导入应明确提示配置
 func TestOAuthClientConfigRequired(t *testing.T) {
 	f := newFakeGemini(t)

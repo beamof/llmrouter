@@ -40,8 +40,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `-version` | — | — | 打印版本号后退出 |
 | — | `LLMROUTER_GEMINI_TURN_TIMEOUT` | `180` | Gemini App 单回合总超时（秒，1–600） |
 | — | `LLMROUTER_GEMINI_OAUTH_PORT` | `18765` | Gemini App 登录回环回调端口；`0` = 随机，被占用时自动改用随机端口 |
-| — | `LLMROUTER_GEMINI_CLIENT_ID` | 空 | Gemini App 登录/续期使用的 Google OAuth 客户端 ID；也可由 Provider 凭证自带的 `client_id` 提供 |
-| — | `LLMROUTER_GEMINI_CLIENT_SECRET` | 空 | 对应的 Google OAuth 客户端密钥；公开客户端可留空 |
+| — | `LLMROUTER_GEMINI_CLIENT_ID` | 空 | Gemini App 登录/续期使用的 Google OAuth 客户端 ID 兜底值；后台设置或 Provider 凭证优先 |
+| — | `LLMROUTER_GEMINI_CLIENT_SECRET` | 空 | 对应的 Google OAuth 客户端密钥兜底值；公开客户端可留空 |
 
 ## API Key 管理
 
@@ -81,7 +81,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - **Zed**：复用 Zed 账号额度（`gpt-*`、`claude-*`），登录一次长期有效、凭证自动续期；`system_id` 依次取弹窗、`LLMROUTER_ZED_SYSTEM_ID`、本机安装数据库
 - **Command Code**：复用订阅额度（Go / Pro / GOAT / Max / Ultra）；`max_tokens` 上限 200000；可选零数据保留
 - **Codex 套餐**（两种凭证来源，加 Provider 时选择）：① Sign in with ChatGPT：浏览器授权后 llmrouter 以 OAuth 公共客户端动态注册，access token（1 小时）临期自动续期、refresh token（30 天）滚动轮换，出站走 `api.openai.com/v1/responses`，需要 ChatGPT Plus / Pro；② Codex CLI 登录态：把 `~/.codex/auth.json` 整份粘贴导入即可，出站走 ChatGPT 后端的 Codex 通道（`chatgpt.com/backend-api/codex/responses`）并自动伪装官方客户端（`chatgpt-account-id` / `originator` 等），模型目录用内置列表。两种来源共用：强制流式、不落盘，网关自动剥离该通道不支持的字段（`temperature` 等）与托管工具、把 `system` 折成 `developer`；用量与 ChatGPT 共享（Plus 为 5 小时窗口，达限 429 时按网关规则自动静音）；无浏览器环境可用粘贴回调 URL 兜底，或粘贴凭证 JSON 直接导入（三种格式：auth.json / SIWC 凭证记录 / 本网关 data.json 的 `codex` 字段；导入即续期验证并轮换 refresh token）；删除 Provider 会尝试在 OpenAI 侧吊销授权
-- **Gemini App**：复用 Google 账号的 Gemini / Google AI 订阅额度（Free、AI Pro、AI Ultra、AI Plus）。浏览器 Google OAuth 回环登录（PKCE）+ 粘贴回调 URL 兜底，或粘贴带 `refresh_token` 的凭证 JSON 导入；浏览器登录与续期需要配置 `LLMROUTER_GEMINI_CLIENT_ID` / `LLMROUTER_GEMINI_CLIENT_SECRET`，或由凭证自带 `client_id` / `client_secret`；access token（1 小时）临期自动续期。出站走 Gemini 原生 Robin 通道并固定为临时会话（不进账号云端历史）；工具调用走提示词协议，由网关校验后才下发给客户端；上游不返回 token 用量，统计页为估算值；模型档位严格校验，上游降级会被拒绝；套餐额度耗尽返回 429 并自动静音 5 小时；只支持 `data:` URL 内联 PNG / JPEG / WebP 图片。账号需要接受服务条款时可在后台「接受 Gemini 条款」，删除 Provider 会尽力在 Google 侧吊销授权
+- **Gemini App**：复用 Google 账号的 Gemini / Google AI 订阅额度（Free、AI Pro、AI Ultra、AI Plus）。浏览器 Google OAuth 回环登录（PKCE）+ 粘贴回调 URL 兜底，或粘贴带 `refresh_token` 的凭证 JSON 导入；浏览器登录与续期需要在「设置 → 常规 → Gemini App OAuth 客户端」配置 Client ID / Secret（保存到 `data.json`），或由凭证自带 `client_id` / `client_secret`；优先级为 Provider 凭证 > 后台设置 > 环境变量 `LLMROUTER_GEMINI_CLIENT_ID` / `LLMROUTER_GEMINI_CLIENT_SECRET`；access token（1 小时）临期自动续期。出站走 Gemini 原生 Robin 通道并固定为临时会话（不进账号云端历史）；工具调用走提示词协议，由网关校验后才下发给客户端；上游不返回 token 用量，统计页为估算值；模型档位严格校验，上游降级会被拒绝；套餐额度耗尽返回 429 并自动静音 5 小时；只支持 `data:` URL 内联 PNG / JPEG / WebP 图片。账号需要接受服务条款时可在后台「接受 Gemini 条款」，删除 Provider 会尽力在 Google 侧吊销授权
 
 ## 后台与小工具
 

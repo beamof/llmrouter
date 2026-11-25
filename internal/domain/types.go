@@ -176,9 +176,9 @@ func (c *CodexCred) RefreshExpires() time.Time {
 
 // GeminiAppCred Gemini App（Google 账号订阅）凭证：浏览器 Google 登录（回环 PKCE）
 // 或粘贴凭证 JSON 导入。refresh token 长期有效，access token（1 小时）临期用它续期。
-// ClientID / ClientSecret 为空时用环境变量配置的 OAuth 客户端
-// （LLMROUTER_GEMINI_CLIENT_ID / LLMROUTER_GEMINI_CLIENT_SECRET）；Usage 与 Terms
-// 分别是最近一次用量快照与主服务条款的接受回执。
+// ClientID / ClientSecret 为空时用后台设置页配置的 OAuth 客户端（data.json），
+// 再回落到环境变量 LLMROUTER_GEMINI_CLIENT_ID / LLMROUTER_GEMINI_CLIENT_SECRET；
+// Usage 与 Terms 分别是最近一次用量快照与主服务条款的接受回执。
 type GeminiAppCred struct {
 	Subject      string          `json:"subject"` // userinfo 的 sub，账号唯一标识
 	Email        string          `json:"email,omitempty"`

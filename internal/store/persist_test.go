@@ -47,6 +47,31 @@ func TestAsyncHotWritesAndFlush(t *testing.T) {
 	_ = time.Second
 }
 
+// Gemini OAuth 客户端设置随 data.json 落盘
+func TestGeminiOAuthClientPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.json")
+	st, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.SetGeminiOAuthClient(" client-id ", " secret ")
+	reloaded, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, secret := reloaded.GeminiOAuthClient(); id != "client-id" || secret != "secret" {
+		t.Fatalf("Gemini OAuth 客户端未正确落盘: id=%q secret=%q", id, secret)
+	}
+	st.SetGeminiOAuthClient("", "leftover")
+	reloaded, err = LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, secret := reloaded.GeminiOAuthClient(); id != "" || secret != "" {
+		t.Fatalf("清空 Client ID 应同时清掉 secret: id=%q secret=%q", id, secret)
+	}
+}
+
 // provider 名是直连模型对外名的前缀：加载旧数据与新建时都要规范化成
 // 非空、不含 "/"、全局唯一。
 func TestProviderNameNormalization(t *testing.T) {

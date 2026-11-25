@@ -25,4 +25,7 @@ type StateView struct {
 	ResponsesConvert bool `json:"responses_convert"`
 	// SessionTTLSeconds 生效中的会话粘性有效期（秒）
 	SessionTTLSeconds int64 `json:"session_ttl_seconds"`
+	// GeminiOAuthClientID / GeminiOAuthClientSecret 后台配置的 Gemini App OAuth 客户端
+	GeminiOAuthClientID     string `json:"gemini_oauth_client_id,omitempty"`
+	GeminiOAuthClientSecret string `json:"gemini_oauth_client_secret,omitempty"`
 }
