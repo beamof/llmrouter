@@ -272,12 +272,10 @@ func TestCommandCodeImportFromCLI(t *testing.T) {
 	}
 	var out struct {
 		Provider string `json:"provider"`
-		Models   int    `json:"models"`
 		Plan     string `json:"plan"`
-		Warning  string `json:"warning"`
 	}
 	json.Unmarshal([]byte(body), &out)
-	if out.Provider == "" || out.Plan != "Go" || out.Models != 2 {
+	if out.Provider == "" || out.Plan != "Go" {
 		t.Fatalf("import result = %+v (%s)", out, body)
 	}
 	p, ok := s.store.Provider(out.Provider)
@@ -285,15 +283,15 @@ func TestCommandCodeImportFromCLI(t *testing.T) {
 		!p.CommandCode.CLI || p.BaseURL != s.ccAPI()+"/alpha/generate" {
 		t.Fatalf("provider = %+v", p)
 	}
-	// Go 套餐过滤掉 premium 模型，只留下 deepseek 与 gpt-6-luna
+	// 导入只建 provider，不自动创建模型
 	var names []string
 	for _, m := range s.store.Models {
 		if m.ProviderID == p.ID {
 			names = append(names, m.Name)
 		}
 	}
-	if len(names) != 2 {
-		t.Fatalf("models = %v", names)
+	if len(names) != 0 {
+		t.Fatalf("导入不应自动创建模型: %v", names)
 	}
 }
 

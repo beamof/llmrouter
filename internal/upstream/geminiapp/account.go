@@ -134,22 +134,9 @@ func (a *Adapter) acceptTerms(ctx context.Context, cli *http.Client, token strin
 	return int64(version), nil
 }
 
-// syncModels 把内置模型目录同步成该 Provider 的模型条目（只增不删，不覆盖用户
-// 调整过的优先级 / 上限 / 暴露开关），返回目录里的模型数
-func (a *Adapter) syncModels(providerID string) int {
-	n := 0
-	for _, name := range nativeModels {
-		if !a.rt.Store.HasGeminiAppModel(providerID, name) {
-			a.rt.Store.UpsertModel(&Model{ProviderID: providerID, Name: name, Expose: true,
-				ContextLength: modelSpecs[name].ContextLength})
-		}
-		n++
-	}
-	return n
-}
-
-// persistAccount 创建或原地更新 Gemini App Provider，并同步模型条目
-func (a *Adapter) persistAccount(cred *AppCred, name, proxy string) (string, int) {
+// persistAccount 创建或原地更新 Gemini App Provider。不自动创建模型，模型由
+// 用户在后台按需添加（添加对话框会列出内置模型目录做建议）。
+func (a *Adapter) persistAccount(cred *AppCred, name, proxy string) string {
 	p := &Provider{Kind: Kind, BaseURL: a.robinOrigin() + processQueryPath, Proxy: proxy, GeminiApp: cred}
 	if old, ok := a.rt.Store.ProviderByGeminiAppSubject(cred.Subject); ok {
 		p.ID, p.Name, p.Proxy = old.ID, old.Name, old.Proxy // 原地更新：保留 ID / 名称 / 代理
@@ -167,7 +154,7 @@ func (a *Adapter) persistAccount(cred *AppCred, name, proxy string) (string, int
 		p.Name = "Gemini · " + label
 	}
 	a.rt.Store.UpsertProvider(p)
-	return p.ID, a.syncModels(p.ID)
+	return p.ID
 }
 
 // parseCredential 解析粘贴导入的凭证 JSON。兼容三种形态：

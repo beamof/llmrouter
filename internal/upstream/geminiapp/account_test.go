@@ -104,8 +104,8 @@ func TestLoginPasteFlow(t *testing.T) {
 	rec := callHandler(f.a.HandleGeminiLoginPaste, http.MethodPost, "/api/gemini/login/paste",
 		`{"state":"`+state+`","url":"?state=`+state+`&code=4%2F0AbCdEf&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fflexible-api"}`)
 	res := decodeBody(t, rec)
-	if rec.Code != 200 || res["status"] != "success" || res["models"] != float64(3) {
-		t.Fatalf("粘贴回调应完成登录并同步 3 个模型: %d %s", rec.Code, rec.Body)
+	if rec.Code != 200 || res["status"] != "success" {
+		t.Fatalf("粘贴回调应完成登录: %d %s", rec.Code, rec.Body)
 	}
 	// 换 token：授权码 + PKCE verifier，verifier 与授权地址里的 challenge 对得上
 	if len(f.tokenForm) != 2 {
@@ -136,10 +136,9 @@ func TestLoginPasteFlow(t *testing.T) {
 		c.Expires().Before(time.Now()) || c.CheckedAt == nil {
 		t.Errorf("凭证不对: %+v", c)
 	}
-	models := modelsOf(f, p.ID)
-	if len(models) != 3 || models[0].Name != "gemini-neon" || !models[0].Expose || models[0].ContextLength != 512000 ||
-		models[2].Name != "gemini-flash-lite" || models[2].ContextLength != 0 {
-		t.Errorf("模型目录同步不对: %+v", models)
+	// 登录只建 provider，不自动创建模型
+	if models := modelsOf(f, p.ID); len(models) != 0 {
+		t.Errorf("登录不应自动创建模型: %+v", models)
 	}
 	// 完成后回环监听关闭
 	if conn, err := net.DialTimeout("tcp", strings.TrimPrefix(strings.Replace(redirect, "localhost", "127.0.0.1", 1), "http://"), 300*time.Millisecond); err == nil {
@@ -360,7 +359,7 @@ func TestRefreshUsageTermsAndProbe(t *testing.T) {
 	rec := httptest.NewRecorder()
 	f.a.HandleGeminiRefresh(rec, req)
 	res := decodeBody(t, rec)
-	if rec.Code != 200 || res["tier"] != "pro" || res["synced"] != float64(3) {
+	if rec.Code != 200 || res["tier"] != "pro" {
 		t.Fatalf("刷新失败: %d %s", rec.Code, rec.Body)
 	}
 	saved, _ := f.store.Provider(p.ID)
@@ -369,8 +368,8 @@ func TestRefreshUsageTermsAndProbe(t *testing.T) {
 		usage.Rows[0].Label != "Gemini 4 Pro" || usage.Rows[0].Percent != 25 || usage.Rows[0].RefreshAt == nil {
 		t.Errorf("刷新后凭证与用量快照不对: cred=%+v usage=%+v", saved.GeminiApp, usage)
 	}
-	if n := len(modelsOf(f, p.ID)); n != 3 {
-		t.Errorf("刷新应同步模型目录, got %d", n)
+	if n := len(modelsOf(f, p.ID)); n != 1 { // addProvider 手工建的 1 条
+		t.Errorf("刷新不应自动创建模型, got %d", n)
 	}
 
 	// 接受条款：先查版本再提交，回执落盘

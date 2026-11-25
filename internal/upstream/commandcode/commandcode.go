@@ -418,10 +418,11 @@ func ccParseTime(v any) *time.Time {
 
 // ── Provider 导入 / 刷新 ──────────────────────────────────────────────────
 
-// ccPersist 创建或原地更新 Command Code Provider，并同步模型（只增不删）。
+// ccPersist 创建或原地更新 Command Code Provider。不自动创建模型，模型由用户
+// 在后台按需添加（添加对话框会拉取上游目录做建议）。
 // providerID 非空时更新该 Provider（用于编辑时替换 Key）；否则按 Key 去重。
-// 返回 provider ID 与同步的模型数。
-func (a *Adapter) Persist(ctx context.Context, providerID, key, name, proxy string, zdr, fromCLI bool) (string, int, string, error) {
+// 返回 provider ID 与套餐名。
+func (a *Adapter) Persist(ctx context.Context, providerID, key, name, proxy string, zdr, fromCLI bool) (string, string) {
 	p := &domain.Provider{
 		Kind:    commandCodeKind,
 		BaseURL: a.API() + "/alpha/generate",
@@ -477,19 +478,7 @@ func (a *Adapter) Persist(ctx context.Context, providerID, key, name, proxy stri
 	now := time.Now()
 	p.CommandCode.CheckedAt = &now
 	a.rt.Store.UpsertProvider(p)
-
-	models, err := a.Catalog(ctx, *p)
-	if err != nil {
-		return p.ID, 0, p.CommandCode.Plan, err
-	}
-	n := 0
-	for _, m := range models {
-		if !a.rt.Store.HasZedModel(p.ID, m) { // 通用「该 provider 下是否已有同名模型」
-			a.rt.Store.UpsertModel(&domain.Model{ProviderID: p.ID, Name: m, Expose: true})
-		}
-		n++
-	}
-	return p.ID, n, p.CommandCode.Plan, nil
+	return p.ID, p.CommandCode.Plan
 }
 
 // ccErrSnippet 上游错误原文的短摘要（JSON 优先取 error.message）。

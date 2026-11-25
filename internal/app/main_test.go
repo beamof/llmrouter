@@ -481,6 +481,10 @@ func TestQualifiedNameValidation(t *testing.T) {
 		t.Fatalf("创建 provider 失败: %d %s", resp.StatusCode, body)
 	}
 	pid := s.store.Providers[0].ID
+	// 新建 Provider 只落配置，不自动创建任何模型
+	if len(s.store.Models) != 0 {
+		t.Fatalf("创建 provider 不应自动创建模型: %d", len(s.store.Models))
+	}
 
 	if resp, body := postJSON(t, app, "/api/providers", `{"name":"p1","base_url":"http://y.invalid"}`); resp.StatusCode != 400 || !strings.Contains(body, "已存在") {
 		t.Fatalf("provider 重名应 400: %d %s", resp.StatusCode, body)

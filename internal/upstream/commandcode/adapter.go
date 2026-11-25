@@ -75,14 +75,13 @@ func (a *Adapter) API() string {
 // PersistResult 导入/刷新后的摘要。
 type PersistResult struct {
 	ProviderID string
-	Models     int
 	Plan       string
 }
 
-// Persist 创建或原地更新 Provider，并同步模型（只增不删）。
-func (a *Adapter) PersistProvider(ctx context.Context, providerID, key, name, proxy string, zdr, fromCLI bool) (PersistResult, error) {
-	id, n, plan, err := a.Persist(ctx, providerID, key, name, proxy, zdr, fromCLI)
-	return PersistResult{ProviderID: id, Models: n, Plan: plan}, err
+// Persist 创建或原地更新 Provider（不自动创建模型）。
+func (a *Adapter) PersistProvider(ctx context.Context, providerID, key, name, proxy string, zdr, fromCLI bool) PersistResult {
+	id, plan := a.Persist(ctx, providerID, key, name, proxy, zdr, fromCLI)
+	return PersistResult{ProviderID: id, Plan: plan}
 }
 
 // Probe 用模型目录做连通性探测（不消耗 token）。
@@ -108,15 +107,15 @@ func contains(list []string, s string) bool {
 	return false
 }
 
-// Refresh 重新读取套餐并同步模型；CLI 导入的账号会重新读本机 auth.json。
-func (a *Adapter) Refresh(ctx context.Context, providerID string) (string, int, error) {
+// Refresh 重新读取套餐；CLI 导入的账号会重新读本机 auth.json。
+func (a *Adapter) Refresh(ctx context.Context, providerID string) (string, error) {
 	p, ok := a.rt.Store.Provider(providerID)
 	if !ok {
-		return "", 0, fmt.Errorf("provider 不存在")
+		return "", fmt.Errorf("provider 不存在")
 	}
 	cred := Cred(p)
 	if cred == nil {
-		return "", 0, fmt.Errorf("该 provider 不是 Command Code 类型")
+		return "", fmt.Errorf("该 provider 不是 Command Code 类型")
 	}
 	key := cred.APIKey
 	if cred.CLI {
@@ -138,19 +137,7 @@ func (a *Adapter) Refresh(ctx context.Context, providerID string) (string, int, 
 	now := time.Now()
 	updated.CheckedAt = &now
 	a.rt.Store.UpdateCommandCodeAuth(p.ID, &updated)
-	p.CommandCode = &updated
-	models, err := a.Catalog(ctx, p)
-	if err != nil {
-		return updated.Plan, 0, fmt.Errorf("拉取 Command Code 模型目录失败: %w", err)
-	}
-	n := 0
-	for _, m := range models {
-		if !a.rt.Store.HasZedModel(p.ID, m) {
-			a.rt.Store.UpsertModel(&domain.Model{ProviderID: p.ID, Name: m, Expose: true})
-		}
-		n++
-	}
-	return updated.Plan, n, nil
+	return updated.Plan, nil
 }
 
 // ListModels 拉取 Command Code 模型目录（按套餐过滤）。

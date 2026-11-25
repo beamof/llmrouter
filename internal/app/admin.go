@@ -24,6 +24,8 @@ func (s *Server) replyState(w http.ResponseWriter, _ *http.Request) {
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool { return httpx.Decode(w, r, v) }
 
+// handleProviderUpsert 新建/更新 Provider 配置；不创建任何模型（模型只在用户
+// 通过 /api/models 或组内加入时创建）。
 func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 	var p Provider
 	if !decode(w, r, &p) {

@@ -500,6 +500,8 @@ func (s *Store) Provider(id string) (Provider, bool) {
 }
 
 // UpsertProvider ID 为空则新建，否则按 ID 替换。
+// 只写 Provider 配置，不创建任何模型；模型必须由用户显式添加（后台 /api/models
+// 或组内加入），登录/导入流程不要在这里或之后自动播种模型。
 // 名称会规范化为非空、无 "/" 且全局唯一（重名自动追加序号），因为它是直连模型
 // 对外名 "provider/model" 的前缀；后台手动保存会先做严格校验并提示重名。
 func (s *Store) UpsertProvider(p *Provider) {
@@ -739,13 +741,6 @@ func (s *Store) EnsureCodexHostID() string {
 	return s.CodexHostID
 }
 
-// HasZedModel 判断某 provider 下是否已有同名模型条目（登录同步模型时去重）
-func (s *Store) HasZedModel(providerID, name string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.hasProviderModelLocked(providerID, name)
-}
-
 // UpdateGeminiAppAuth 整份替换 Gemini App 凭证（登录/导入/测试注入用）。
 // 运行时的续期与后台快照回写请用下面的字段级方法，避免覆盖并发写入。
 func (s *Store) UpdateGeminiAppAuth(providerID string, c *GeminiAppCred) bool {
@@ -842,29 +837,6 @@ func (s *Store) ProviderByGeminiAppSubject(subject string) (Provider, bool) {
 		}
 	}
 	return Provider{}, false
-}
-
-// HasGeminiAppModel 判断某 Gemini App provider 下是否已有同名模型条目（登录同步模型时去重）
-func (s *Store) HasGeminiAppModel(providerID, name string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.hasProviderModelLocked(providerID, name)
-}
-
-// HasCodexModel 判断某 Codex provider 下是否已有同名模型条目（登录同步模型时去重）
-func (s *Store) HasCodexModel(providerID, name string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.hasProviderModelLocked(providerID, name)
-}
-
-func (s *Store) hasProviderModelLocked(providerID, name string) bool {
-	for _, m := range s.Models {
-		if m.ProviderID == providerID && m.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 // ProviderModelCount 某 provider 名下的模型条目数（后台展示用）

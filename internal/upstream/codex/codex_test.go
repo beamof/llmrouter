@@ -612,8 +612,8 @@ func TestCodexLoginFlow(t *testing.T) {
 	if p.BaseURL != fi.base+"/responses" {
 		t.Fatalf("基址: %s", p.BaseURL)
 	}
-	if got := st.ProviderModelCount(p.ID); got != 3 { // hidden 被过滤
-		t.Fatalf("模型同步: %d", got)
+	if got := st.ProviderModelCount(p.ID); got != 0 {
+		t.Fatalf("登录不应自动创建模型: %d", got)
 	}
 	// token 端点收到的交换请求形状
 	fa.mu.Lock()
@@ -667,10 +667,10 @@ func TestCodexLoginPasteFallback(t *testing.T) {
 		t.Fatalf("自定义名称应生效: %+v", providers)
 	}
 	if res["warning"] != nil {
-		t.Fatalf("模型同步不应有告警: %v", res["warning"])
+		t.Fatalf("不应有告警: %v", res["warning"])
 	}
-	if got := st.ProviderModelCount(providers[0].ID); got != 3 {
-		t.Fatalf("粘贴登录也应同步模型: %d", got)
+	if got := st.ProviderModelCount(providers[0].ID); got != 0 {
+		t.Fatalf("粘贴登录不应自动创建模型: %d", got)
 	}
 }
 
@@ -983,8 +983,8 @@ func TestCodexImportFlow(t *testing.T) {
 	if !p.Codex.PlanUsage {
 		t.Fatal("应识别套餐推理权限")
 	}
-	if got := st.ProviderModelCount(p.ID); got != 3 {
-		t.Fatalf("模型同步: %d", got)
+	if got := st.ProviderModelCount(p.ID); got != 0 {
+		t.Fatalf("凭证导入不应自动创建模型: %d", got)
 	}
 
 	// 同一账号再次导入：原地更新（subject 相同）
@@ -1128,8 +1128,8 @@ func TestCodexImportCLIAuth(t *testing.T) {
 	if !c.PlanUsage {
 		t.Fatal("CLI 模式 PlanUsage 应保持 true")
 	}
-	if got := st.ProviderModelCount(p.ID); got != len(codexCLIModels) {
-		t.Fatalf("应同步内置模型目录: %d", got)
+	if got := st.ProviderModelCount(p.ID); got != 0 {
+		t.Fatalf("CLI 导入不应自动创建模型: %d", got)
 	}
 	if res["warning"] != nil {
 		t.Fatalf("不应有告警: %v", res["warning"])

@@ -884,7 +884,7 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
           <button class="btn mini" onclick="zedLoginPaste()" style="margin-top:4px">用粘贴的 URL 完成登录</button>
         </div>
       </div>
-      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 Zed 账号（编辑器自带的模型额度）作为上游：点击「登录 Zed」后在浏览器完成授权，自动创建 Provider 并同步 gpt-*/claude-* 模型（优先级 0，可自行调整）。服务器上没有浏览器时用上方粘贴回调兜底。上游访问需代理时填上方「网络代理」。支持 chat 与 responses 两种接入协议。</p></details>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 Zed 账号（编辑器自带的模型额度）作为上游：点击「登录 Zed」后在浏览器完成授权，自动创建 Provider；模型在模型页按需添加（添加对话框会列出云端目录）。服务器上没有浏览器时用上方粘贴回调兜底。上游访问需代理时填上方「网络代理」。支持 chat 与 responses 两种接入协议。</p></details>
     </div>
     <div id="p-cc" hidden style="margin-top:8px">
       <div class="field"><label>API Key</label>
@@ -900,12 +900,12 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
           <span class="hint">每个请求带 x-cmd-zdr: 1（Command Code 的 ZDR）；通常费用更高，没有 ZDR 上游的模型会被拒绝</span>
         </div>
       </div>
-      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">复用 Command Code 订阅额度（Go / Pro / GOAT / Max / Ultra）。Go 套餐没有 Provider API，llmrouter 走 CLI 自己的 POST /alpha/generate 线协议；出站请求会转换成 CLI 格式，回程再翻回 chat / responses。点击「读取本机 CLI 登录」读取 ~/.commandcode/auth.json（只读），或直接粘贴 API Key。导入后自动按套餐同步模型（Go 会过滤掉套餐不含的高级模型）。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">复用 Command Code 订阅额度（Go / Pro / GOAT / Max / Ultra）。Go 套餐没有 Provider API，llmrouter 走 CLI 自己的 POST /alpha/generate 线协议；出站请求会转换成 CLI 格式，回程再翻回 chat / responses。点击「读取本机 CLI 登录」读取 ~/.commandcode/auth.json（只读），或直接粘贴 API Key。导入后不自动创建模型，可在模型页添加（添加对话框会按套餐列出可用模型，Go 套餐会过滤掉不含的高级模型）。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
     </div>
     <div id="p-codex" hidden style="margin-top:8px">
       <div class="field"><label>ChatGPT 账号</label>
         <div class="inline" style="flex:1">
-          <span class="hint" style="flex:1">浏览器完成 OpenAI 授权后自动创建 Provider 并同步模型</span>
+          <span class="hint" style="flex:1">浏览器完成 OpenAI 授权后自动创建 Provider（模型在模型页手动添加）</span>
           <button class="btn mini pri" onclick="codexLoginStart()">登录 ChatGPT</button>
         </div>
       </div>
@@ -927,7 +927,7 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
     <div id="p-gemini" hidden style="margin-top:8px">
       <div class="field"><label>Google 账号</label>
         <div class="inline" style="flex:1">
-          <span class="hint" style="flex:1">浏览器完成 Google 授权后自动创建 Provider 并同步模型</span>
+          <span class="hint" style="flex:1">浏览器完成 Google 授权后自动创建 Provider（模型在模型页手动添加）</span>
           <button class="btn mini pri" onclick="geminiLoginStart()">登录 Google</button>
         </div>
       </div>
@@ -2386,10 +2386,10 @@ function renderProviders() {
       quick = `<button class="link-btn" onclick="ccRefreshNow('${p.id}')">刷新套餐</button>`;
     } else if (isCodex) {
       balCell = codexBalanceHTML(p);
-      quick = `<button class="link-btn" onclick="codexRefreshNow('${p.id}')">刷新账号 / 同步模型</button>`;
+      quick = `<button class="link-btn" onclick="codexRefreshNow('${p.id}')">刷新账号</button>`;
     } else if (isGemini) {
       balCell = geminiBalanceHTML(p);
-      quick = `<button class="link-btn" onclick="geminiRefreshNow('${p.id}')">刷新账号 / 同步模型</button>`;
+      quick = `<button class="link-btn" onclick="geminiRefreshNow('${p.id}')">刷新账号</button>`;
     } else {
       balCell = balanceHTML(p);
       quick = `<button class="link-btn" onclick="queryBalance('${p.id}')">查余额</button>`;
@@ -2472,7 +2472,7 @@ function zedPoll() {
       editingProvider = S.providers.find(p => p.id === res.provider) || null;
       $('p-name').value = editingProvider?.name || $('p-name').value;
       zedRenderStatus();
-      toast(`Zed 登录成功，已同步 ${res.models} 个模型（优先级 0，可在模型页调整）`);
+      toast(`Zed 登录成功，provider 已创建；模型请在模型页手动添加`);
     } else {
       $('p-zedstatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}，可重试`;
     }
@@ -2492,7 +2492,7 @@ async function zedLoginPaste() {
       editingProvider = S.providers.find(p => p.id === res.provider) || null;
       $('p-name').value = editingProvider?.name || $('p-name').value;
       zedRenderStatus();
-      toast(`Zed 登录成功，已同步 ${res.models} 个模型`);
+      toast(`Zed 登录成功，provider 已创建；模型请在模型页手动添加`);
     } else {
       $('p-zedstatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}`;
     }
@@ -2534,15 +2534,15 @@ function ccRenderStatus() {
     (cred.plan ? ' · ' + esc(cred.plan) : '') + (cred.zdr ? ' · ZDR' : '') +
     ` · <span class="mono">${esc(maskKey(cred.api_key || ''))}</span>`;
   if (editingProvider) {
-    html += ` <button class="btn mini" onclick="ccRefreshNow('${editingProvider.id}')">刷新套餐 / 同步模型</button>`;
+    html += ` <button class="btn mini" onclick="ccRefreshNow('${editingProvider.id}')">刷新套餐</button>`;
   }
   el.innerHTML = html;
 }
 
-// 从本机 CLI 登录态或输入框里的 API Key 导入；成功后自动创建/更新 Provider 与模型
+// 从本机 CLI 登录态或输入框里的 API Key 导入；成功后自动创建/更新 Provider（不建模型）
 async function ccImport() {
   const key = $('p-cckey').value.trim();
-  $('p-ccstatus').textContent = '正在读取并同步模型…';
+  $('p-ccstatus').textContent = '正在导入账号…';
   try {
     const res = await api('POST', '/api/commandcode/import', {
       provider_id: editingProvider?.id || '',
@@ -2558,15 +2558,14 @@ async function ccImport() {
     $('p-cczdr').checked = !!editingProvider?.commandcode?.zdr;
     ccRenderStatus();
     const plan = res.plan ? `（套餐 ${res.plan}）` : '';
-    if (res.warning) toast(`已导入${plan}，但同步模型失败：${res.warning}`);
-    else toast(`已导入${plan}，同步 ${res.models} 个模型`);
+    toast(`已导入${plan}；模型请在模型页手动添加`);
   } catch (e) { $('p-ccstatus').innerHTML = `导入失败：${esc(e.message)}`; }
 }
 
 async function ccRefreshNow(id) {
   try {
     const res = await api('POST', `/api/providers/${id}/commandcode-refresh`);
-    toast(`已刷新${res.plan ? '（套餐 ' + res.plan + '）' : ''}，同步 ${res.models} 个模型`);
+    toast(`已刷新${res.plan ? '（套餐 ' + res.plan + '）' : ''}`);
     await load();
     editingProvider = S.providers.find(p => p.id === id) || editingProvider;
     ccRenderStatus();
@@ -2639,7 +2638,7 @@ function codexPoll() {
       editingProvider = S.providers.find(p => p.id === res.provider) || null;
       $('p-name').value = editingProvider?.name || $('p-name').value;
       codexRenderStatus();
-      let msg = `ChatGPT 登录成功，已同步 ${res.models} 个模型（优先级 0，可在模型页调整）`;
+      let msg = `ChatGPT 登录成功，provider 已创建；模型请在模型页手动添加`;
       if (res.warning) msg += `；注意：${res.warning}`;
       toast(msg);
     } else {
@@ -2661,7 +2660,7 @@ async function codexLoginPaste() {
       editingProvider = S.providers.find(p => p.id === res.provider) || null;
       $('p-name').value = editingProvider?.name || $('p-name').value;
       codexRenderStatus();
-      let msg = `ChatGPT 登录成功，已同步 ${res.models} 个模型`;
+      let msg = `ChatGPT 登录成功，provider 已创建；模型请在模型页手动添加`;
       if (res.warning) msg += `；注意：${res.warning}`;
       toast(msg);
     } else {
@@ -2674,7 +2673,6 @@ async function codexRefreshNow(id) {
   try {
     const res = await api('POST', `/api/providers/${id}/codex-refresh`);
     let msg = `已续期，token 到期 ${res.expires_at ? new Date(res.expires_at).toLocaleString() : '未知'}`;
-    if (res.synced != null) msg += `，同步 ${res.synced} 个新模型`;
     if (res.warning) msg += `；注意：${res.warning}`;
     toast(msg);
     await load();
@@ -2698,7 +2696,7 @@ async function codexImportRaw() {
     $('p-name').value = editingProvider?.name || $('p-name').value;
     $('p-codexraw').value = '';
     codexRenderStatus();
-    let msg = `凭证已导入，同步 ${res.models} 个模型`;
+    let msg = `凭证已导入，provider 已创建；模型请在模型页手动添加`;
     if (res.warning) msg += `；注意：${res.warning}`;
     toast(msg);
   } catch (e) { alert('导入失败: ' + e.message); }
@@ -2779,7 +2777,7 @@ function geminiPoll() {
       editingProvider = S.providers.find(p => p.id === res.provider) || null;
       $('p-name').value = editingProvider?.name || $('p-name').value;
       geminiRenderStatus();
-      toast(`Google 登录成功，已同步 ${res.models} 个模型（优先级 0，可在模型页调整）`);
+      toast(`Google 登录成功，provider 已创建；模型请在模型页手动添加`);
     } else {
       $('p-geministatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}，可重试`;
     }
@@ -2799,7 +2797,7 @@ async function geminiLoginPaste() {
       editingProvider = S.providers.find(p => p.id === res.provider) || null;
       $('p-name').value = editingProvider?.name || $('p-name').value;
       geminiRenderStatus();
-      toast(`Google 登录成功，已同步 ${res.models} 个模型`);
+      toast(`Google 登录成功，provider 已创建；模型请在模型页手动添加`);
     } else {
       $('p-geministatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}`;
     }
@@ -2809,7 +2807,7 @@ async function geminiLoginPaste() {
 async function geminiRefreshNow(id) {
   try {
     const res = await api('POST', `/api/providers/${id}/gemini-refresh`);
-    let msg = `已续期，token 到期 ${res.expires_at ? new Date(res.expires_at).toLocaleString() : '未知'}；目录 ${res.models} 个模型`;
+    let msg = `已续期，token 到期 ${res.expires_at ? new Date(res.expires_at).toLocaleString() : '未知'}；当前 ${res.models} 个模型`;
     if (res.warning) msg += `；注意：${res.warning}`;
     toast(msg);
     await load();
@@ -2845,7 +2843,7 @@ async function geminiImportRaw() {
     $('p-name').value = editingProvider?.name || $('p-name').value;
     $('p-geminiraw').value = '';
     geminiRenderStatus();
-    toast(`凭证已导入，同步 ${res.models} 个模型`);
+    toast(`凭证已导入，provider 已创建；模型请在模型页手动添加`);
   } catch (e) { alert('导入失败: ' + e.message); }
 }
 
@@ -3039,7 +3037,7 @@ async function saveProvider() {
     body.base_url = 'https://api.commandcode.ai/alpha/generate';
     const cred = ccCredOf(editingProvider);
     const typed = $('p-cckey').value.trim();
-    // 新 Provider，或编辑时填了不同的 Key：走导入接口（顺便按套餐同步模型）
+    // 新 Provider，或编辑时填了不同的 Key：走导入接口
     if (!cred || (typed && typed !== cred.api_key)) {
       if (!cred && !typed) { alert('Command Code 类型需要先「读取本机 CLI 登录」，或粘贴 API Key'); return; }
       try {
@@ -3050,7 +3048,7 @@ async function saveProvider() {
         dlgProvider.close();
         await load();
         renderAll();
-        toast(`已导入${res.plan ? '（套餐 ' + res.plan + '）' : ''}，同步 ${res.models} 个模型`);
+        toast(`已导入${res.plan ? '（套餐 ' + res.plan + '）' : ''}；模型请在模型页手动添加`);
       } catch (e) { alert(e.message); }
       return;
     }

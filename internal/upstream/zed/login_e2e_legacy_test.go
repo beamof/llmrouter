@@ -182,21 +182,9 @@ func TestZedLoginFlow(t *testing.T) {
 	if p.Zed.Plan.Used == nil || *p.Zed.Plan.Used != 3 || p.Zed.Plan.Limit == nil || *p.Zed.Plan.Limit != 500 {
 		t.Fatalf("套餐用量解析不对: %+v", p.Zed.Plan)
 	}
-	// 模型同步：gpt-5.4 / claude-sonnet-4.5 入选；gemini（无线协议）、
-	// 禁用的 claude-opus、不带 gpt-/claude- 前缀的 o4-mini 都不建
-	want := map[string]bool{"gpt-5.4": true, "claude-sonnet-4.5": true}
-	if n := s.rt.Store.ProviderModelCount(p.ID); n != len(want) {
-		t.Fatalf("模型条目 = %d, want %d", n, len(want))
-	}
-	for name := range want {
-		if !s.rt.Store.HasZedModel(p.ID, name) {
-			t.Fatalf("缺少模型条目 %s", name)
-		}
-	}
-	for name := range map[string]bool{"gemini-3-pro": true, "claude-opus-4.6": true, "o4-mini": true} {
-		if s.rt.Store.HasZedModel(p.ID, name) {
-			t.Fatalf("不应同步模型 %s", name)
-		}
+	// 登录只建 provider，不自动创建模型（模型由用户在后台按需添加）
+	if n := s.rt.Store.ProviderModelCount(p.ID); n != 0 {
+		t.Fatalf("登录不应自动创建模型: %d", n)
 	}
 
 	// 同账号重复登录：原地更新，不新建 provider
@@ -214,7 +202,7 @@ func TestZedLoginFlow(t *testing.T) {
 	}
 	// 会话状态查询
 	resp, body := zedGet(t, app, "/api/zed/login/status?state=state-2")
-	if resp.StatusCode != 200 || !strings.Contains(body, `"success"`) || !strings.Contains(body, `"models":2`) {
+	if resp.StatusCode != 200 || !strings.Contains(body, `"success"`) {
 		t.Fatalf("登录状态应成功: %d %s", resp.StatusCode, body)
 	}
 	// 未完成的会话返回 pending

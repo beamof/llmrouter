@@ -63,28 +63,21 @@ func (s *Server) handleCommandCodeImport(w http.ResponseWriter, r *http.Request)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
-	res, err := s.ccAdapter().PersistProvider(ctx, req.ProviderID, key, req.Name, proxy, req.ZDR, fromCLI)
-	if err != nil {
-		// Provider 已落盘，模型同步失败只提示，不回滚账号。
-		writeJSON(w, http.StatusOK, map[string]any{
-			"provider": res.ProviderID, "models": res.Models, "plan": res.Plan, "warning": err.Error(),
-		})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"provider": res.ProviderID, "models": res.Models, "plan": res.Plan})
+	res := s.ccAdapter().PersistProvider(ctx, req.ProviderID, key, req.Name, proxy, req.ZDR, fromCLI)
+	writeJSON(w, http.StatusOK, map[string]any{"provider": res.ProviderID, "plan": res.Plan})
 }
 
-// handleCommandCodeRefresh 重新读取套餐并同步模型；CLI 导入的账号会重新读本机
+// handleCommandCodeRefresh 重新读取套餐；CLI 导入的账号会重新读本机
 // auth.json，`commandcode login` 换号后自动跟上。
 func (s *Server) handleCommandCodeRefresh(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	plan, n, err := s.ccAdapter().Refresh(ctx, r.PathValue("id"))
+	plan, err := s.ccAdapter().Refresh(ctx, r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"plan": plan, "models": n})
+	writeJSON(w, http.StatusOK, map[string]any{"plan": plan})
 }
 
 // ccAttempt 兼容旧候选循环的入口。

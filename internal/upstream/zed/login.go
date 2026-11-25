@@ -125,7 +125,6 @@ type zedLoginSession struct {
 	status   string // pending / success / failed
 	err      string // 失败原因
 	provider string // 成功后的 provider ID
-	models   int    // 同步的模型条目数
 }
 
 // zedLoginLookup 取登录会话；过期未完成的当场标记失败并关闭监听
@@ -204,19 +203,13 @@ func (a *Adapter) completeLogin(state, callbackURL string) (*zedLoginSession, er
 		a.loginCloseListener(sess)
 		return sess, err
 	}
-	models, err := zedFetchModels(ctx, cli, a.cloud(), minted)
-	if err != nil {
-		sess.status, sess.err = "failed", "拉取模型目录失败: "+err.Error()
-		a.loginCloseListener(sess)
-		return sess, err
-	}
 	minted.Username = account.Username
 	minted.GitHubLogin = account.GitHubLogin
 	minted.Plan = account.zedPlanSnapshot()
-	pid, n := a.persistLogin(minted, models, sess.name, proxy)
-	sess.status, sess.provider, sess.models = "success", pid, n
+	pid := a.persistLogin(minted, sess.name, proxy)
+	sess.status, sess.provider = "success", pid
 	a.loginCloseListener(sess)
-	log.Printf("[INFO] Zed 登录成功：%s（provider %s，同步 %d 个模型）", account.Username, pid, n)
+	log.Printf("[INFO] Zed 登录成功：%s（provider %s）", account.Username, pid)
 	return sess, nil
 }
 
@@ -227,9 +220,9 @@ func (a *Adapter) loginCloseListener(sess *zedLoginSession) {
 	}
 }
 
-// zedPersistLogin 创建或原地更新 Zed Provider，并同步模型条目（只增不删，
-// 不覆盖用户调整过的优先级/上限/暴露开关）。
-func (a *Adapter) persistLogin(cred *ZedCred, models []string, name, proxy string) (string, int) {
+// zedPersistLogin 创建或原地更新 Zed Provider。不自动创建模型，模型由用户
+// 在后台按需添加（添加对话框会拉取云端目录做建议）。
+func (a *Adapter) persistLogin(cred *ZedCred, name, proxy string) string {
 	completions := a.cloud() + "/completions"
 	p := &Provider{Kind: "zed", BaseURL: completions, Proxy: proxy, Zed: cred}
 	if old, ok := a.rt.Store.ProviderByZedUser(cred.UserID); ok {
@@ -252,14 +245,7 @@ func (a *Adapter) persistLogin(cred *ZedCred, models []string, name, proxy strin
 		p.Name = "Zed · " + label
 	}
 	a.rt.Store.UpsertProvider(p)
-	n := 0
-	for _, m := range models {
-		if !a.rt.Store.HasZedModel(p.ID, m) {
-			a.rt.Store.UpsertModel(&Model{ProviderID: p.ID, Name: m, Expose: true})
-		}
-		n++
-	}
-	return p.ID, n
+	return p.ID
 }
 
 // ── 管理后台 handler ──────────────────────────────────────────────────────
@@ -373,7 +359,6 @@ func (a *Adapter) HandleZedLoginStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if sess.status == "success" {
 		out["provider"] = sess.provider
-		out["models"] = sess.models
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
@@ -404,7 +389,6 @@ func (a *Adapter) HandleZedLoginPaste(w http.ResponseWriter, r *http.Request) {
 	}
 	if sess.status == "success" {
 		out["provider"] = sess.provider
-		out["models"] = sess.models
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }

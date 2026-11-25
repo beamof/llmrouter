@@ -502,6 +502,10 @@ func TestWBImportEndpoint(t *testing.T) {
 	if p2.BaseURL != "https://www.codebuddy.ai/v2" {
 		t.Fatalf("国际版端点不对: %s", p2.BaseURL)
 	}
+	// 导入只建 provider，不自动创建模型
+	if len(s.store.Models) != 0 {
+		t.Fatalf("导入不应自动创建模型: %d", len(s.store.Models))
+	}
 	// 非法 kind / 缺凭证
 	resp, _ = postJSON(t, app, "/api/workbuddy/import", `{"kind":"x","cred":{"uid":"u","access_token":"a"}}`)
 	if resp.StatusCode != 400 {

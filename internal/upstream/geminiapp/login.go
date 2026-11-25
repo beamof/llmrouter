@@ -7,7 +7,7 @@ package geminiapp
 //  2. 用户完成 Google 登录与同意后被重定向回回环地址，回调里带授权码；
 //  3. 网关用授权码 + PKCE verifier 换 token，随即做一次续期验证 refresh token
 //     可用并换到带完整授权范围的 access token，再用 userinfo 取账号身份；
-//  4. 按 Google 账号 sub 归并 Provider 并同步模型。
+//  4. 按 Google 账号 sub 归并 Provider。
 //
 // 无浏览器环境（服务器部署）走粘贴兜底：浏览器授权后落地失败的回调 URL 里
 // 仍带授权码，把它粘贴进后台即可完成（授权码绑定 PKCE，泄漏给第三方也无法兑换）。
@@ -49,7 +49,6 @@ type loginSession struct {
 	status       string // pending / success / failed
 	err          string // 失败原因
 	provider     string // 成功后的 provider ID
-	models       int    // 同步的模型条目数
 }
 
 // loginLookup 取登录会话；过期未完成的当场标记失败并关闭监听
@@ -196,10 +195,10 @@ func (a *Adapter) completeLogin(state, callbackURL string) (*loginSession, error
 		return fail(err)
 	}
 	cred.Subject, cred.Email = subject, email
-	pid, n := a.persistAccount(cred, sess.name, sess.proxy)
-	sess.status, sess.provider, sess.models = "success", pid, n
+	pid := a.persistAccount(cred, sess.name, sess.proxy)
+	sess.status, sess.provider = "success", pid
 	a.loginCloseListener(sess)
-	log.Printf("[INFO] Gemini App 登录成功：%s（provider %s，同步 %d 个模型）", credLabel(cred), pid, n)
+	log.Printf("[INFO] Gemini App 登录成功：%s（provider %s）", credLabel(cred), pid)
 	return sess, nil
 }
 
@@ -351,7 +350,6 @@ func loginStatusPayload(sess *loginSession) map[string]any {
 	}
 	if sess.status == "success" {
 		out["provider"] = sess.provider
-		out["models"] = sess.models
 	}
 	return out
 }
@@ -462,14 +460,14 @@ func (a *Adapter) HandleGeminiImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nc.Subject, nc.Email = subject, email
-	pid, n := a.persistAccount(nc, strings.TrimSpace(req.Name), proxy)
-	log.Printf("[INFO] Gemini App 凭证导入成功：%s（provider %s，同步 %d 个模型）", credLabel(nc), pid, n)
+	pid := a.persistAccount(nc, strings.TrimSpace(req.Name), proxy)
+	log.Printf("[INFO] Gemini App 凭证导入成功：%s（provider %s）", credLabel(nc), pid)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"status": "success", "provider": pid, "models": n, "expires_at": nc.Expires(),
+		"status": "success", "provider": pid, "expires_at": nc.Expires(),
 	})
 }
 
-// HandleGeminiRefresh 强制续期、刷新用量快照并同步模型目录
+// HandleGeminiRefresh 强制续期并刷新用量快照
 func (a *Adapter) HandleGeminiRefresh(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.rt.Store.Provider(r.PathValue("id"))
 	if !ok {
@@ -485,11 +483,9 @@ func (a *Adapter) HandleGeminiRefresh(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, http.StatusBadGateway, "续期失败: "+err.Error())
 		return
 	}
-	synced := a.syncModels(p.ID)
 	out := map[string]any{
 		"expires_at": nc.Expires(),
 		"models":     a.rt.Store.ProviderModelCount(p.ID),
-		"synced":     synced,
 	}
 	cli, cerr := a.rt.Clients.For(p, 15*time.Second)
 	var usage *domain.GeminiAppUsage

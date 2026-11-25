@@ -60,8 +60,7 @@ type loginSession struct {
 	status      string // pending / success / failed
 	err         string // 失败原因
 	provider    string // 成功后的 provider ID
-	models      int    // 同步的模型条目数
-	warning     string // 模型同步失败等非致命提示
+	warning     string // 非致命提示（如缺少套餐推理权限）
 }
 
 // codexRandomHex n 字节随机数的十六进制文本（state / nonce）
@@ -166,7 +165,7 @@ func (a *Adapter) loginLookup(state string) *loginSession {
 	return sess
 }
 
-// completeLogin 校验回调、换 token、校验 ID token、同步模型并落盘 Provider。
+// completeLogin 校验回调、换 token、校验 ID token 并落盘 Provider。
 // 浏览器回调与粘贴兜底共用；重复调用幂等（首个完成者生效）。
 func (a *Adapter) completeLogin(state, callbackURL string) (*loginSession, error) {
 	sess := a.loginLookup(state)
@@ -247,25 +246,17 @@ func (a *Adapter) completeLogin(state, callbackURL string) (*loginSession, error
 	}
 	now := time.Now()
 	cred.CheckedAt = &now
-	// 同步模型目录：失败不阻断登录（身份与凭证已有效，稍后可手动同步）
-	models, merr := a.fetchModels(ctx, cli, cred)
-	if merr != nil {
-		sess.warning = "模型目录同步失败：" + merr.Error()
-	}
 	if !cred.PlanUsage {
-		if sess.warning != "" {
-			sess.warning += "；"
-		}
-		sess.warning += "本次授权未包含 ChatGPT 套餐推理权限（chatgpt.tokens.use.direct），推理会被拒绝；可在 ChatGPT 设置里开启后重新登录"
+		sess.warning = "本次授权未包含 ChatGPT 套餐推理权限（chatgpt.tokens.use.direct），推理会被拒绝；可在 ChatGPT 设置里开启后重新登录"
 	}
-	pid, n := a.persistLogin(cred, models, sess.name, sess.proxy)
-	sess.status, sess.provider, sess.models = "success", pid, n
+	pid := a.persistLogin(cred, sess.name, sess.proxy)
+	sess.status, sess.provider = "success", pid
 	a.loginCloseListener(sess)
 	label := claims.Email
 	if label == "" {
 		label = claims.Subject
 	}
-	log.Printf("[INFO] Codex 套餐登录成功：%s（provider %s，同步 %d 个模型）", label, pid, n)
+	log.Printf("[INFO] Codex 套餐登录成功：%s（provider %s）", label, pid)
 	return sess, nil
 }
 
@@ -276,9 +267,9 @@ func (a *Adapter) loginCloseListener(sess *loginSession) {
 	}
 }
 
-// persistLogin 创建或原地更新 Codex Provider，并同步模型条目（只增不删，
-// 不覆盖用户调整过的优先级/上限/暴露开关）。
-func (a *Adapter) persistLogin(cred *CodexCred, models []string, name, proxy string) (string, int) {
+// persistLogin 创建或原地更新 Codex Provider。不自动创建模型，模型由用户在
+// 后台按需添加（添加对话框会拉取上游目录做建议）。
+func (a *Adapter) persistLogin(cred *CodexCred, name, proxy string) string {
 	p := &Provider{Kind: "codex", BaseURL: a.dataPlaneURL(cred), Proxy: proxy, Codex: cred}
 	if old, ok := a.rt.Store.ProviderByCodexSubject(cred.Subject, cred.ClientID); ok {
 		p.ID, p.Name, p.Proxy = old.ID, old.Name, old.Proxy // 原地更新：保留 ID/名称/代理
@@ -304,14 +295,7 @@ func (a *Adapter) persistLogin(cred *CodexCred, models []string, name, proxy str
 		}
 	}
 	a.rt.Store.UpsertProvider(p)
-	n := 0
-	for _, m := range models {
-		if !a.rt.Store.HasCodexModel(p.ID, m) {
-			a.rt.Store.UpsertModel(&Model{ProviderID: p.ID, Name: m, Expose: true})
-		}
-		n++
-	}
-	return p.ID, n
+	return p.ID
 }
 
 // ── 管理后台 handler ──────────────────────────────────────────────────────
@@ -432,7 +416,6 @@ func codexLoginStatusPayload(sess *loginSession) map[string]any {
 	}
 	if sess.status == "success" {
 		out["provider"] = sess.provider
-		out["models"] = sess.models
 	}
 	return out
 }
@@ -563,27 +546,20 @@ func (a *Adapter) HandleCodexImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nc := a.credFromToken(cred, tr)
-	models, merr := a.fetchModels(ctx, cli, nc)
-	if merr != nil {
-		if warn != "" {
-			warn += "；"
-		}
-		warn += "模型目录同步失败：" + merr.Error()
-	}
 	if !nc.PlanUsage && !codexIsCLI(nc) {
 		if warn != "" {
 			warn += "；"
 		}
 		warn += "凭证未包含 ChatGPT 套餐推理权限（chatgpt.tokens.use.direct），推理会被拒绝"
 	}
-	pid, n := a.persistLogin(nc, models, strings.TrimSpace(req.Name), proxy)
+	pid := a.persistLogin(nc, strings.TrimSpace(req.Name), proxy)
 	label := nc.Email
 	if label == "" {
 		label = nc.Subject
 	}
-	log.Printf("[INFO] Codex 凭证导入成功：%s（provider %s，同步 %d 个模型）", label, pid, n)
+	log.Printf("[INFO] Codex 凭证导入成功：%s（provider %s）", label, pid)
 	out := map[string]any{
-		"status": "success", "provider": pid, "models": n,
+		"status": "success", "provider": pid,
 		"expires_at": nc.Expires(), "plan_usage": nc.PlanUsage,
 	}
 	if warn != "" {
@@ -592,7 +568,7 @@ func (a *Adapter) HandleCodexImport(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
-// HandleCodexRefresh 强制续期并同步模型目录（镜像 HandleZedRefresh）
+// HandleCodexRefresh 强制续期并刷新凭证信息（镜像 HandleZedRefresh）
 func (a *Adapter) HandleCodexRefresh(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.rt.Store.Provider(r.PathValue("id"))
 	if !ok {
@@ -608,32 +584,11 @@ func (a *Adapter) HandleCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, http.StatusBadGateway, "续期失败: "+err.Error())
 		return
 	}
-	models, merr := a.fetchModels(r.Context(), mustClient(a, p), nc)
-	n := 0
-	for _, m := range models {
-		if !a.rt.Store.HasCodexModel(p.ID, m) {
-			a.rt.Store.UpsertModel(&Model{ProviderID: p.ID, Name: m, Expose: true})
-		}
-		n++
-	}
 	out := map[string]any{
 		"expires_at":         nc.Expires(),
 		"refresh_expires_at": nc.RefreshExpires(),
 		"plan_usage":         nc.PlanUsage,
 		"models":             a.rt.Store.ProviderModelCount(p.ID),
-		"synced":             n,
-	}
-	if merr != nil {
-		out["warning"] = "模型目录同步失败：" + merr.Error()
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
-}
-
-// mustClient 刷新接口用的上游客户端（代理配置来自 provider）
-func mustClient(a *Adapter, p Provider) *http.Client {
-	cli, err := a.rt.Clients.For(p, 20*time.Second)
-	if err != nil {
-		return http.DefaultClient
-	}
-	return cli
 }

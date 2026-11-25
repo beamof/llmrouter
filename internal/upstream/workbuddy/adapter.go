@@ -118,7 +118,7 @@ func (a *Adapter) Forget(id string) {
 // InvalidateCatalog 让缓存失效，下次请求重新拉取（刷新/导入凭证后调用）。
 func (a *Adapter) InvalidateCatalog(providerID string) { a.invalidateCatalog(providerID) }
 
-// Models 返回该 Provider 的模型目录（缓存或内置兜底），给后台下拉/模型同步用。
+// Models 返回该 Provider 的模型目录（缓存或内置兜底），给后台下拉/探测用。
 func (a *Adapter) Models(p domain.Provider) []string {
 	ids := a.catalogFor(p).IDs
 	return append([]string(nil), ids...)
