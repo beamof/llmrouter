@@ -25,6 +25,9 @@ type (
 	ZedPlan         = domain.ZedPlan
 	CommandCodeCred = domain.CommandCodeCred
 	CodexCred       = domain.CodexCred
+	GeminiAppCred   = domain.GeminiAppCred
+	GeminiAppUsage  = domain.GeminiAppUsage
+	GeminiAppTerms  = domain.GeminiAppTerms
 	MuteWindow      = domain.MuteWindow
 	Model           = domain.Model
 	APIKey          = domain.APIKey
@@ -727,6 +730,111 @@ func (s *Store) EnsureCodexHostID() string {
 
 // HasZedModel 判断某 provider 下是否已有同名模型条目（登录同步模型时去重）
 func (s *Store) HasZedModel(providerID, name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hasProviderModelLocked(providerID, name)
+}
+
+// UpdateGeminiAppAuth 整份替换 Gemini App 凭证（登录/导入/测试注入用）。
+// 运行时的续期与后台快照回写请用下面的字段级方法，避免覆盖并发写入。
+func (s *Store) UpdateGeminiAppAuth(providerID string, c *GeminiAppCred) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.GeminiApp == nil {
+		return false
+	}
+	cp := *c
+	p.GeminiApp = &cp
+	s.save()
+	return true
+}
+
+// UpdateGeminiAppToken 只回写续期得到的 token 字段：从当前凭证复制后修改，
+// 不覆盖并发写入的 usage / terms 等快照。refresh token 为空时保留当前值。
+func (s *Store) UpdateGeminiAppToken(providerID string, c *GeminiAppCred) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.GeminiApp == nil {
+		return false
+	}
+	cp := *p.GeminiApp
+	cp.AccessToken = c.AccessToken
+	if c.RefreshToken != "" {
+		cp.RefreshToken = c.RefreshToken
+	}
+	cp.ExpiresAt = c.ExpiresAt
+	cp.CheckedAt = c.CheckedAt
+	cp.AuthError = ""
+	p.GeminiApp = &cp
+	s.save()
+	return true
+}
+
+// UpdateGeminiAppUsage 只回写用量快照，不覆盖并发续期的新 token。
+func (s *Store) UpdateGeminiAppUsage(providerID string, u *GeminiAppUsage) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.GeminiApp == nil {
+		return false
+	}
+	cp := *p.GeminiApp
+	cp.Usage = u
+	p.GeminiApp = &cp
+	s.save()
+	return true
+}
+
+// UpdateGeminiAppTerms 只回写条款接受回执，不覆盖并发续期的新 token。
+func (s *Store) UpdateGeminiAppTerms(providerID string, t *GeminiAppTerms) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.GeminiApp == nil {
+		return false
+	}
+	cp := *p.GeminiApp
+	cp.Terms = t
+	p.GeminiApp = &cp
+	s.save()
+	return true
+}
+
+// UpdateGeminiAppAuthError 只回写授权失效标记，不覆盖并发续期的新 token。
+func (s *Store) UpdateGeminiAppAuthError(providerID, msg string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.providerLocked(providerID)
+	if !ok || p.GeminiApp == nil {
+		return false
+	}
+	cp := *p.GeminiApp
+	cp.AuthError = msg
+	p.GeminiApp = &cp
+	s.save()
+	return true
+}
+
+// ProviderByGeminiAppSubject 按 Google 账号 sub 找 provider，重复登录同一账号时
+// 原地更新而不是新建。
+func (s *Store) ProviderByGeminiAppSubject(subject string) (Provider, bool) {
+	if subject == "" {
+		return Provider{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.Providers {
+		if p.Kind == "geminiapp" && p.GeminiApp != nil && p.GeminiApp.Subject == subject {
+			return *p, true
+		}
+	}
+	return Provider{}, false
+}
+
+// HasGeminiAppModel 判断某 Gemini App provider 下是否已有同名模型条目（登录同步模型时去重）
+func (s *Store) HasGeminiAppModel(providerID, name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.hasProviderModelLocked(providerID, name)

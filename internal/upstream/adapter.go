@@ -1,8 +1,8 @@
 // Package upstream 定义上游适配器的统一契约、注册表与共享运行时。
 //
 // 标准 OpenAI 兼容上游使用 standard 适配器；私有协议上游（WorkBuddy、Zed、
-// Command Code）各自实现 Adapter 并在 Registry 注册。网关的候选循环只面向
-// Adapter，不再感知具体厂商。
+// Command Code、Codex 套餐、Gemini App）各自实现 Adapter 并在 Registry 注册。
+// 网关的候选循环只面向 Adapter，不再感知具体厂商。
 package upstream
 
 import (

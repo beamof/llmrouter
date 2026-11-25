@@ -9,6 +9,7 @@ import (
 	"llmrouter/internal/session"
 	"llmrouter/internal/upstream"
 	"llmrouter/internal/upstream/codex"
+	"llmrouter/internal/upstream/geminiapp"
 	"llmrouter/internal/upstream/workbuddy"
 	"llmrouter/internal/upstream/zed"
 )
@@ -18,7 +19,8 @@ type Server struct {
 	store   *Store
 	client  *http.Client
 	clients *upstream.ClientFactory // 按 Provider 代理配置构造的上游客户端
-	reg     *upstream.Registry      // 上游适配器注册表
+	regOnce sync.Once
+	reg     *upstream.Registry // 上游适配器注册表
 
 	adminToken string // 后台令牌，空则不鉴权
 	apiToken   string // 代理入口令牌，空则不鉴权
@@ -33,6 +35,14 @@ type Server struct {
 	codex         *codex.Adapter     // Codex 套餐适配器（含续期单飞锁与登录会话）
 	codexAuthBase string             // Codex 授权服务器基址覆盖（测试注入用，空 = 官方端点）
 	codexAPIBase  string             // Codex 推理 API 基址覆盖（测试注入用，空 = 官方端点）
+
+	// Gemini App 适配器（含续期单飞锁与登录会话）。登录与代理请求可能并发触发
+	// 首次构造，用互斥锁保护；其余基址为测试注入用，空 = 官方端点。
+	geminiMu         sync.Mutex
+	gemini           *geminiapp.Adapter
+	geminiOAuthBase  string
+	geminiOrigin     string
+	geminiUploadBase string
 
 	guard *auth.Guard // 后台鉴权与失败锁定
 

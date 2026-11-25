@@ -23,6 +23,7 @@
   --zed-bg:#f3e8ff; --zed-fg:#7e22ce;
   --cc-bg:#ccfbf1; --cc-fg:#0f766e;
   --codex-bg:#e7f5ec; --codex-fg:#15803d;
+  --gem-bg:#ffedd5; --gem-fg:#c2410c;
   --input-ph:#a4afc1;
   --topbar-fade:rgba(245,247,251,.55);
   --tip-bg:#111827; --tip-tx:#fff; --tip-mut:#c7d2fe;
@@ -51,6 +52,7 @@
     --zed-bg:#2a1b40; --zed-fg:#d8b4fe;
     --cc-bg:#0f2f2c; --cc-fg:#5eead4;
     --codex-bg:#0f2e1a; --codex-fg:#86efac;
+    --gem-bg:#3a1f0a; --gem-fg:#fdba74;
     --input-ph:#5f6f89;
     --topbar-fade:rgba(11,16,32,.6);
     --tip-bg:#e8eefc; --tip-tx:#0f172a; --tip-mut:#475569;
@@ -275,6 +277,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .kind-tag.zed{background:var(--zed-bg);color:var(--zed-fg)}
 .kind-tag.cc{background:var(--cc-bg);color:var(--cc-fg)}
 .kind-tag.codex{background:var(--codex-bg);color:var(--codex-fg)}
+.kind-tag.gem{background:var(--gem-bg);color:var(--gem-fg)}
 .provider-endpoint{display:flex;align-items:center;gap:6px;margin-top:3px;min-width:0;color:var(--mut);font-size:11.5px}
 .provider-endpoint .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px}
 .mini-tag{
@@ -825,9 +828,16 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
         <option value="zed">Zed 账号</option>
         <option value="commandcode">Command Code（Go 等订阅）</option>
         <option value="codex">Codex 套餐（ChatGPT 计划）</option>
+        <option value="geminiapp">Gemini App（Google 账号订阅）</option>
       </select>
     </div>
-    <div class="field"><label>名称</label><input id="p-name" placeholder="deepseek"><div class="hint" style="margin-top:4px">会作为直连模型名的前缀（如 deepseek/deepseek-chat），必须唯一且不含 /；改名会使旧模型名失效。</div></div>
+    <div class="field"><label>名称</label>
+      <!-- 输入框与提示上下排列：并排时较长的提示会把输入框挤到只剩内边距 -->
+      <div style="flex:1;min-width:0">
+        <input id="p-name" placeholder="deepseek" style="width:100%;box-sizing:border-box">
+        <div class="hint" style="margin-top:4px">会作为直连模型名的前缀（如 deepseek/deepseek-chat），必须唯一且不含 /；改名会使旧模型名失效。</div>
+      </div>
+    </div>
     <div class="field" id="row-base"><label>Chat 基址 *</label><input id="p-base" class="mono" placeholder="https://api.openai.com/v1"></div>
     <div class="field" id="row-key"><label>API Key</label><input id="p-key" class="mono" placeholder="sk-..." autocomplete="off"></div>
     <div class="field" id="row-resp"><label>Responses 基址</label><input id="p-resp" class="mono" placeholder="留空 = 同 Chat 基址"></div>
@@ -902,6 +912,28 @@ dialog::backdrop{background:var(--backdrop);backdrop-filter:blur(3px)}
         </div>
       </div>
       <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 ChatGPT 套餐（Plus / Pro 的 Codex 额度）作为上游，两种凭证来源：① 点击「登录 ChatGPT」走 Sign in with ChatGPT 浏览器授权（需要 ChatGPT Plus / Pro）；② 本机装过 Codex CLI 的话，把 ~/.codex/auth.json 的内容整份粘贴到上方「粘贴凭证 JSON」导入（复用 CLI 登录态，出站走 ChatGPT 后端的 Codex 通道并自动伪装官方客户端）。服务器上没有浏览器时也可用粘贴回调 URL 兜底。出站强制流式、不落盘，llmrouter 自动剥离该通道不支持的字段与托管工具；用量与 ChatGPT 共享（Plus 为 5 小时窗口，达限 429 自动静音）。导入即续期验证并轮换 refresh token（来源端凭证随之失效）。删除 Provider 会尝试在 OpenAI 侧吊销授权。支持 chat 与 responses 两种接入协议；上游需代理时填上方「网络代理」。</p></details>
+    </div>
+    <div id="p-gemini" hidden style="margin-top:8px">
+      <div class="field"><label>Google 账号</label>
+        <div class="inline" style="flex:1">
+          <span class="hint" style="flex:1">浏览器完成 Google 授权后自动创建 Provider 并同步模型</span>
+          <button class="btn mini pri" onclick="geminiLoginStart()">登录 Google</button>
+        </div>
+      </div>
+      <div id="p-geministatus" class="hint" style="margin:4px 0 8px"></div>
+      <div class="field" style="align-items:flex-start"><label>粘贴回调 URL</label>
+        <div style="flex:1;min-width:0">
+          <textarea id="p-geminicb" class="mono" rows="2" placeholder='http://localhost:18765/?code=…&state=… （浏览器无法访问本机时，复制授权后地址栏的完整 URL 粘贴到这里）' style="width:100%;box-sizing:border-box"></textarea>
+          <button class="btn mini" onclick="geminiLoginPaste()" style="margin-top:4px">用粘贴的 URL 完成登录</button>
+        </div>
+      </div>
+      <div class="field" style="align-items:flex-start"><label>粘贴凭证 JSON</label>
+        <div style="flex:1;min-width:0">
+          <textarea id="p-geminiraw" class="mono" rows="4" placeholder='支持三种格式：{"refresh_token":"…"}；gemini-app2api 状态文件里的账号记录；本网关 data.json 的 geminiapp 字段' style="width:100%;box-sizing:border-box"></textarea>
+          <button class="btn mini" onclick="geminiImportRaw()" style="margin-top:4px">导入粘贴的凭证</button>
+        </div>
+      </div>
+      <details class="hint-toggle" style="margin-top:6px"><summary>说明</summary><p class="hint">用 Gemini / Google AI 订阅（Free、AI Pro、AI Ultra、AI Plus）的额度作为上游：点击「登录 Google」走标准 OAuth 授权（需要 Google 账号；服务端需配置 LLMROUTER_GEMINI_CLIENT_ID / LLMROUTER_GEMINI_CLIENT_SECRET，或凭证自带 client_id / client_secret；同一账号重复登录会原地更新）。服务器上没有浏览器时用粘贴回调 URL 兜底，或把带 refresh_token 的凭证 JSON 粘贴到上方导入。出站走 Gemini 原生通道并固定为临时会话（不进账号的云端历史）；工具调用走提示词协议，由网关校验后才下发。上游不返回 token 用量，统计页里是估算值。模型档位严格校验，上游降级会被拒绝；套餐额度耗尽返回 429 并自动静音 5 小时。新账号若提示需要先接受服务条款，可用「接受 Gemini 条款」或到官方 Gemini 应用里接受。只支持 data: URL 内联图片。访问上游需要代理时填上方「网络代理」（令牌续期也由网关发出）。</p></details>
     </div>
   </div>
   <div class="dlg-foot split">
@@ -2202,6 +2234,7 @@ function providerKindTag(p) {
     case 'zed': return '<span class="kind-tag zed">Zed</span>';
     case 'commandcode': return '<span class="kind-tag cc">Command Code</span>';
     case 'codex': return '<span class="kind-tag codex">Codex</span>';
+    case 'geminiapp': return '<span class="kind-tag gem">Gemini</span>';
     default: return '<span class="kind-tag">标准</span>';
   }
 }
@@ -2259,6 +2292,23 @@ function providerStatusHTML(p) {
       <span class="status-extra">${esc(c.email || c.name || c.subject)}${srcTag}${e.detail ? ' · token 至 ' + e.detail : ''}${planTag}</span>
     </div>`;
   }
+  if (p.kind === 'geminiapp') {
+    const c = p.geminiapp;
+    if (!c || !c.subject) return '<span class="pill bad">未登录</span>';
+    const who = c.email || c.subject;
+    if (c.auth_error) {
+      return `<div class="status-line">
+        <span class="pill bad">授权失效</span>
+        <span class="status-extra">${esc(who)} · 请重新登录 Google 账号</span>
+      </div>`;
+    }
+    const e = expiryBadge(c.expires_at);
+    const tier = geminiTierLabel(c.usage && c.usage.tier);
+    return `<div class="status-line">
+      <span class="pill ${e.cls || 'ok'}">${e.cls ? e.label : '凭证有效'}</span>
+      <span class="status-extra">${esc(who)}${tier ? ' · ' + esc(tier) : ''}${e.detail ? ' · token 至 ' + e.detail : ''}</span>
+    </div>`;
+  }
   if (p.api_key) {
     return `<div class="status-line"><span class="pill ok">Key 已配置</span><span class="status-extra mono">${esc(maskKey(p.api_key))}</span></div>`;
   }
@@ -2271,16 +2321,17 @@ function providerEndpointHTML(p) {
   const isZed = p.kind === 'zed';
   const isCC = p.kind === 'commandcode';
   const isCodex = p.kind === 'codex';
+  const isGemini = p.kind === 'geminiapp';
   let endpoint = p.base_url;
-  if (!isWB && !isZed && !isCC && !isCodex) {
+  if (!isWB && !isZed && !isCC && !isCodex && !isGemini) {
     try {
       const u = new URL(p.base_url);
       endpoint = u.host + (u.pathname === '/' ? '' : u.pathname.replace(/\/$/, ''));
     } catch { endpoint = p.base_url; }
   }
-  const text = isWB ? '官方客户端端点' : isZed ? 'cloud.zed.dev' : isCC ? 'api.commandcode.ai' : isCodex ? 'api.openai.com（ChatGPT 计划）' : endpoint;
+  const text = isWB ? '官方客户端端点' : isZed ? 'cloud.zed.dev' : isCC ? 'api.commandcode.ai' : isCodex ? 'api.openai.com（ChatGPT 计划）' : isGemini ? 'Google 原生通道（Robin）' : endpoint;
   const tags = [];
-  if (!isWB && !isZed && !isCC && !isCodex && p.responses_url && p.responses_url !== p.base_url) tags.push('Responses 独立');
+  if (!isWB && !isZed && !isCC && !isCodex && !isGemini && p.responses_url && p.responses_url !== p.base_url) tags.push('Responses 独立');
   if (p.proxy) tags.push('代理');
   return `<div class="provider-endpoint" title="${esc(p.base_url)}">
     <span class="mono">${esc(text)}</span>
@@ -2299,6 +2350,7 @@ function renderProviders() {
     const isZed = p.kind === 'zed';
     const isCC = p.kind === 'commandcode';
     const isCodex = p.kind === 'codex';
+    const isGemini = p.kind === 'geminiapp';
     let balCell, quick;
     if (isWB) {
       balCell = wbBalanceHTML(p);
@@ -2312,6 +2364,9 @@ function renderProviders() {
     } else if (isCodex) {
       balCell = codexBalanceHTML(p);
       quick = `<button class="link-btn" onclick="codexRefreshNow('${p.id}')">刷新账号 / 同步模型</button>`;
+    } else if (isGemini) {
+      balCell = geminiBalanceHTML(p);
+      quick = `<button class="link-btn" onclick="geminiRefreshNow('${p.id}')">刷新账号 / 同步模型</button>`;
     } else {
       balCell = balanceHTML(p);
       quick = `<button class="link-btn" onclick="queryBalance('${p.id}')">查余额</button>`;
@@ -2626,27 +2681,175 @@ async function codexImportRaw() {
   } catch (e) { alert('导入失败: ' + e.message); }
 }
 
+/* ---------- Gemini App（Google 账号订阅） ---------- */
+let geminiLoginState = ''; // 进行中的登录会话 state
+
+// 编辑已有 geminiapp provider 时取其凭证（保存时原样带回，登录成功后由服务端更新）
+function geminiCredOf(editing) {
+  return (editing && editing.kind === 'geminiapp' && editing.geminiapp) ? editing.geminiapp : null;
+}
+
+// 订阅档位（Google GetUsageInfo 上报的访问档位，不是账单或续订状态）
+const GEMINI_TIERS = {free: 'Free', pro: 'AI Pro', ultra: 'AI Ultra', plus: 'AI Plus', neon: 'Ultra / Neon'};
+const geminiTierLabel = tier => GEMINI_TIERS[tier] || '';
+
+// Gemini App 套餐/用量快照单元格：各用量窗口的已用百分比
+function geminiBalanceHTML(p) {
+  const u = p.geminiapp && p.geminiapp.usage;
+  if (!u) return '<span class="hint">未查询</span>';
+  const when = u.checked_at ? `<div class="cell-sub">更新于 ${agoText(u.checked_at)}${u.error ? ' · 最近一次查询失败' : ''}</div>` : '';
+  const rows = (u.rows || []).slice(0, 3).map(r => {
+    const pct = Number(r.percent);
+    if (isNaN(pct)) return `<div>${esc(r.label || '用量')}</div>`;
+    const cls = pct >= 90 ? 'bad' : pct >= 70 ? 'warn' : 'ok';
+    return `<div>${esc(r.label || '用量')} 已用 <span class="pill ${cls}" style="margin-left:4px">${pct.toFixed(0)}%</span></div>`;
+  }).join('');
+  const summary = rows || (u.tier ? esc(geminiTierLabel(u.tier)) : '<span class="hint">上游未上报用量窗口</span>');
+  return `<div class="bal">${summary}</div>${when}`;
+}
+
+function geminiRenderStatus() {
+  const el = $('p-geministatus');
+  if ($('p-kind').value !== 'geminiapp') return;
+  const cred = geminiCredOf(editingProvider);
+  if (!cred) { el.innerHTML = '尚未登录——点击「登录 Google」在浏览器完成授权后自动创建 Provider；或把带 refresh_token 的凭证 JSON 粘贴到下方导入'; return; }
+  const exp = cred.expires_at ? new Date(cred.expires_at) : null;
+  let html = cred.auth_error
+    ? `<span class="pill bad">授权失效</span> ${esc(cred.auth_error)}`
+    : `已登录：<b>${esc(cred.email || cred.subject)}</b>` + (exp ? ` · token 到期 ${exp.toLocaleString()}` : '');
+  const tier = geminiTierLabel(cred.usage && cred.usage.tier);
+  if (tier) html += ` · <span class="mini-tag">${esc(tier)}</span>`;
+  if (cred.terms && cred.terms.status === 'accepted') html += ` · <span class="mini-tag">条款已接受</span>`;
+  if (editingProvider) {
+    html += ` <button class="btn mini" onclick="geminiRefreshNow('${editingProvider.id}')">续期 / 刷新用量</button>`;
+    html += ` <button class="btn mini" onclick="geminiTermsAccept('${editingProvider.id}')">接受 Gemini 条款</button>`;
+  }
+  el.innerHTML = html;
+}
+
+// 发起登录：拿到授权 URL 后新开浏览器页，本页轮询会话状态。
+// 编辑已有 provider 时带 provider_id：服务端沿用其自带的 OAuth 客户端配置。
+async function geminiLoginStart() {
+  try {
+    const res = await api('POST', '/api/gemini/login', {
+      name: $('p-name').value.trim(),
+      proxy: $('p-proxy').value.trim(),
+      provider_id: editingProvider?.id || '',
+    });
+    geminiLoginState = res.state;
+    $('p-geministatus').innerHTML = '已打开授权页，完成 Google 登录后这里会自动更新…（10 分钟内有效）';
+    window.open(res.url, '_blank', 'noopener');
+    geminiPoll();
+  } catch (e) { alert('发起登录失败: ' + e.message); }
+}
+
+function geminiPoll() {
+  if (!geminiLoginState) return;
+  setTimeout(async () => {
+    let res;
+    try { res = await api('GET', '/api/gemini/login/status?state=' + encodeURIComponent(geminiLoginState)); }
+    catch (e) { return; /* 会话过期等：停止轮询 */ }
+    if (res.status === 'pending') { geminiPoll(); return; }
+    geminiLoginState = '';
+    if (res.status === 'success') {
+      await load();
+      editingProvider = S.providers.find(p => p.id === res.provider) || null;
+      $('p-name').value = editingProvider?.name || $('p-name').value;
+      geminiRenderStatus();
+      toast(`Google 登录成功，已同步 ${res.models} 个模型（优先级 0，可在模型页调整）`);
+    } else {
+      $('p-geministatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}，可重试`;
+    }
+  }, 1500);
+}
+
+// 无浏览器环境兜底：粘贴浏览器地址栏里的回调 URL
+async function geminiLoginPaste() {
+  const url = $('p-geminicb').value.trim();
+  if (!url) { alert('请先粘贴回调 URL'); return; }
+  if (!geminiLoginState) { alert('请先点击「登录 Google」发起会话，再把浏览器里的回调 URL 粘贴到这里'); return; }
+  try {
+    const res = await api('POST', '/api/gemini/login/paste', {state: geminiLoginState, url});
+    geminiLoginState = '';
+    if (res.status === 'success') {
+      await load();
+      editingProvider = S.providers.find(p => p.id === res.provider) || null;
+      $('p-name').value = editingProvider?.name || $('p-name').value;
+      geminiRenderStatus();
+      toast(`Google 登录成功，已同步 ${res.models} 个模型`);
+    } else {
+      $('p-geministatus').innerHTML = `登录失败：${esc(res.error || '未知错误')}`;
+    }
+  } catch (e) { alert(e.message); }
+}
+
+async function geminiRefreshNow(id) {
+  try {
+    const res = await api('POST', `/api/providers/${id}/gemini-refresh`);
+    let msg = `已续期，token 到期 ${res.expires_at ? new Date(res.expires_at).toLocaleString() : '未知'}；目录 ${res.models} 个模型`;
+    if (res.warning) msg += `；注意：${res.warning}`;
+    toast(msg);
+    await load();
+    editingProvider = S.providers.find(p => p.id === id) || editingProvider;
+    geminiRenderStatus();
+  } catch (e) { alert(e.message); }
+}
+
+// 显式接受 Gemini 主服务条款：只有用户确认后才提交
+async function geminiTermsAccept(id) {
+  if (!confirm('确认代表该 Google 账号接受 Gemini 主服务条款？只有在这里确认时 llmrouter 才会向 Google 提交接受。')) return;
+  try {
+    const res = await api('POST', `/api/providers/${id}/gemini-terms`);
+    toast(`已接受 Gemini 条款（版本 ${res.terms && res.terms.version != null ? res.terms.version : '未知'}）`);
+    await load();
+    editingProvider = S.providers.find(p => p.id === id) || editingProvider;
+    geminiRenderStatus();
+  } catch (e) { alert(e.message); }
+}
+
+// 粘贴凭证 JSON 直接导入（无浏览器 / 跨机器迁移场景）；导入即续期验证
+async function geminiImportRaw() {
+  const raw = $('p-geminiraw').value.trim();
+  if (!raw) { alert('请先粘贴凭证 JSON'); return; }
+  try {
+    const res = await api('POST', '/api/gemini/import', {
+      name: $('p-name').value.trim(),
+      proxy: $('p-proxy').value.trim(),
+      raw,
+    });
+    await load();
+    editingProvider = S.providers.find(p => p.id === res.provider) || null;
+    $('p-name').value = editingProvider?.name || $('p-name').value;
+    $('p-geminiraw').value = '';
+    geminiRenderStatus();
+    toast(`凭证已导入，同步 ${res.models} 个模型`);
+  } catch (e) { alert('导入失败: ' + e.message); }
+}
+
 /* ---------- WorkBuddy 凭证 ---------- */
 const WB_ENDPOINTS = {'workbuddy': 'https://copilot.tencent.com/v2', 'workbuddy-intl': 'https://www.codebuddy.ai/v2'};
 let wbCred = null; // 当前弹窗持有的凭证（编辑时来自 provider，重新导入后覆盖）
 let wbHits = [];
 
 function onKindChange() {
-  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode', codex = kind === 'codex', special = wb || zed || cc || codex;
+  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode', codex = kind === 'codex', gemini = kind === 'geminiapp', special = wb || zed || cc || codex || gemini;
   for (const id of ['row-base', 'row-key', 'row-resp', 'row-bal']) $(id).style.display = special ? 'none' : '';
   $('hint-normal').style.display = special ? 'none' : '';
   $('p-wb').hidden = !wb;
   $('p-zed').hidden = !zed;
   $('p-cc').hidden = !cc;
   $('p-codex').hidden = !codex;
+  $('p-gemini').hidden = !gemini;
   if (wb) $('p-base').value = WB_ENDPOINTS[kind];
   if (zed) $('p-base').value = 'https://cloud.zed.dev/completions';
   if (cc) $('p-base').value = 'https://api.commandcode.ai/alpha/generate';
   if (codex) $('p-base').value = 'https://api.openai.com/v1/responses';
+  if (gemini) $('p-base').value = 'https://robinfrontend-pa.googleapis.com/assistant.mobile.robin.RobinService/ProcessQuery';
   wbRenderStatus();
   zedRenderStatus();
   ccRenderStatus();
   codexRenderStatus();
+  geminiRenderStatus();
 }
 
 function wbRenderStatus() {
@@ -2771,19 +2974,22 @@ function editProvider(id) {
   $('p-codexcb').value = '';
   $('p-codexraw').value = '';
   codexLoginState = '';
+  $('p-geminicb').value = '';
+  $('p-geminiraw').value = '';
+  geminiLoginState = '';
   onKindChange();
   dlgProvider.showModal();
 }
 
 async function saveProvider() {
-  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode', codex = kind === 'codex';
+  const kind = $('p-kind').value, wb = !!WB_ENDPOINTS[kind], zed = kind === 'zed', cc = kind === 'commandcode', codex = kind === 'codex', gemini = kind === 'geminiapp';
   const body = {
     name: $('p-name').value.trim() || 'provider',
     kind,
     base_url: $('p-base').value.trim(),
-    responses_url: (wb || zed || cc || codex) ? '' : $('p-resp').value.trim(),
-    api_key: (wb || zed || cc || codex) ? '' : $('p-key').value.trim(),
-    balance_url: (wb || zed || cc || codex) ? '' : $('p-bal').value.trim(),
+    responses_url: (wb || zed || cc || codex || gemini) ? '' : $('p-resp').value.trim(),
+    api_key: (wb || zed || cc || codex || gemini) ? '' : $('p-key').value.trim(),
+    balance_url: (wb || zed || cc || codex || gemini) ? '' : $('p-bal').value.trim(),
     proxy: $('p-proxy').value.trim(),
   };
   if (wb) {
@@ -2800,6 +3006,11 @@ async function saveProvider() {
     body.codex = codexCredOf(editingProvider);
     if (!body.base_url) body.base_url = 'https://api.openai.com/v1/responses';
     if (!body.codex || !body.codex.subject) { alert('Codex 套餐类型需要先完成「登录 ChatGPT」'); return; }
+  }
+  if (gemini) {
+    body.geminiapp = geminiCredOf(editingProvider);
+    if (!body.base_url) body.base_url = 'https://robinfrontend-pa.googleapis.com/assistant.mobile.robin.RobinService/ProcessQuery';
+    if (!body.geminiapp || !body.geminiapp.subject) { alert('Gemini App 类型需要先完成「登录 Google」，或粘贴凭证 JSON 导入'); return; }
   }
   if (cc) {
     body.base_url = 'https://api.commandcode.ai/alpha/generate';

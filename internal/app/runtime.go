@@ -38,15 +38,17 @@ func (s *Server) wbAttempt(w http.ResponseWriter, r *http.Request, c Candidate, 
 }
 
 // registry 组装上游适配器注册表（标准上游 + 各私有协议）。
+// 登录/代理/后台请求都可能并发触发首次构造，用 sync.Once 保证只构造一份。
 func (s *Server) registry() *upstream.Registry {
-	if s.reg == nil {
+	s.regOnce.Do(func() {
 		std := &upstream.Standard{Store: s.store, Clients: s.upstreamRuntime().Clients, APIToken: s.apiToken}
 		r := upstream.NewRegistry(std)
 		r.Register(s.wbAdapter())
 		r.Register(s.zedAdapter())
 		r.Register(s.ccAdapter())
 		r.Register(s.codexAdapter())
+		r.Register(s.geminiAdapter())
 		s.reg = r
-	}
+	})
 	return s.reg
 }

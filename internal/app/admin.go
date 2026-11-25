@@ -53,7 +53,7 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 	if p.Kind != "" {
 		adapter, ok := s.registry().ForKind(p.Kind)
 		if !ok {
-			writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy、workbuddy-intl、zed、commandcode 或 codex")
+			writeErr(w, http.StatusBadRequest, "kind 只能为空、workbuddy、workbuddy-intl、zed、commandcode、codex 或 geminiapp")
 			return
 		}
 		if err := adapter.ValidateProvider(&p); err != nil {
@@ -77,14 +77,20 @@ func (s *Server) handleProviderUpsert(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleProviderDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !s.store.DeleteProvider(id) {
+	if _, ok := s.store.Provider(id); !ok {
 		writeErr(w, http.StatusNotFound, "provider 不存在")
 		return
 	}
+	// 先让适配器清理（Codex / Gemini App 会尽力在远端吊销授权，需要读取凭证），
+	// 再删除本地配置。删除失败（并发删除）仍返回 404。
 	for _, a := range s.registry().Adaptors() {
 		if f, ok := a.(upstream.Forgetter); ok {
 			f.Forget(id)
 		}
+	}
+	if !s.store.DeleteProvider(id) {
+		writeErr(w, http.StatusNotFound, "provider 不存在")
+		return
 	}
 	s.replyState(w, r)
 }

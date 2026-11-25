@@ -43,6 +43,7 @@ type Provider struct {
 	Zed          *ZedCred         `json:"zed,omitempty"`           // Zed 凭证
 	CommandCode  *CommandCodeCred `json:"commandcode,omitempty"`   // Command Code 凭证
 	Codex        *CodexCred       `json:"codex,omitempty"`         // Codex 套餐（Sign in with ChatGPT）凭证
+	GeminiApp    *GeminiAppCred   `json:"geminiapp,omitempty"`     // Gemini App（Google 账号订阅）凭证
 }
 
 // WorkBuddyCred WorkBuddy 上游的账号凭证（本机客户端扫描导入或后台粘贴）。
@@ -171,6 +172,59 @@ func (c *CodexCred) RefreshExpires() time.Time {
 		return time.Time{}
 	}
 	return *c.RefreshExpiresAt
+}
+
+// GeminiAppCred Gemini App（Google 账号订阅）凭证：浏览器 Google 登录（回环 PKCE）
+// 或粘贴凭证 JSON 导入。refresh token 长期有效，access token（1 小时）临期用它续期。
+// ClientID / ClientSecret 为空时用环境变量配置的 OAuth 客户端
+// （LLMROUTER_GEMINI_CLIENT_ID / LLMROUTER_GEMINI_CLIENT_SECRET）；Usage 与 Terms
+// 分别是最近一次用量快照与主服务条款的接受回执。
+type GeminiAppCred struct {
+	Subject      string          `json:"subject"` // userinfo 的 sub，账号唯一标识
+	Email        string          `json:"email,omitempty"`
+	ClientID     string          `json:"client_id,omitempty"` // 可选：覆盖环境变量里的 OAuth 客户端
+	ClientSecret string          `json:"client_secret,omitempty"`
+	AccessToken  string          `json:"access_token,omitempty"`
+	RefreshToken string          `json:"refresh_token,omitempty"`
+	ExpiresAt    *time.Time      `json:"expires_at,omitempty"`
+	AuthError    string          `json:"auth_error,omitempty"` // 非空 = 授权已失效，需要重新登录
+	Usage        *GeminiAppUsage `json:"usage,omitempty"`
+	Terms        *GeminiAppTerms `json:"terms,omitempty"`
+	CheckedAt    *time.Time      `json:"checked_at,omitempty"` // 最近一次登录/续期成功时刻
+}
+
+// Expires 取 access token 过期时刻（nil 安全）
+func (c *GeminiAppCred) Expires() time.Time {
+	if c == nil || c.ExpiresAt == nil {
+		return time.Time{}
+	}
+	return *c.ExpiresAt
+}
+
+// GeminiAppUsage Google GetUsageInfo 的只读快照：订阅档位与各用量窗口的已用百分比。
+// 只反映 Google 上报的访问档位，不是账单或续订状态。
+type GeminiAppUsage struct {
+	Tier      string              `json:"tier,omitempty"` // free / pro / ultra / plus / neon
+	Rows      []GeminiAppUsageRow `json:"rows,omitempty"`
+	CheckedAt time.Time           `json:"checked_at"`
+	Error     string              `json:"error,omitempty"` // 最近一次查询失败的原因（保留旧快照）
+}
+
+// GeminiAppUsageRow 一个用量窗口：Percent 是已用百分比，RefreshAt 是窗口滚动时刻
+// （不保证归零）。
+type GeminiAppUsageRow struct {
+	Label     string     `json:"label"`
+	Percent   float64    `json:"percent"`
+	RefreshAt *time.Time `json:"refresh_at,omitempty"`
+}
+
+// GeminiAppTerms Gemini 主服务条款的接受回执：只记录本网关成功提交过接受，
+// 不代表之后在官方 App 内的状态。
+type GeminiAppTerms struct {
+	Status     string    `json:"status"`            // accepted | error
+	Version    int64     `json:"version,omitempty"` // 提交接受的条款版本号
+	AcceptedAt time.Time `json:"accepted_at"`
+	Error      string    `json:"error,omitempty"`
 }
 
 // MuteWindow 每天重复的静音时段，支持跨零点（如 22:00~06:00）

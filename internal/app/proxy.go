@@ -315,8 +315,8 @@ func (s *Server) logAttemptFailure(adapter upstream.Adapter, c Candidate, err er
 
 // candidateSupportsProtocol 判断候选能否处理该接入协议。标准 OpenAI 兼容 Provider
 // 两种协议都原样透传；WorkBuddy 上游只有 chat completions，仅在开启 responses
-// 协议转换时才由适配层翻译承接 /v1/responses；Zed 与 Command Code 适配层两种
-// 协议恒可承接（chat 直接转换，responses 经 chat 中间形态转换）。
+// 协议转换时才由适配层翻译承接 /v1/responses；Zed、Command Code、Codex 与
+// Gemini App 适配层两种协议恒可承接（chat 直接转换，responses 经 chat 中间形态转换）。
 func (s *Server) candidateSupportsProtocol(c Candidate, protocol string) bool {
 	return s.registry().For(c.Provider).CanServe(domain.Protocol(protocol))
 }
